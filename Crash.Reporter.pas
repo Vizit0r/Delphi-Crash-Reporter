@@ -133,6 +133,7 @@ uses
   Crash.ELFormat,
   Crash.Signals,
   Crash.MacOS.Symbols,
+  Crash.MacOS.MachExc,
   {$IF Defined(MSWINDOWS)}
   Winapi.Windows,
   {$IFEND}
@@ -518,6 +519,10 @@ begin
   // POSIX: capture registers + stack for AV/div0/illegal-instruction before the
   // kernel re-delivers the signal to the Pascal RTL handler. No-op on Windows.
   CrashInstallSignalHandlers;
+  // macOS: install our thread-level Mach exception port on the MAIN thread (we
+  // run on it here). Captures CPU registers for hardware faults, which the RTL's
+  // POSIX-bypassing Mach handler otherwise hides. No-op on non-(macOS x86-64).
+  CrashInstallMacOSMachHandlerForCurrentThread;
   // macOS: build the Pascal-symbol cache from the running Mach-O LC_SYMTAB so the
   // call stack shows real function names (not the nearest dladdr export). No-op
   // elsewhere.

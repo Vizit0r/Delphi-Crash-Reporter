@@ -591,30 +591,39 @@ begin
     SB.Append(StringOfChar('-', TotalRowLen)); SB.Append(CRLF);
     SB.Append(CRLF);
 
-    // ============== Modules ==============
-    // EL format: a header with the full name "Modules Information:" (see
-    // EStrConsts.pas rsELDialog_ModulesHeaderVal), then dashes-line + header-row
-    // + dashes-line + data + dashes-line. We don't call AppendSectionHeader - it
-    // would add an extra short dashes-line over the long one from the table. An
-    // empty "Modules Information:" is not emitted at all.
+    // ============== Modules + Registers ==============
+    // The EL Viewer locates the CPU/Registers section POSITIONALLY: GetItem_CPU
+    // (ELogManager.pas) counts 2 blank-line breaks after the Call Stack table.
+    // EL's normal layout is CallStack -> Modules -> Registers, so the 2nd break
+    // lands on Registers. If we emit Registers with NO Modules section between,
+    // the 2nd break lands on our internal Registers/Stack-Dump blank instead, and
+    // the Viewer's CPU tab shows empty (the registers are still in the .el text).
+    // So: when Registers WILL be emitted but the real Modules table is absent
+    // (crsModules disabled, or enumeration returned nothing), emit an EMPTY
+    // "Modules Information:" header as the positional anchor. Verified against the
+    // Viewer source: Generate_Modules treats an empty Modules section as an empty
+    // tab (no '|' rows => no data), and Generate_CPU then finds the registers.
+    var RegsPresent := (not (crsRegisters in ACtx.DisabledSections)) and
+                       (ACtx.CpuSnapshot <> '');
+    var ModulesText := '';
     if not (crsModules in ACtx.DisabledSections) then
+      ModulesText := CrashFormatModulesTable(CrashEnumerateModules);
+    if ModulesText <> '' then
     begin
-      var ModulesText := CrashFormatModulesTable(CrashEnumerateModules);
-      if ModulesText <> '' then
-      begin
-        SB.Append('Modules Information'); SB.Append(EHeaderSuffix); SB.Append(CRLF);
-        SB.Append(ModulesText);
-        SB.Append(CRLF);
-      end;
-    end;
-    // Processes Information / Assembler Information are intentionally NOT emitted:
-    // we don't fill them with data, and the EL Viewer breaks on empty
-    // "Title:\n----\n" blocks (renders them oddly or complains). Without the
-    // sections the corresponding Viewer tabs just stay empty - which is fine.
+      // Full "Modules Information:" header; the table brings its own dashes lines,
+      // so we don't call AppendSectionHeader.
+      SB.Append('Modules Information'); SB.Append(EHeaderSuffix); SB.Append(CRLF);
+      SB.Append(ModulesText);
+      SB.Append(CRLF);
+    end
+    else if RegsPresent then
+      // Empty positional anchor so the Viewer can locate the Registers below.
+      AppendEmptySection(SB, 'Modules Information');
+    // Processes / Assembler are not emitted (we have no data to fill them).
     //
-    // Registers - short, special name (see EStrConsts.pas rsELCPU_RegistersVal).
-    // An empty one (when no signal fired) is not emitted either.
-    if (not (crsRegisters in ACtx.DisabledSections)) and (ACtx.CpuSnapshot <> '') then
+    // Registers - special section name (EStrConsts.pas rsELCPU_RegistersVal).
+    // Empty (no signal fired) is not emitted.
+    if RegsPresent then
     begin
       SB.Append(ACtx.CpuSnapshot);
       if not ACtx.CpuSnapshot.EndsWith(CRLF) then SB.Append(CRLF);

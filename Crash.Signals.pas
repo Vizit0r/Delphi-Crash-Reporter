@@ -49,6 +49,23 @@ function  CrashHasSignalSnapshot: Boolean;
 // Resets the Captured/InvocationCount flags. If there was no snapshot, both ''.
 procedure CrashTakeAndFormatSnapshots(out ARegistersSection, ASignalInfoSection: String);
 
+type
+  { CPU registers captured by the macOS Mach handler (Crash.MacOS.MachExc) and
+    handed to CrashRecordMacOSSnapshot. Mirrors x86_thread_state64. }
+  TCrashMacOSRegs = record
+    Rax, Rbx, Rcx, Rdx, Rdi, Rsi, Rbp, Rsp: UInt64;
+    R8, R9, R10, R11, R12, R13, R14, R15:    UInt64;
+    Rip, Rflags, Cs:                         UInt64;
+  end;
+
+{ Record a snapshot captured by the macOS Mach exception handler into the same
+  global the POSIX path uses, so CrashTakeAndFormatSnapshots emits the Registers
+  section. No stack dump is taken (the watcher thread is not the faulting one).
+  No-op when signal capture isn't compiled in. }
+procedure CrashRecordMacOSSnapshot(const ARegs: TCrashMacOSRegs;
+  ASignalNum, ASignalCode: Integer; AFaultAddr: UInt64;
+  AStackBase: UInt64; AStackBytes: Pointer; AStackLen: Integer);
+
 implementation
 
 {$IF (Defined(LINUX) and Defined(CPUX64)) or
@@ -564,6 +581,44 @@ begin
   ASignalInfoSection := FormatSignalInfoSection(S);
 end;
 
+procedure CrashRecordMacOSSnapshot(const ARegs: TCrashMacOSRegs;
+  ASignalNum, ASignalCode: Integer; AFaultAddr: UInt64;
+  AStackBase: UInt64; AStackBytes: Pointer; AStackLen: Integer);
+begin
+  TInterlocked.Increment(GSignalSnapshot.InvocationCount);
+  // Capture only the FIRST exception (as the POSIX handler does) - a later
+  // secondary fault must not overwrite the primary registers.
+  if TInterlocked.CompareExchange(GSignalSnapshot.Captured, 1, 0) = 0 then
+  begin
+    GSignalSnapshot.Kind       := Ord(skMacOSX64);
+    GSignalSnapshot.SignalNum  := ASignalNum;
+    GSignalSnapshot.SignalCode := ASignalCode;
+    GSignalSnapshot.FaultAddr  := AFaultAddr;
+    {$IF Defined(CPUX64)}
+    GSignalSnapshot.Rax := ARegs.Rax;  GSignalSnapshot.Rbx := ARegs.Rbx;
+    GSignalSnapshot.Rcx := ARegs.Rcx;  GSignalSnapshot.Rdx := ARegs.Rdx;
+    GSignalSnapshot.Rdi := ARegs.Rdi;  GSignalSnapshot.Rsi := ARegs.Rsi;
+    GSignalSnapshot.Rbp := ARegs.Rbp;  GSignalSnapshot.Rsp := ARegs.Rsp;
+    GSignalSnapshot.R8  := ARegs.R8;   GSignalSnapshot.R9  := ARegs.R9;
+    GSignalSnapshot.R10 := ARegs.R10;  GSignalSnapshot.R11 := ARegs.R11;
+    GSignalSnapshot.R12 := ARegs.R12;  GSignalSnapshot.R13 := ARegs.R13;
+    GSignalSnapshot.R14 := ARegs.R14;  GSignalSnapshot.R15 := ARegs.R15;
+    GSignalSnapshot.Rip := ARegs.Rip;  GSignalSnapshot.Rflags := ARegs.Rflags;
+    GSignalSnapshot.Cs  := ARegs.Cs;
+    {$IFEND}
+    // Stack dump (read SAFELY by the caller, e.g. via vm_read_overwrite). It lets
+    // the EL Viewer recognise the full "Registers:" + "Stack:/Memory Dump"
+    // section - without the Stack Dump the Viewer's CPU tab stays blank even
+    // though the registers are in the .el text.
+    GSignalSnapshot.StackBaseAddr := AStackBase;
+    if (AStackBase <> 0) and (AStackBytes <> nil) and (AStackLen > 0) then
+    begin
+      if AStackLen > STACK_DUMP_BYTES then AStackLen := STACK_DUMP_BYTES;
+      Move(AStackBytes^, GSignalSnapshot.StackBytes[0], AStackLen);
+    end;
+  end;
+end;
+
 {$ELSE}  // not CRASH_SIGCAP -> no-op stubs
 
 procedure CrashInstallSignalHandlers;            begin end;
@@ -573,6 +628,9 @@ begin
   ARegistersSection := '';
   ASignalInfoSection := '';
 end;
+procedure CrashRecordMacOSSnapshot(const ARegs: TCrashMacOSRegs;
+  ASignalNum, ASignalCode: Integer; AFaultAddr: UInt64;
+  AStackBase: UInt64; AStackBytes: Pointer; AStackLen: Integer); begin end;
 
 {$IFEND}
 
