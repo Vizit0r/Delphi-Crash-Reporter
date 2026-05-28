@@ -1,0 +1,916 @@
+﻿unit Crash.CallStack;
+{ Exception capture engine: installs the Delphi RTL exception hooks
+  (ExceptProc / ExceptionAcquired / Exception.GetExceptionStackInfoProc) and,
+  on an unhandled exception, builds a TCrashReport (message + fault location +
+  call stack) and hands it to TCrashCapture.OnReport. The host wires
+  Application.OnException := TCrashCapture.ExceptionHandler for main-thread
+  GUI exceptions.
+
+  Call stacks are produced on macOS (backtrace), Android (frame/unwind) and
+  Linux (libgcc _Unwind_Backtrace); on Windows no call stack is produced.
+
+  Part of the Crash Reporter library - standalone, EurekaLog-compatible
+  crash/exception reporting for Delphi cross-platform targets.
+
+  Derived from Grijjy JustAddCode / ErrorReporting:
+    Copyright (c) 2017 Grijjy, Inc. BSD 2-Clause license (see LICENSE.txt).
+  Modifications under the same BSD 2-Clause license. }
+
+interface
+
+uses
+  {$IF (Defined(MACOS64) and not Defined(IOS)) or Defined(LINUX)}
+  Crash.LineNumbers,
+  {$ENDIF}
+  System.SysUtils;
+
+type
+  { Signature of the TApplication.OnException event }
+  TCrashExceptionEvent = procedure(Sender: TObject; E: Exception) of object;
+
+type
+  { A single entry in a stack trace }
+  TCrashStackEntry = record
+  public
+    { The address of the code in the call stack. }
+    CodeAddress: UIntPtr;
+
+    { The address of the start of the routine in the call stack. The CodeAddress
+      value always lies inside the routine that starts at RoutineAddress.
+      This, the value "CodeAddress - RoutineAddress" is the offset into the
+      routine in the call stack. }
+    RoutineAddress: UIntPtr;
+
+    { The (base) address of the module where CodeAddress is found. }
+    ModuleAddress: UIntPtr;
+
+    { The line number (of CodeAddress), or 0 if not available. }
+    LineNumber: Integer;
+
+    { Line number where the routine starts (of RoutineAddress), or 0 if not
+      available. Lets the report formatter compute the in-routine relative
+      line as (LineNumber - RoutineLineNumber + 1) for EL Viewer's Rel.Line
+      column. Currently filled only on MACOS64 desktop where Grijjy has
+      access to a .gol file -- on Linux/Win/Android stays 0. }
+    RoutineLineNumber: Integer;
+
+    { The name of the routine at CodeAddress, if available. }
+    RoutineName: String;
+
+    { The name of the module where CodeAddress is found. If CodeAddress is
+      somewhere inside your (Delphi) code, then this will be the name of the
+      executable module (or .so file on Android). }
+    ModuleName: String;
+  public
+    { Clears the entry (sets everything to 0) }
+    procedure Clear;
+  end;
+
+type
+  { A call stack (aka stack trace) is just an array of call stack entries. }
+  TCrashStack = TArray<TCrashStackEntry>;
+
+type
+  { Which hook fired this report. Lets the adapter decide "process stays alive"
+    vs "process will Halt right after we return". }
+  TCrashSource = (
+    csOnException,   // Application.OnException - FMX main thread caught it; process stays alive.
+    csAcquired,      // ExceptionAcquired - secondary thread caught it; process stays alive.
+    csFatalProc      // ExceptProc - truly unhandled; RTL will Halt(217) shortly.
+  );
+
+type
+  { A captured exception report: message, fault location, full call stack, and
+    which hook fired. A plain value type - no interface, no refcounting. }
+  TCrashReport = record
+    ExceptionMessage: String;
+    ExceptionLocation: TCrashStackEntry;
+    CallStack: TCrashStack;
+    Source: TCrashSource;
+  end;
+
+type
+  { Invoked by TCrashCapture when an unhandled exception is captured. Set it via
+    TCrashCapture.OnReport. The report is built and handed over directly (no
+    message broadcasting). May be called from any thread. }
+  TCrashReportEvent = reference to procedure(const AReport: TCrashReport);
+
+type
+  { Main class for reporting exceptions.
+    See the documentation at the top of this unit for usage information. }
+  TCrashCapture = class
+  {$REGION 'Internal Declarations'}
+  private class var
+    FInstance: TCrashCapture;
+    FOnReport: TCrashReportEvent;
+    {$IF (Defined(MACOS64) and not Defined(IOS)) or Defined(LINUX)}
+    FLineNumberInfo: TLineNumberInfo;
+    class function GetLineNumber(const AAddress: UIntPtr): Integer; static;
+  public class var
+    class function GetLineNumberInfo: TLineNumberInfo; static;
+  private class var
+    {$ENDIF}
+    class function GetExceptionHandler: TCrashExceptionEvent; static;
+    class function GetMaxCallStackDepth: Integer; static;
+    class procedure SetMaxCallStackDepth(const Value: Integer); static;
+  private
+    FMaxCallStackDepth: Integer;
+    FModuleAddress: UIntPtr;
+    FReportingException: Boolean;
+  private
+    constructor InternalCreate(const ADummy: Integer = 0);
+    procedure ReportException(const AExceptionObject: TObject;
+      const AExceptionAddress: Pointer;
+      const ASource: TCrashSource);
+  private
+    class function GetCallStack(const AStackInfo: Pointer): TCrashStack; static;
+    class function GetCallStackEntry(var AEntry: TCrashStackEntry): Boolean; static;
+  private
+    { Global hooks }
+    procedure GlobalHandleException(Sender: TObject; E: Exception);
+    class procedure GlobalExceptionAcquiredHandler(Obj: {$IFDEF AUTOREFCOUNT}TObject{$ELSE}Pointer{$ENDIF}); static;
+    class procedure GlobalExceptHandler(ExceptObject: TObject; ExceptAddr: Pointer); static;
+    class function GlobalGetExceptionStackInfo(P: PExceptionRecord): Pointer; static;
+    class procedure GlobalCleanUpStackInfo(Info: Pointer); static;
+  {$ENDREGION 'Internal Declarations'}
+  public
+    { Don't call the constructor manually. This is a singleton. }
+    constructor Create;
+
+    { Set to Application.OnException handler event to this value to report
+      unhandled exceptions in the main (UI) thread.
+      For example:
+        Application.OnException := TCrashCapture.ExceptionHandler; }
+    class property ExceptionHandler: TCrashExceptionEvent read GetExceptionHandler;
+
+    { Host (the reporter) sets this to receive captured reports directly. }
+    class property OnReport: TCrashReportEvent read FOnReport write FOnReport;
+
+    { Maximum depth of the call stack that is retrieved when an exception
+      occurs. Defaults to 20.
+
+      Every time an exception is raised, we retrieve a call stack. This adds a
+      little overhead, but raising exceptions is already an "expensive"
+      operation anyway.
+
+      You can limit this overhead by decreasing the maximum number of entries
+      in the call stack. You can also increase this number of you want a more
+      detailed call stack.
+
+      Set to 0 to disable call stacks altogether. }
+    class property MaxCallStackDepth: Integer read GetMaxCallStackDepth write SetMaxCallStackDepth;
+  end;
+
+implementation
+
+uses
+  System.Classes,
+  {$IF Defined(MACOS) or Defined(ANDROID) or Defined(LINUX)}
+  Posix.Dlfcn,
+  Posix.Stdlib,
+  {$ENDIF}
+  {$IF Defined(LINUX)} // Posix.Base for libc/_PU constants
+  Posix.Base,
+  {$ENDIF}
+  Crash.Demangle;
+
+{$RANGECHECKS OFF}
+
+{ TCrashStackEntry }
+
+procedure TCrashStackEntry.Clear;
+begin
+  CodeAddress := 0;
+  RoutineAddress := 0;
+  ModuleAddress := 0;
+  LineNumber := 0;
+  RoutineLineNumber := 0;
+  RoutineName := '';
+  ModuleName := '';
+end;
+
+{ TCrashCapture }
+
+constructor TCrashCapture.Create;
+begin
+  raise EInvalidOperation.Create('Invalid singleton constructor call');
+end;
+
+class function TCrashCapture.GetExceptionHandler: TCrashExceptionEvent;
+begin
+  { HandleException is usually called in response to the FMX
+    Application.OnException event, which is called for exceptions that aren't
+    handled in the main thread. This event is only fired for exceptions that
+    occur in the main (UI) thread though. }
+  if Assigned(FInstance) then
+    Result := FInstance.GlobalHandleException
+  else
+    Result := nil;
+end;
+
+class function TCrashCapture.GetMaxCallStackDepth: Integer;
+begin
+  if Assigned(FInstance) then
+    Result := FInstance.FMaxCallStackDepth
+  else
+    Result := 20;
+end;
+
+class procedure TCrashCapture.GlobalCleanUpStackInfo(Info: Pointer);
+begin
+  { Free memory allocated by GlobalGetExceptionStackInfo }
+  if (Info <> nil) then
+    FreeMem(Info);
+end;
+
+class procedure TCrashCapture.GlobalExceptHandler(ExceptObject: TObject;
+  ExceptAddr: Pointer);
+begin
+  if Assigned(FInstance) then
+    FInstance.ReportException(ExceptObject, ExceptAddr, csFatalProc);
+end;
+
+class procedure TCrashCapture.GlobalExceptionAcquiredHandler(
+  Obj: {$IFDEF AUTOREFCOUNT}TObject{$ELSE}Pointer{$ENDIF});
+begin
+  if Assigned(FInstance) then
+    FInstance.ReportException(Obj, ExceptAddr, csAcquired);
+end;
+
+procedure TCrashCapture.GlobalHandleException(Sender: TObject; E: Exception);
+begin
+  ReportException(E, ExceptAddr, csOnException);
+end;
+
+constructor TCrashCapture.InternalCreate(const ADummy: Integer);
+{$IF Defined(MACOS) or Defined(ANDROID) or Defined(LINUX)}
+var
+  Info: dl_info;
+{$ENDIF}
+begin
+  inherited Create;
+  FMaxCallStackDepth := 20;
+
+  { Assign the global ExceptionAcquired procedure to our own implementation (it
+    is nil by default). This procedure gets called for unhandled exceptions that
+    happen in other threads than the main thread. }
+  ExceptionAcquired := @GlobalExceptionAcquiredHandler;
+
+  { The global ExceptProc method can be called for certain unhandled exception.
+    By default, it calls the ExceptHandler procedure in the System.SysUtils
+    unit, which shows the exception message and terminates the app.
+    We set it to our own implementation. }
+  ExceptProc := @GlobalExceptHandler;
+
+  { We hook into the global static GetExceptionStackInfoProc and
+    CleanUpStackInfoProc methods of the Exception class to provide a call stack
+    for the exception. These methods are unassigned by default.
+    The Exception.GetExceptionStackInfoProc method gets called soon after the
+    exception is created, before the call stack is unwound. This is the only
+    place where we can get the call stack at the point closest to the exception
+    as possible. The Exception.CleanUpStackInfoProc just frees the memory
+    allocated by GetExceptionStackInfoProc. }
+  Exception.GetExceptionStackInfoProc := GlobalGetExceptionStackInfo;
+  Exception.CleanUpStackInfoProc := GlobalCleanUpStackInfo;
+
+  {$IF Defined(MACOS) or Defined(ANDROID) or Defined(LINUX)}
+  { Get address of current module. We use this to see if an entry in the call
+    stack is part of this module.
+    We use the dladdr API as a "trick" to get the address of this method, which
+    is obviously part of this module. }
+  if (dladdr(UIntPtr(@TCrashCapture.InternalCreate), Info) <> 0) then
+    FModuleAddress := UIntPtr(Info.dli_fbase);
+  {$ENDIF}
+end;
+
+procedure TCrashCapture.ReportException(const AExceptionObject: TObject;
+  const AExceptionAddress: Pointer;
+  const ASource: TCrashSource);
+var
+  E: Exception;
+  ExceptionMessage: String;
+  CallStack: TCrashStack;
+  ExceptionLocation: TCrashStackEntry;
+  Report: TCrashReport;
+  I: Integer;
+begin
+  { Ignore exception that occur while we are already reporting another
+    exception. That can happen when the original exception left the application
+    in such a state that other exceptions would happen (cascading errors). }
+  if (FReportingException) then
+    Exit;
+
+  FReportingException := True;
+  try
+    CallStack := nil;
+    if (AExceptionObject = nil) then
+      ExceptionMessage := 'Unknown Error'
+    else if (AExceptionObject is EAbort) then
+      Exit //  do nothing
+    else if (AExceptionObject is Exception) then
+    begin
+      E := Exception(AExceptionObject);
+      ExceptionMessage := E.Message;
+      if (E.StackInfo <> nil) then
+      begin
+        CallStack := GetCallStack(E.StackInfo);
+        for I := 0 to Length(Callstack) - 1 do
+        begin
+          { If entry in call stack is for this module, then try to translate
+            the routine name to Pascal. }
+          if (CallStack[I].ModuleAddress = FModuleAddress) then
+            CallStack[I].RoutineName := CppSymbolToPascal(CallStack[I].RoutineName);
+        end;
+      end;
+    end
+    else
+      ExceptionMessage := 'Unknown Error (' + AExceptionObject.ClassName + ')';
+
+    ExceptionLocation.Clear;
+    ExceptionLocation.CodeAddress := UIntPtr(AExceptionAddress);
+    GetCallStackEntry(ExceptionLocation);
+    if (ExceptionLocation.ModuleAddress = FModuleAddress) then
+      ExceptionLocation.RoutineName := CppSymbolToPascal(ExceptionLocation.RoutineName);
+
+    Report.ExceptionMessage := ExceptionMessage;
+    Report.ExceptionLocation := ExceptionLocation;
+    Report.CallStack := CallStack;
+    Report.Source := ASource;
+    if Assigned(FOnReport) then
+    try
+      FOnReport(Report);
+    except
+      { Ignore any exceptions in the report handler. }
+    end;
+  finally
+    FReportingException := False;
+  end;
+end;
+
+class procedure TCrashCapture.SetMaxCallStackDepth(const Value: Integer);
+begin
+  if Assigned(FInstance) then
+    FInstance.FMaxCallStackDepth := Value;
+end;
+
+{$IF Defined(MACOS)}
+
+(*****************************************************************************)
+(*** iOS/macOS specific ******************************************************)
+(*****************************************************************************)
+
+const
+  libSystem = '/usr/lib/libSystem.dylib';
+
+function backtrace(buffer: PPointer; size: Integer): Integer;
+  external libSystem name 'backtrace';
+
+function cxa_demangle(const mangled_name: MarshaledAString;
+  output_buffer: MarshaledAString; length: NativeInt;
+  out status: Integer): MarshaledAString; cdecl;
+  external libSystem name '__cxa_demangle';
+
+type
+  TCallStack = record
+    { Number of entries in the call stack }
+    Count: Integer;
+
+    { The entries in the call stack }
+    Stack: array [0..0] of UIntPtr;
+  end;
+  PCallStack = ^TCallStack;
+
+class function TCrashCapture.GlobalGetExceptionStackInfo(
+  P: PExceptionRecord): Pointer;
+var
+  CallStack: PCallStack;
+begin
+  { Don't call into FInstance here. That would only add another entry to the
+    call stack. Instead, retrieve the entire call stack from within this method.
+    Just return nil if we are already reporting an exception, or call stacks
+    are disabled. }
+  if (FInstance = nil) or (FInstance.FReportingException) or (FInstance.FMaxCallStackDepth <= 0) then
+    Exit(nil);
+
+  { Allocate a PCallStack record large enough to hold just MaxCallStackDepth
+    entries }
+  GetMem(CallStack, SizeOf(Integer{TCallStack.Count}) +
+    FInstance.FMaxCallStackDepth * SizeOf(Pointer));
+
+  { Use backtrace API to retrieve call stack }
+  CallStack.Count := backtrace(@CallStack.Stack, FInstance.FMaxCallStackDepth);
+  Result := CallStack;
+end;
+
+class function TCrashCapture.GetCallStack(
+  const AStackInfo: Pointer): TCrashStack;
+var
+  CallStack: PCallStack;
+  I: Integer;
+begin
+  { Convert TCallStack to TCrashStack }
+  CallStack := AStackInfo;
+  SetLength(Result, CallStack.Count);
+  for I := 0 to CallStack.Count - 1 do
+  begin
+    Result[I].CodeAddress := CallStack.Stack[I];
+    GetCallStackEntry(Result[I]);
+  end;
+end;
+
+{$ELSEIF Defined(ANDROID64)}
+
+(*****************************************************************************)
+(*** Android64 specific ******************************************************)
+(*****************************************************************************)
+
+function cxa_demangle(const mangled_name: MarshaledAString;
+  output_buffer: MarshaledAString; length: NativeInt;
+  out status: Integer): MarshaledAString; cdecl;
+  external 'libc++abi.a' name '__cxa_demangle';
+
+type
+  _PUnwind_Context = Pointer;
+  _Unwind_Ptr = UIntPtr;
+
+type
+  _Unwind_Reason_code = Integer;
+
+const
+  _URC_NO_REASON = 0;
+  _URC_FOREIGN_EXCEPTION_CAUGHT = 1;
+  _URC_FATAL_PHASE2_ERROR = 2;
+  _URC_FATAL_PHASE1_ERROR = 3;
+  _URC_NORMAL_STOP = 4;
+  _URC_END_OF_STACK = 5;
+  _URC_HANDLER_FOUND = 6;
+  _URC_INSTALL_CONTEXT = 7;
+  _URC_CONTINUE_UNWIND = 8;
+type
+  _Unwind_Trace_Fn = function(context: _PUnwind_Context; userdata: Pointer): _Unwind_Reason_code; cdecl;
+
+const
+  LIB_UNWIND = 'libunwind.a';
+
+procedure _Unwind_Backtrace(fn: _Unwind_Trace_Fn; userdata: Pointer); cdecl; external LIB_UNWIND;
+function _Unwind_GetIP(context: _PUnwind_Context): _Unwind_Ptr; cdecl; external LIB_UNWIND;
+
+type
+  TCallStack = record
+    { Number of entries in the call stack }
+    Count: Integer;
+
+    { The entries in the call stack }
+    Stack: array [0..0] of UIntPtr;
+  end;
+  PCallStack = ^TCallStack;
+
+function UnwindCallback(AContext: _PUnwind_Context; AUserData: Pointer): _Unwind_Reason_code; cdecl;
+var
+  Callstack: PCallstack;
+begin
+  Callstack := AUserData;
+  if (TCrashCapture.FInstance = nil) or (Callstack.Count >= TCrashCapture.FInstance.FMaxCallStackDepth) then
+    Exit(_URC_END_OF_STACK);
+
+  Callstack.Stack[Callstack.Count] := _Unwind_GetIP(AContext);
+  Inc(Callstack.Count);
+  Result := _URC_NO_REASON;
+end;
+
+class function TCrashCapture.GlobalGetExceptionStackInfo(
+  P: PExceptionRecord): Pointer;
+var
+  CallStack: PCallStack;
+begin
+  { Don't call into FInstance here. That would only add another entry to the
+    call stack. Instead, retrieve the entire call stack from within this method.
+    Just return nil if we are already reporting an exception, or call stacks
+    are disabled. }
+  if (FInstance = nil) or (FInstance.FReportingException) or (FInstance.FMaxCallStackDepth <= 0) then
+    Exit(nil);
+
+  { Allocate a PCallStack record large enough to hold just MaxCallStackDepth
+    entries }
+  GetMem(CallStack, SizeOf(Integer{TCallStack.Count}) +
+    FInstance.FMaxCallStackDepth * SizeOf(Pointer));
+
+  { Use _Unwind_Backtrace API to retrieve call stack }
+  CallStack.Count := 0;
+  _Unwind_Backtrace(UnwindCallback, Callstack);
+  Result := CallStack;
+end;
+
+class function TCrashCapture.GetCallStack(
+  const AStackInfo: Pointer): TCrashStack;
+var
+  CallStack: PCallStack;
+  I: Integer;
+begin
+  { Convert TCallStack to TCrashStack }
+  CallStack := AStackInfo;
+  SetLength(Result, CallStack.Count);
+  for I := 0 to CallStack.Count - 1 do
+  begin
+    Result[I].CodeAddress := CallStack.Stack[I];
+    GetCallStackEntry(Result[I]);
+  end;
+end;
+
+{$ELSEIF Defined(ANDROID)}
+
+(*****************************************************************************)
+(*** Android32 specific ******************************************************)
+(*****************************************************************************)
+
+type
+  TGetFramePointer = function: NativeUInt; cdecl;
+
+const
+  { We need a function to get the frame pointer. The address of this frame
+    pointer is stored in register R7.
+    In assembly code, the function would look like this:
+      ldr R0, [R7]       // Retrieve frame pointer
+      bx  LR             // Return to caller
+    The R0 register is used to store the function result.
+    The "bx LR" line means "return to the address stored in the LR register".
+    The LR (Link Return) register is set by the calling routine to the address
+    to return to.
+
+    We could create a text file with this code, assemble it to a static library,
+    and link that library into this unit. However, since the routine is so
+    small, it assembles to just 8 bytes, which we store in an array here. }
+  GET_FRAME_POINTER_CODE: array [0..7] of Byte = (
+    $00, $00, $97, $E5,  // ldr R0, [R7]
+    $1E, $FF, $2F, $E1); // bx  LR
+
+var
+  { Now define a variable of a procedural type, that is assigned to the
+    assembled code above }
+  GetFramePointer: TGetFramePointer = @GET_FRAME_POINTER_CODE;
+
+function cxa_demangle(const mangled_name: MarshaledAString;
+  output_buffer: MarshaledAString; length: NativeInt;
+  out status: Integer): MarshaledAString; cdecl;
+  external {$IF (RTLVersion < 34)}'libgnustl_static.a'{$ELSE}'libc++abi.a'{$ENDIF} name '__cxa_demangle';
+
+type
+  { For each entry in the call stack, we save 7 values for inspection later.
+    See GlobalGetExceptionStackInfo for explaination. }
+  TStackValues = array [0..6] of UIntPtr;
+
+type
+  TCallStack = record
+    { Number of entries in the call stack }
+    Count: Integer;
+
+    { The entries in the call stack }
+    Stack: array [0..0] of TStackValues;
+  end;
+  PCallStack = ^TCallStack;
+
+class function TCrashCapture.GlobalGetExceptionStackInfo(
+  P: PExceptionRecord): Pointer;
+const
+  { On most Android systems, each thread has a stack of 1MB }
+  MAX_STACK_SIZE = 1024 * 1024;
+var
+  MaxCallStackDepth, Count: Integer;
+  FramePointer, MinStack, MaxStack: UIntPtr;
+  Address: Pointer;
+  CallStack: PCallStack;
+begin
+  { Don't call into FInstance here. That would only add another entry to the
+    call stack. Instead, retrieve the entire call stack from within this method.
+    Just return nil if we are already reporting an exception, or call stacks
+    are disabled. }
+  if (FInstance = nil) or (FInstance.FReportingException) or (FInstance.FMaxCallStackDepth <= 0) then
+    Exit(nil);
+
+  MaxCallStackDepth := FInstance.FMaxCallStackDepth;
+
+  { Allocate a PCallStack record large enough to hold just MaxCallStackDepth
+    entries }
+  GetMem(CallStack, SizeOf(Integer{TCallStack.Count}) +
+    MaxCallStackDepth * SizeOf(TStackValues));
+
+  (*We manually walk the stack to create a stack trace. This is possible since
+    Delphi creates a stack frame for each routine, by starting each routine with
+    a prolog. This prolog is similar to the one used by the iOS ABI (Application
+    Binary Interface, see
+    https://developer.apple.com/library/content/documentation/Xcode/Conceptual/iPhoneOSABIReference/Articles/ARMv7FunctionCallingConventions.html
+
+    The prolog looks like this:
+    * Push all registers that need saving. Always push the R7 and LR registers.
+    * Set R7 (frame pointer) to the location in the stack where the previous
+      value of R7 was just pushed.
+
+    A minimal prolog (used in many small functions) looks like this:
+
+      push {R7, LR}
+      mov  R7, SP
+
+    We are interested in the value of the LR (Link Return) register. This
+    register contains the address to return to after the routine finishes. We
+    can use this address to look up the symbol (routine name). Using the
+    example prolog above, we can get to the LR value and walk the stack like
+    this:
+    1. Set FramePointer to the value of the R7 register.
+    2. At this location in the stack, you will find the previous value of the
+       R7 register. Lets call this PreviousFramePointer.
+    3. At the next location in the stack, we will find the LR register. Add its
+       value to our stack trace so we can use it later to look up the routine
+       name at this address.
+    4. Set FramePointer to PreviousFramePointer and go back to step 2, until
+       FramePointer is 0 or falls outside of the stack.
+
+    Unfortunately, Delphi doesn't follow the iOS ABI exactly, and it may push
+    other registers between R7 and LR. For example:
+
+      push {R4, R5, R6, R7, R8, R9, LR}
+      add  R7, SP, #12
+
+    Here, it pushed 3 registers (R4-R6) before R7, so in the second line it sets
+    R7 to point 12 bytes into the stack (so it still points to the previous R7,
+    as required). However, it also pushed registers R8 and R9, before it pushes
+    the LR register. This means we cannot assume that the LR register will be
+    directly located after the R7 register in the stack. There may be (up to 6)
+    registers in between. We don't know which one represents LR, so we just
+    store all 7 values after R7, and later try to figure out which one
+    represents LR (in the GetCallStack method). *)
+  FramePointer := GetFramePointer;
+
+  { The stack grows downwards, so all entries in the call stack leading to this
+    call have addresses greater than FramePointer. We don't know what the start
+    and end address of the stack is for this thread, but we do know that the
+    stack is at most 1MB in size, so we only investigate entries from
+    FramePointer to FramePointer + 1MB. }
+  MinStack := FramePointer;
+  MaxStack := MinStack + MAX_STACK_SIZE;
+
+  { Now we can walk the stack using the algorithm described above. }
+  Count := 0;
+  while (Count < MaxCallStackDepth) and (FramePointer <> 0)
+    and (FramePointer >= MinStack) and (FramePointer < MaxStack) do
+  begin
+    { The first value at FramePointer contains the previous value of R7.
+      Store the 7 values after that. }
+    Address := Pointer(FramePointer + SizeOf(UIntPtr));
+    Move(Address^, CallStack.Stack[Count], SizeOf(TStackValues));
+    Inc(Count);
+
+    { The FramePointer points to the previous value of R7, which contains the
+      previous FramePointer. }
+    FramePointer := PNativeUInt(FramePointer)^;
+  end;
+
+  CallStack.Count := Count;
+  Result := CallStack;
+end;
+
+class function TCrashCapture.GetCallStack(
+  const AStackInfo: Pointer): TCrashStack;
+var
+  CallStack: PCallStack;
+  I, J: Integer;
+  FoundLR: Boolean;
+begin
+  { Convert TCallStack to TCrashStack }
+  CallStack := AStackInfo;
+  SetLength(Result, CallStack.Count);
+  for I := 0 to CallStack.Count - 1 do
+  begin
+    { For each entry in the call stack, we have up to 7 values now that may
+      represent the LR register. Most of the time, it will be the first value.
+      We try to find the correct LR value by passing up to all 7 addresses to
+      the dladdr API (by calling GetCallStackEntry). If the API call succeeds,
+      we assume we found the value of LR. However, this is not fool proof
+      because an address value we pass to dladdr may be a valid code address,
+      but not the LR value we are looking for.
+
+      Also, the LR value contains the address of the next instruction after the
+      call instruction. Delphi usually uses the BL or BLX instruction to call
+      another routine. These instructions takes 4 bytes, so LR will be set to 4
+      bytes after the BL(X) instruction (the return address). However, we want
+      to know at what address the call was made, so we need to subtract 4
+      bytes.
+
+      There is one final complication here: the lowest bit of the LR register
+      indicates the mode the CPU operates in (ARM or Thumb). We need to clear
+      this bit to get to the actual address, by AND'ing it with "not 1". }
+    FoundLR := False;
+    for J := 0 to Length(CallStack.Stack[I]) - 1 do
+    begin
+      Result[I].CodeAddress := (CallStack.Stack[I, J] and not 1) - 4;
+      if GetCallStackEntry(Result[I]) then
+      begin
+        { Assume we found LR }
+        FoundLR := True;
+        Break;
+      end;
+    end;
+
+    if (not FoundLR) then
+      { None of the 7 values were valid.
+        Set CodeAddress to 0 to signal we couldn't find LR. }
+      Result[I].CodeAddress := 0;
+  end;
+end;
+
+{$ELSEIF Defined(LINUX)}
+
+(*****************************************************************************)
+(*** Linux specific                                                         **)
+(*****************************************************************************)
+
+{ __cxa_demangle from libstdc++ (Itanium C++ ABI). Delphi Linux64 RTL emits
+  Itanium-mangled symbols compatible with this demangler. If libstdc++.so.6
+  is missing on the target, the unit will fail to load -- in practice it is
+  present on every Ubuntu/Debian dev/server install. }
+const
+  libstdcpp = 'libstdc++.so.6';
+  libgccs   = 'libgcc_s.so.1';
+
+function cxa_demangle(const mangled_name: MarshaledAString;
+  output_buffer: MarshaledAString; length: NativeInt;
+  out status: Integer): MarshaledAString; cdecl;
+  external libstdcpp name '__cxa_demangle';
+
+{ Use libgcc_s _Unwind_Backtrace (same API as Android64). glibc's backtrace()
+  in our experiments emits garbage IPs for deep FMX/RTL stacks (addresses
+  land in .dynstr / .hash instead of .text). libgcc walks .eh_frame directly
+  and is steadier on Delphi-generated code. }
+type
+  _PUnwind_Context = Pointer;
+  _Unwind_Ptr = UIntPtr;
+  _Unwind_Reason_code = Integer;
+
+const
+  _URC_NO_REASON      = 0;
+  _URC_END_OF_STACK   = 5;
+
+type
+  _Unwind_Trace_Fn = function(context: _PUnwind_Context; userdata: Pointer): _Unwind_Reason_code; cdecl;
+
+procedure _Unwind_Backtrace(fn: _Unwind_Trace_Fn; userdata: Pointer); cdecl;
+  external libgccs name '_Unwind_Backtrace';
+function _Unwind_GetIP(context: _PUnwind_Context): _Unwind_Ptr; cdecl;
+  external libgccs name '_Unwind_GetIP';
+
+type
+  TCallStack = record
+    Count: Integer;
+    Stack: array [0..0] of UIntPtr;
+  end;
+  PCallStack = ^TCallStack;
+
+function CrashLinuxUnwindCallback(AContext: _PUnwind_Context; AUserData: Pointer): _Unwind_Reason_code; cdecl;
+var
+  CS: PCallStack;
+begin
+  CS := AUserData;
+  if (TCrashCapture.FInstance = nil) or
+     (CS.Count >= TCrashCapture.FInstance.FMaxCallStackDepth) then
+    Exit(_URC_END_OF_STACK);
+  CS.Stack[CS.Count] := UIntPtr(_Unwind_GetIP(AContext));
+  Inc(CS.Count);
+  Result := _URC_NO_REASON;
+end;
+
+class function TCrashCapture.GlobalGetExceptionStackInfo(
+  P: PExceptionRecord): Pointer;
+var
+  CallStack: PCallStack;
+begin
+  if (FInstance = nil) or (FInstance.FReportingException) or (FInstance.FMaxCallStackDepth <= 0) then
+    Exit(nil);
+
+  GetMem(CallStack, SizeOf(Integer{TCallStack.Count}) +
+    FInstance.FMaxCallStackDepth * SizeOf(Pointer));
+  CallStack.Count := 0;
+  _Unwind_Backtrace(CrashLinuxUnwindCallback, CallStack);
+  Result := CallStack;
+end;
+
+class function TCrashCapture.GetCallStack(
+  const AStackInfo: Pointer): TCrashStack;
+var
+  CallStack: PCallStack;
+  I: Integer;
+begin
+  CallStack := AStackInfo;
+  SetLength(Result, CallStack.Count);
+  for I := 0 to CallStack.Count - 1 do
+  begin
+    Result[I].CodeAddress := CallStack.Stack[I];
+    GetCallStackEntry(Result[I]);
+  end;
+end;
+
+{$ELSE}
+
+(*****************************************************************************)
+(*** Non iOS/Android/Linux                                                  **)
+(*****************************************************************************)
+
+class function TCrashCapture.GlobalGetExceptionStackInfo(
+  P: PExceptionRecord): Pointer;
+begin
+  { Call stacks are only supported on iOS, Android and macOS }
+  Result := nil;
+end;
+
+class function TCrashCapture.GetCallStack(
+  const AStackInfo: Pointer): TCrashStack;
+begin
+  { Call stacks are only supported on iOS, Android and macOS }
+  Result := nil;
+end;
+
+class function TCrashCapture.GetCallStackEntry(
+  var AEntry: TCrashStackEntry): Boolean;
+begin
+  { Call stacks are only supported on iOS, Android and macOS }
+  Result := False;
+end;
+
+{$ENDIF}
+
+{$IF Defined(MACOS) or Defined(ANDROID) or Defined(LINUX)}
+class function TCrashCapture.GetCallStackEntry(
+  var AEntry: TCrashStackEntry): Boolean;
+var
+  Info: dl_info;
+  Status: Integer;
+  Demangled: MarshaledAString;
+begin
+  // dladdr success is enough: even without a nearest exported symbol (typical
+  // for internal RTL frames before the first Pascal export) Module/Offset are
+  // filled from dli_fname/dli_fbase. An extra dli_saddr<>nil check would lose
+  // those fields in such cases.
+  Result := dladdr(AEntry.CodeAddress, Info) <> 0;
+  if (Result) then
+  begin
+    AEntry.ModuleAddress := UIntPtr(Info.dli_fbase);
+    AEntry.ModuleName := String(Info.dli_fname);
+
+    if Info.dli_saddr <> nil then
+    begin
+      AEntry.RoutineAddress := UIntPtr(Info.dli_saddr);
+      if Info.dli_sname <> nil then
+      begin
+        Demangled := cxa_demangle(Info.dli_sname, nil, 0, Status);
+        if (Demangled = nil) then
+          AEntry.RoutineName := String(Info.dli_sname)
+        else
+        begin
+          AEntry.RoutineName := String(Demangled);
+          Posix.Stdlib.free(Demangled);
+        end;
+      end;
+    end
+    else
+    begin
+      // No nearest exported symbol - leave routine empty, but Module and
+      // Offset (via CodeAddress-ModuleAddress) are already filled.
+      AEntry.RoutineAddress := AEntry.ModuleAddress; // offset = code - module
+    end;
+
+    {$IF (Defined(MACOS64) and not Defined(IOS)) or Defined(LINUX)}
+    AEntry.LineNumber := GetLineNumber(AEntry.CodeAddress);
+    AEntry.RoutineLineNumber := GetLineNumber(AEntry.RoutineAddress);
+    {$ELSE}
+    AEntry.LineNumber := 0;
+    AEntry.RoutineLineNumber := 0;
+    {$ENDIF}
+  end;
+end;
+{$ENDIF}
+
+{$IF (Defined(MACOS64) and not Defined(IOS)) or Defined(LINUX)}
+// Moved here from inside the {$IF Defined(MACOS)} branch above so that it is
+// visible to the LINUX branch too -- the class declaration is now active for
+// both, and the implementation must live in a block both code paths reach.
+class function TCrashCapture.GetLineNumber(const AAddress: UIntPtr): Integer;
+begin
+  if (FLineNumberInfo = nil) then
+    FLineNumberInfo := TLineNumberInfo.Create;
+  Result := FLineNumberInfo.Lookup(AAddress);
+end;
+
+// Expose the singleton for diagnostic surfacing.
+class function TCrashCapture.GetLineNumberInfo: TLineNumberInfo;
+begin
+  if (FLineNumberInfo = nil) then
+    FLineNumberInfo := TLineNumberInfo.Create;
+  Result := FLineNumberInfo;
+end;
+{$ENDIF}
+
+initialization
+  TCrashCapture.FInstance := TCrashCapture.InternalCreate;
+
+finalization
+  FreeAndNil(TCrashCapture.FInstance);
+
+end.
