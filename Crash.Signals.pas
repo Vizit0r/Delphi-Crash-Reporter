@@ -527,7 +527,8 @@ begin
     begin
       SB.Append('  Note       : RIP in shared-lib range - this is a SECONDARY signal'); SB.Append(CRLF);
       SB.Append('               (caught inside the Pascal RTL / call-stack unwinder).'); SB.Append(CRLF);
-      SB.Append('               Primary crash details are in section 2 (Exception).'); SB.Append(CRLF);
+      SB.Append('               Registers section omitted - it would show the unwinder,'); SB.Append(CRLF);
+      SB.Append('               not the fault. Primary crash details are in section 2.'); SB.Append(CRLF);
     end;
     Result := SB.ToString;
   finally
@@ -539,11 +540,27 @@ procedure CrashTakeAndFormatSnapshots(out ARegistersSection,
   ASignalInfoSection: String);
 var
   S: TSignalSnapshot;
+  RIP: UInt64;
 begin
   ARegistersSection := '';
   ASignalInfoSection := '';
   if not TakeSnapshot(S) then Exit;
-  ARegistersSection  := FormatRegistersSection(S);
+  {$IF Defined(CPUX64)}
+  RIP := S.Rip;
+  {$ELSEIF Defined(CPUARM64)}
+  RIP := S.Pc;
+  {$ELSE}
+  RIP := 0;
+  {$IFEND}
+  // Emit the Registers section ONLY for a primary fault. A "secondary" snapshot
+  // (RIP in the shared-lib range) is not the crash - it's a benign fault caught
+  // inside the Pascal RTL / call-stack unwinder (e.g. _Unwind_Backtrace reading
+  // past the top stack frame); its registers are the unwinder's, not the crash's,
+  // so they are noise. A primary hardware fault in our own code has RIP in the
+  // exe's low range and its registers are kept. The Signal Info block is emitted
+  // regardless (small, diagnostic; its Note explains the omission).
+  if not GuessSnapshotIsSecondary(RIP) then
+    ARegistersSection := FormatRegistersSection(S);
   ASignalInfoSection := FormatSignalInfoSection(S);
 end;
 

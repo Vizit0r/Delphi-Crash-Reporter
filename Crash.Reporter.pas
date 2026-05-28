@@ -31,7 +31,7 @@ unit Crash.Reporter;
 interface
 
 uses
-  Crash.CallStack;
+  Crash.CallStack; // TCrashConfig, TCrashReport, TCrashReportSection(s)
 
 type
   { Shows a modal dialog with the full report text for non-fatal exceptions.
@@ -75,6 +75,13 @@ type
     OnShowDialog: TCrashShowDialogProc;
     { Optional extra-context provider appended to the report. nil -> none. }
     OnCollectContext: TCrashCollectContextProc;
+    { Report sections to OMIT entirely (header + body vanish). Default [] = full
+      report. Application, Exception and Call Stack are never omittable (the first
+      two carry the core crash info; the EL Viewer needs the Call Stack as the
+      report's structural anchor) and are intentionally absent from
+      TCrashReportSection. Use AllOptionalCrashReportSections to strip everything
+      but those three. }
+    DisabledSections: TCrashReportSections;
   end;
 
 { A config pre-filled with sensible defaults. Override the fields you need. }
@@ -310,6 +317,7 @@ begin
   if FConfig.AppName <> '' then Ctx.AppName := FConfig.AppName;
   Ctx.AppVersion := FConfig.AppVersion;
   Ctx.CompileTime := FConfig.CompilationTime;
+  Ctx.DisabledSections := FConfig.DisabledSections;
   // Exception thread: HandleReport runs synchronously in the crashing thread
   // (RTL hook -> TCrashCapture.ReportException -> OnReport -> here), so
   // CurrentThread IS the faulting thread - capture its real ID and name.

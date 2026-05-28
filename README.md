@@ -74,16 +74,35 @@ vary is a field — there are no compile-time constants baked into the library.
 | `AllowRestart` | `True` | Allow the Restart action (platform-gated) |
 | `OnShowDialog` | `nil` | GUI dialog provider; `nil` → brief stderr |
 | `OnCollectContext` | `nil` | Optional extra text appended to the report |
+| `DisabledSections` | `[]` (full report) | Report sections to omit entirely (header + body); Application, Exception and Call Stack are mandatory and not omittable |
 
 Set the env var `CRASH_NO_UPLOAD=1` to skip uploads and keep the file on disk
 (useful for local testing).
+
+### Trimming report sections
+
+`DisabledSections` omits whole sections from the `.el` — both the section header
+and its body disappear. Default `[]` emits the full report. The optional sections
+are `crsUser`, `crsComputer`, `crsOperatingSystem`, `crsStepsToReproduce`,
+`crsModules`, `crsRegisters`, `crsSignalInfo`. **Application, Exception and Call
+Stack are always emitted** — Application/Exception carry the core crash info, and
+the EurekaLog Viewer needs the Call Stack table as the report's structural anchor;
+they are deliberately not part of `TCrashReportSection`.
+
+```pascal
+Cfg.DisabledSections := [crsModules, crsRegisters];     // drop just these two
+Cfg.DisabledSections := AllOptionalCrashReportSections; // mandatory three only
+```
+
+`TCrashReportSection`, `TCrashReportSections` and `AllOptionalCrashReportSections`
+are declared in `Crash.CallStack` (which the quick-start already uses).
 
 ## Units
 
 Core (framework-agnostic):
 
 - `Crash.Reporter` — public façade: `TCrashConfig`, `DefaultCrashConfig`, `TCrashReporter`.
-- `Crash.CallStack` — RTL exception hooks + stack capture; `TCrashCapture`, `TCrashReport`.
+- `Crash.CallStack` — RTL exception hooks + stack capture; `TCrashCapture`, `TCrashReport`, `TCrashReportSection`.
 - `Crash.Signals` — POSIX `sigaction` CPU-register snapshot for hardware faults.
 - `Crash.Modules` — loaded-module enumeration.
 - `Crash.LineNumbers` — `.gol` line-number reader.

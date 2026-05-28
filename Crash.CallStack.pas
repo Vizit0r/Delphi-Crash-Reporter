@@ -90,6 +90,32 @@ type
   end;
 
 type
+  { Optional report sections the host can omit via TCrashConfig.DisabledSections.
+    When a section is disabled, its header AND body vanish from the .el entirely.
+    Application, Exception and Call Stack are mandatory (always emitted) and are
+    intentionally NOT listed here: Application/Exception carry the core "what
+    crashed and where", and the EL Viewer needs the Call Stack table as the report's
+    structural anchor (see ELogManager ParseBuffer / GetItem_Generals). }
+  TCrashReportSection = (
+    crsUser,              // section 3.x  User (name, email)
+    crsComputer,          // section 5.x  Computer (name, display DPI)
+    crsOperatingSystem,   // section 6.x  Operating System (type)
+    crsStepsToReproduce,  // section 8.x  Steps to reproduce (text)
+    crsModules,           // Modules Information table
+    crsRegisters,         // Registers (present only after a hardware signal fault)
+    crsSignalInfo         // Crash Signal Info (our custom trailing block)
+  );
+  TCrashReportSections = set of TCrashReportSection;
+
+const
+  { Every optional section. `DisabledSections := AllOptionalCrashReportSections`
+    yields the most minimal report: the mandatory Application + Exception + Call
+    Stack only. }
+  AllOptionalCrashReportSections: TCrashReportSections =
+    [crsUser, crsComputer, crsOperatingSystem, crsStepsToReproduce,
+     crsModules, crsRegisters, crsSignalInfo];
+
+type
   { Invoked by TCrashCapture when an unhandled exception is captured. Set it via
     TCrashCapture.OnReport. The report is built and handed over directly (no
     message broadcasting). May be called from any thread. }

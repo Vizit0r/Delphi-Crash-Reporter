@@ -40,6 +40,7 @@ type
     AppDpi: Integer;
     ThreadID: Cardinal;
     ThreadName: String;        // "MAIN" or the worker thread's name
+    DisabledSections: TCrashReportSections; // sections to OMIT; default [] = full report
   end;
 
 function CrashBuildELReportText(
@@ -388,7 +389,7 @@ begin
     SB.Append(StringOfChar('0', 32)); SB.Append(CRLF);
     SB.Append(CRLF);
 
-    // ============== Application ==============
+    // ============== Application ============== (mandatory: always emitted)
     AppendSectionHeader(SB, 'Application');
     AppendField(SB, '1.1 Start Date',       FormatELDate(ACtx.StartTime), 22);
     AppendField(SB, '1.2 Name/Description', ACtx.AppName, 22);
@@ -402,7 +403,7 @@ begin
     end;
     SB.Append(CRLF);
 
-    // ============== Exception ==============
+    // ============== Exception ============== (mandatory: always emitted)
     Loc := AReport.ExceptionLocation;
     AppendSectionHeader(SB, 'Exception');
     AppendField(SB, '2.1 Date',           FormatELDate(ACtx.ExceptionTime), 18);
@@ -417,28 +418,44 @@ begin
     SB.Append(CRLF);
 
     // ============== User ==============
-    AppendSectionHeader(SB, 'User');
-    AppendField(SB, '3.2 Name',  ACtx.UserName, 10);
-    AppendField(SB, '3.3 Email', '', 10);
-    SB.Append(CRLF);
+    if not (crsUser in ACtx.DisabledSections) then
+    begin
+      AppendSectionHeader(SB, 'User');
+      AppendField(SB, '3.2 Name',  ACtx.UserName, 10);
+      AppendField(SB, '3.3 Email', '', 10);
+      SB.Append(CRLF);
+    end;
 
     // ============== Computer ==============
-    AppendSectionHeader(SB, 'Computer');
-    AppendField(SB, '5.1 Name',        ACtx.ComputerName, 18);
-    AppendField(SB, '5.9 Display DPI', IntToStr(ACtx.AppDpi), 18);
-    SB.Append(CRLF);
+    if not (crsComputer in ACtx.DisabledSections) then
+    begin
+      AppendSectionHeader(SB, 'Computer');
+      AppendField(SB, '5.1 Name',        ACtx.ComputerName, 18);
+      AppendField(SB, '5.9 Display DPI', IntToStr(ACtx.AppDpi), 18);
+      SB.Append(CRLF);
+    end;
 
     // ============== Operating System ==============
-    AppendSectionHeader(SB, 'Operating System');
-    AppendField(SB, '6.1 Type', ACtx.OSDescription, 26);
-    SB.Append(CRLF);
+    if not (crsOperatingSystem in ACtx.DisabledSections) then
+    begin
+      AppendSectionHeader(SB, 'Operating System');
+      AppendField(SB, '6.1 Type', ACtx.OSDescription, 26);
+      SB.Append(CRLF);
+    end;
 
     // ============== Steps to reproduce ==============
-    AppendSectionHeader(SB, 'Steps to reproduce');
-    AppendField(SB, '8.1 Text', '', 10);
-    SB.Append(CRLF);
+    if not (crsStepsToReproduce in ACtx.DisabledSections) then
+    begin
+      AppendSectionHeader(SB, 'Steps to reproduce');
+      AppendField(SB, '8.1 Text', '', 10);
+      SB.Append(CRLF);
+    end;
 
     // ============== Call Stack Information ==============
+    // Mandatory section: always emitted, NOT gated by DisabledSections. The EL
+    // Viewer treats the first "-<CRLF>|" table as the report's structural anchor
+    // (ELogManager ParseBuffer / GetItem_Generals); without it the file fails the
+    // load gate and the remaining tabs mis-parse.
     // Pre-render each frame to compute max widths over the real data.
     Stack := AReport.CallStack;
     SetLength(Rendered, Length(Stack));
@@ -580,12 +597,15 @@ begin
     // + dashes-line + data + dashes-line. We don't call AppendSectionHeader - it
     // would add an extra short dashes-line over the long one from the table. An
     // empty "Modules Information:" is not emitted at all.
-    var ModulesText := CrashFormatModulesTable(CrashEnumerateModules);
-    if ModulesText <> '' then
+    if not (crsModules in ACtx.DisabledSections) then
     begin
-      SB.Append('Modules Information'); SB.Append(EHeaderSuffix); SB.Append(CRLF);
-      SB.Append(ModulesText);
-      SB.Append(CRLF);
+      var ModulesText := CrashFormatModulesTable(CrashEnumerateModules);
+      if ModulesText <> '' then
+      begin
+        SB.Append('Modules Information'); SB.Append(EHeaderSuffix); SB.Append(CRLF);
+        SB.Append(ModulesText);
+        SB.Append(CRLF);
+      end;
     end;
     // Processes Information / Assembler Information are intentionally NOT emitted:
     // we don't fill them with data, and the EL Viewer breaks on empty
@@ -594,7 +614,7 @@ begin
     //
     // Registers - short, special name (see EStrConsts.pas rsELCPU_RegistersVal).
     // An empty one (when no signal fired) is not emitted either.
-    if ACtx.CpuSnapshot <> '' then
+    if (not (crsRegisters in ACtx.DisabledSections)) and (ACtx.CpuSnapshot <> '') then
     begin
       SB.Append(ACtx.CpuSnapshot);
       if not ACtx.CpuSnapshot.EndsWith(CRLF) then SB.Append(CRLF);
@@ -604,7 +624,7 @@ begin
     // Comes AFTER all EL-known sections so the Viewer doesn't try to parse it.
     // It's invisible in the Viewer UI (unknown to it), but reads fine in a
     // text view of the .el file.
-    if ACtx.SignalInfoSection <> '' then
+    if (not (crsSignalInfo in ACtx.DisabledSections)) and (ACtx.SignalInfoSection <> '') then
     begin
       SB.Append(ACtx.SignalInfoSection);
       if not ACtx.SignalInfoSection.EndsWith(CRLF) then SB.Append(CRLF);
