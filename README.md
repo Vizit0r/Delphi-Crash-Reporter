@@ -75,6 +75,7 @@ vary is a field — there are no compile-time constants baked into the library.
 | `OnShowDialog` | `nil` | GUI dialog provider; `nil` → brief stderr |
 | `OnCollectContext` | `nil` | Optional extra text appended to the report |
 | `DisabledSections` | `[]` (full report) | Report sections to omit entirely (header + body); Application, Exception and Call Stack are mandatory and not omittable |
+| `ReportDir` | `''` (platform default) | Directory for `.el` files (write + boot-recovery scan). Empty → next to the `.app` on macOS (not inside the bundle), the exe's own dir on Linux/Windows |
 
 Set the env var `CRASH_NO_UPLOAD=1` to skip uploads and keep the file on disk
 (useful for local testing).

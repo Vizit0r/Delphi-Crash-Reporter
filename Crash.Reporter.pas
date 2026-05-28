@@ -82,6 +82,12 @@ type
       TCrashReportSection. Use AllOptionalCrashReportSections to strip everything
       but those three. }
     DisabledSections: TCrashReportSections;
+    { Directory for the .el reports (both writing and the boot-recovery scan).
+      Empty -> platform default: on macOS the directory NEXT TO the .app bundle
+      (never inside it - writing into a bundle breaks code signing, fails on
+      read-only install locations, and is invisible to users); the executable's
+      own directory on Linux/Windows. Trailing path delimiter optional. }
+    ReportDir: String;
   end;
 
 { A config pre-filled with sensible defaults. Override the fields you need. }
@@ -182,6 +188,7 @@ type
     FPendingReports: TArray<String>;
     FAppStartTime: TDateTime;   // captured in Init for the Up Time field
     function EffectiveFileNamePrefix: String;
+    function EffectiveReportDir: String;
     function BuildCrashFilePath: String;
     procedure WriteFatalBriefToConsole(const AReport: TCrashReport);
     procedure WriteToFile(const AText: String);
@@ -220,13 +227,47 @@ begin
     Result := GetExeBaseName + '_' + GetPlatformTag + '_';
 end;
 
+function TCrashReporterImpl.EffectiveReportDir: String;
+var
+  ExeDir: String;
+  {$IF Defined(MACOS)}
+  ExePath, MacOSDir, ContentsDir, AppDir: String;
+  {$IFEND}
+begin
+  // 1. Explicit host override always wins.
+  if FConfig.ReportDir <> '' then
+    Exit(IncludeTrailingPathDelimiter(FConfig.ReportDir));
+
+  {$IF Defined(MACOS)}
+  // 2. macOS: if we're inside a .app bundle (.../<X>.app/Contents/MacOS/<exe>),
+  // write reports NEXT TO the bundle, never inside it - writing into a bundle
+  // breaks code signing, fails on read-only install locations, and is invisible
+  // to users (Show Package Contents only). ExpandFileName resolves a relative
+  // argv[0] (e.g. ./X launched from inside MacOS/) so the detection still works.
+  ExePath     := ExpandFileName(ParamStr(0));
+  MacOSDir    := ExcludeTrailingPathDelimiter(ExtractFilePath(ExePath));
+  ContentsDir := ExcludeTrailingPathDelimiter(ExtractFilePath(MacOSDir));
+  AppDir      := ExcludeTrailingPathDelimiter(ExtractFilePath(ContentsDir));
+  if SameText(ExtractFileName(MacOSDir), 'MacOS') and
+     SameText(ExtractFileName(ContentsDir), 'Contents') and
+     SameText(ExtractFileExt(AppDir), '.app') then
+    Exit(IncludeTrailingPathDelimiter(ExtractFilePath(AppDir)));
+  ExeDir := ExtractFilePath(ExePath);
+  {$ELSE}
+  // 3. Linux / Windows: the executable's own directory.
+  ExeDir := ExtractFilePath(ParamStr(0));
+  {$IFEND}
+
+  if ExeDir = '' then
+    ExeDir := TPath.GetTempPath;
+  Result := IncludeTrailingPathDelimiter(ExeDir);
+end;
+
 function TCrashReporterImpl.BuildCrashFilePath: String;
 var
   Dir, Stamp: String;
 begin
-  Dir := ExtractFilePath(ParamStr(0));
-  if Dir = '' then
-    Dir := TPath.GetTempPath;
+  Dir := EffectiveReportDir;
   // <prefix><yyyymmddhhnnss>.el - prefix (project + platform by default) keeps
   // reports from different builds/targets from merging. .el lets the EurekaLog
   // Viewer open it natively.
@@ -465,7 +506,7 @@ var
   Kept: TList<String>;
   TryUpload: Boolean;
 begin
-  Dir := ExtractFilePath(ParamStr(0));
+  Dir := EffectiveReportDir; // same directory we write to (see BuildCrashFilePath)
   if Dir = '' then
     Exit;
   // Match this build's prefix only: different targets in one folder don't eat
