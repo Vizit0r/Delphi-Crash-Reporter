@@ -106,6 +106,11 @@ type
 
     { Basename of the last written .el (so an upload uses the same name). }
     class function LastCrashFileName: String; static;
+
+    { Delete the last written .el from disk. Call after a successful manual
+      Upload (e.g. from the dialog) to mirror the fatal-path "delete on upload
+      success" policy. No-op if there is no current file. }
+    class procedure DeleteLastCrashFile; static;
   end;
 
 implementation
@@ -544,6 +549,15 @@ class function TCrashReporter.LastCrashFileName: String;
 begin
   if GReporter = nil then Result := ''
   else                    Result := ExtractFileName(GReporter.FCrashFilePath);
+end;
+
+class procedure TCrashReporter.DeleteLastCrashFile;
+begin
+  if (GReporter <> nil) and (GReporter.FCrashFilePath <> '') then
+  begin
+    try TFile.Delete(GReporter.FCrashFilePath); except end;
+    GReporter.FCrashFilePath := '';
+  end;
 end;
 
 class function TCrashReporter.TakePending: TArray<String>;

@@ -215,14 +215,17 @@ end;
 procedure TCrashReportForm.DoOkClick(Sender: TObject);
 begin
   // OK = send report + continue. Upload is synchronous - the user waits a few
-  // seconds; failure isn't critical (the file is already on disk).
-  TCrashReporter.Upload(FMemo.Text, TCrashReporter.LastCrashFileName);
+  // seconds. On success drop the local .el (it's on the server now); on failure
+  // keep it on disk for the next boot-recovery attempt.
+  if TCrashReporter.Upload(FMemo.Text, TCrashReporter.LastCrashFileName) then
+    TCrashReporter.DeleteLastCrashFile;
   ModalResult := mrOk;
 end;
 
 procedure TCrashReportForm.DoRestartClick(Sender: TObject);
 begin
-  TCrashReporter.Upload(FMemo.Text, TCrashReporter.LastCrashFileName);
+  if TCrashReporter.Upload(FMemo.Text, TCrashReporter.LastCrashFileName) then
+    TCrashReporter.DeleteLastCrashFile;
   ModalResult := mrOk;
   TCrashReporter.Restart; // does not return (Halt in the child flow or after exec)
 end;

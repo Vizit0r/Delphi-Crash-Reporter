@@ -10,7 +10,7 @@ On **Windows** it is a no-op by design (use EurekaLog there); the units still
 compile so the same code base builds on every platform.
 
 Derived from [grijjy/JustAddCode](https://github.com/grijjy/JustAddCode)
-(ErrorReporting), BSD 2-Clause — see `LICENSE.txt` and `GRIJJY_UPSTREAM.md`.
+(ErrorReporting), BSD 2-Clause — see `LICENSE.txt`.
 
 ## What you get
 

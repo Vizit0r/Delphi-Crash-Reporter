@@ -2,7 +2,9 @@
 
 Upstream: https://github.com/grijjy/JustAddCode/tree/master/ErrorReporting/Tools/LineNumberGenerator
 
-Vendored verbatim, no patches.
+Derived from the Grijjy upstream above, renamed into the `Crash.*` namespace and
+integrated into this library, with a minor patch (skip duplicate-address line
+entries instead of raising, see `Generator.pas` / `GeneratorElf.pas`).
 
 ## What it does
 
@@ -26,7 +28,7 @@ LNG.exe <path-to-MachO-executable>
 
 `FMX/FMX_MAC_LINUX/UOStealth.dproj` has a PostBuildEvent under the Release
 OSX64 / OSXARM64 configs that calls `tools\run-lng.ps1` with the just-linked
-binary path; the script makes sure `Tools\Bin\LNG.exe` exists (auto-building
+binary path; the script makes sure `Crash\Tools\Bin\LNG.exe` exists (auto-building
 via `build.cmd lng_tool` on first use) and then invokes it. The resulting
 `.gol` is deployed into the `.app/Contents/MacOS/` bundle alongside the
 executable.
@@ -34,8 +36,9 @@ executable.
 ## Source paths
 
 `LNG.dpr` references `Crash.LineNumbers` and `Crash.MacOS.Api` at
-`..\..\Grijjy.*.pas` — those resolve to the parent Vendored directory in
-both upstream and our vendored layout, so no rewriting is required.
+`..\..\Crash.LineNumbers.pas` / `..\..\Crash.MacOS.Api.pas` — the runtime units
+two directories up in `Crash/`. `LNG_ELF.dpr` (the Linux ELF/DWARF sibling)
+references `Crash.LineNumbers` the same way.
 
 ## Building manually
 
@@ -43,4 +46,5 @@ both upstream and our vendored layout, so no rewriting is required.
 build.cmd lng_tool
 ```
 
-Produces `Vendored\Grijjy\ErrorReporting\Tools\Bin\LNG.exe` (Win32 Release).
+Produces `Crash\Tools\Bin\LNG.exe` (Win32 Release). The Linux generator is
+`build.cmd lng_elf_tool` -> `Crash\Tools\Bin\LNG_ELF.exe`.
