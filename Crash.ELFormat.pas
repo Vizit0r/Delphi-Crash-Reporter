@@ -719,6 +719,16 @@ begin
                 Format('  Line entries    : %d', [Lni.LineCount]) + #13#10 +
                 '  ELF BuildID(16) : ' + Lni.DiagImageBuildIdHex + #13#10 +
                 '  .gol Header.ID  : ' + Lni.DiagHeaderIdHex + #13#10;
+    if (Lni.Status <> TLineNumberStatus.Available) and Lni.DiagHasDwarf then
+      Diag := Diag +
+        '  Note            : ELF carries embedded DWARF (.debug_line) but no' + #13#10 +
+        '                    usable .gol, so source line numbers are not' + #13#10 +
+        '                    available (the Line column falls back to +$offset' + #13#10 +
+        '                    proxies). This is typically an IDE-built Linux' + #13#10 +
+        '                    binary: the IDE drives dcclinux64 directly and' + #13#10 +
+        '                    skips the MSBuild post-build that generates the' + #13#10 +
+        '                    .gol. Rebuild via "build.cmd fmx_linux" to emit a' + #13#10 +
+        '                    matching .gol next to the executable.' + #13#10;
     if Result.SignalInfoSection = '' then
       Result.SignalInfoSection := Diag
     else

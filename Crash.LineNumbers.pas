@@ -187,6 +187,8 @@ type
     FDiagFileExists: Boolean;
     FDiagImageBuildId: TGUID;
     FDiagHeaderId: TGUID;
+    FDiagHasDwarf: Boolean;
+    FDiagHasDwarfComputed: Boolean;
     {$ENDIF}
     function Load: TLineNumberStatus;
   private
@@ -214,6 +216,11 @@ type
     function DiagFilename: String;
     function DiagFileExists: Boolean;
     function DiagHeaderIdHex: String;
+    { True if the running ELF still carries a .debug_line section. When the
+      .gol failed to load (Status <> Available) this distinguishes an unstripped
+      IDE-built binary -- whose line numbers are recoverable by rebuilding via
+      build.cmd -- from a properly stripped release build. }
+    function DiagHasDwarf: Boolean;
     {$ENDIF}
   end;
 
@@ -304,6 +311,19 @@ type
     n_namesz: UInt32;
     n_descsz: UInt32;
     n_type: UInt32;
+  end;
+
+  Elf64_Shdr = packed record
+    sh_name: UInt32;       // offset into .shstrtab
+    sh_type: UInt32;
+    sh_flags: UInt64;
+    sh_addr: UInt64;
+    sh_offset: UInt64;
+    sh_size: UInt64;
+    sh_link: UInt32;
+    sh_info: UInt32;
+    sh_addralign: UInt64;
+    sh_entsize: UInt64;
   end;
 
   TLinuxElfImageInfo = record
@@ -400,6 +420,75 @@ begin
     Result.Found := False;
     Result.BaseAddr := 0;
     Result.BuildID := TGUID.Empty;
+  end;
+end;
+
+function SectionNameMatches(const AStrtab: TBytes; const AOff: UInt32;
+  const ATarget: AnsiString): Boolean;
+// Bounded compare of the NUL-terminated section name at AOff in .shstrtab
+// against ATarget. Fully bounds-checked -- never reads past AStrtab, so it is
+// safe to run on a (possibly malformed) image without risking a fault.
+var
+  K: Integer;
+begin
+  Result := False;
+  if (AOff >= UInt32(Length(AStrtab))) then
+    Exit;
+  // need room for ATarget's bytes plus the terminating NUL
+  if (Int64(AOff) + Length(ATarget)) >= Int64(Length(AStrtab)) then
+    Exit;
+  for K := 1 to Length(ATarget) do
+    if (AStrtab[Integer(AOff) + K - 1] <> Byte(ATarget[K])) then
+      Exit;
+  Result := (AStrtab[Integer(AOff) + Length(ATarget)] = 0);
+end;
+
+function LinuxImageHasDwarf: Boolean;
+// File-only check: does the running ELF still carry a .debug_line section?
+// Used only for crash-report diagnostics -- it lets the report tell an
+// IDE-built Linux binary (keeps embedded DWARF but has no matching .gol,
+// because the IDE drives dcclinux64 directly and skips the MSBuild post-build
+// that generates the .gol) apart from a properly stripped release build that
+// ships a matching .gol.
+// Same safety rules as GetLinuxImageInfo: plain TFileStream reads of
+// ParamStr(0), no cdecl callbacks, no /proc pseudo-files, fully guarded.
+var
+  Stream: TFileStream;
+  Ehdr: Elf64_Ehdr;
+  Shdrs: array of Elf64_Shdr;
+  StrtabBytes: TBytes;
+  I: Integer;
+begin
+  Result := False;
+  try
+    Stream := TFileStream.Create(ParamStr(0), fmOpenRead or fmShareDenyNone);
+    try
+      Stream.ReadBuffer(Ehdr, SizeOf(Ehdr));
+      if (Ehdr.e_ident[0] <> $7F) or (Ehdr.e_ident[1] <> Ord('E')) or
+         (Ehdr.e_ident[2] <> Ord('L')) or (Ehdr.e_ident[3] <> Ord('F')) then
+        Exit;
+      if (Ehdr.e_shoff = 0) or (Ehdr.e_shnum = 0) then Exit;
+      if (Ehdr.e_shentsize <> SizeOf(Elf64_Shdr)) then Exit;
+      if (Ehdr.e_shstrndx >= Ehdr.e_shnum) then Exit;  // no usable name table
+
+      SetLength(Shdrs, Ehdr.e_shnum);
+      Stream.Position := Ehdr.e_shoff;
+      Stream.ReadBuffer(Shdrs[0], Int64(Ehdr.e_shnum) * SizeOf(Elf64_Shdr));
+
+      if (Shdrs[Ehdr.e_shstrndx].sh_size = 0) or
+         (Shdrs[Ehdr.e_shstrndx].sh_size > 16 * 1024 * 1024) then Exit;
+      SetLength(StrtabBytes, Shdrs[Ehdr.e_shstrndx].sh_size);
+      Stream.Position := Shdrs[Ehdr.e_shstrndx].sh_offset;
+      Stream.ReadBuffer(StrtabBytes[0], Length(StrtabBytes));
+
+      for I := 0 to Ehdr.e_shnum - 1 do
+        if SectionNameMatches(StrtabBytes, Shdrs[I].sh_name, '.debug_line') then
+          Exit(True);
+    finally
+      Stream.Free;
+    end;
+  except
+    Result := False;
   end;
 end;
 {$ENDIF}
@@ -714,6 +803,19 @@ end;
 function TLineNumberInfo.DiagHeaderIdHex: String;
 begin
   Result := GuidToPlainHex(FDiagHeaderId);
+end;
+
+function TLineNumberInfo.DiagHasDwarf: Boolean;
+// Computed on first use (only the crash-report path asks for it) and cached --
+// the eager-init Load path stays a cheap .gol read, with the heavier ELF
+// section-table walk deferred to the rare moment a report is actually built.
+begin
+  if (not FDiagHasDwarfComputed) then
+  begin
+    FDiagHasDwarf := LinuxImageHasDwarf;
+    FDiagHasDwarfComputed := True;
+  end;
+  Result := FDiagHasDwarf;
 end;
 {$ENDIF}
 
