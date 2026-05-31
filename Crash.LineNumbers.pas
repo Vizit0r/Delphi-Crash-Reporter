@@ -654,7 +654,7 @@ begin
   // NOT terminate the process -- this code runs inside the crash reporter
   // path on first GetLineNumber call. Failure mode is silent: Status stays
   // Exception, Lookup returns 0, Line column falls back to "0[+$N]" proxy.
-  Result := TLineNumberStatus.Exception;
+  // (No explicit default here: the except handler below sets Exception on failure.)
   FDiagImageBuildId := TGUID.Empty;
   FDiagHeaderId := TGUID.Empty;
   FDiagFilename := '';

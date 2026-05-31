@@ -658,7 +658,7 @@ begin
       Client.ResponseTimeout := 30000;
       Form := TMultipartFormData.Create(True);
       try
-        Form.AddStream(FieldName, Stream, UploadName, 'application/octet-stream');
+        Form.AddStream(FieldName, Stream, False, UploadName, 'application/octet-stream');
         try
           Resp := Client.Post(GReporter.FConfig.UploadUrl, Form);
           Result := (Resp <> nil) and (Resp.StatusCode >= 200) and (Resp.StatusCode < 300);

@@ -202,7 +202,6 @@ var
   Req:   TMachExcRequest;
   Reply: mig_reply_error_t;
 begin
-  Result := nil;
   while True do
   begin
     FillChar(Req, SizeOf(Req), 0);

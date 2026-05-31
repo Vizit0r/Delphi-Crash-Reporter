@@ -324,7 +324,7 @@ begin
   Msg := AReport.ExceptionMessage;
   Hash := UInt32(Loc.CodeAddress xor (Loc.CodeAddress shr 32));
   if Msg <> '' then
-    Hash := Hash xor UInt32(Length(Msg) * 2654435761);
+    Hash := Hash xor (UInt32(Length(Msg)) * UInt32(2654435761));
   Result := IntToHex(Hash, 8);
 end;
 
