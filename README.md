@@ -1,13 +1,21 @@
 # Crash Reporter
 
 A standalone, **EurekaLog-compatible** crash/exception reporter for Delphi
-cross-platform targets (Linux, macOS, Android, iOS) built on FMX/RTL. No
+cross-platform targets (Linux, macOS, Android, iOS), built on the Delphi RTL. No
 EurekaLog license required — it produces `.el` text reports that the EurekaLog
 Viewer opens natively, with call stacks, CPU registers, modules and source line
 numbers.
 
 On **Windows** it is a no-op by design (use EurekaLog there); the units still
 compile so the same code base builds on every platform.
+
+**Not tied to FMX (or any UI framework).** The core is framework-agnostic: it
+depends only on the Delphi RTL (`System.*`, `Posix.*`), so it links into FMX
+apps, VCL apps and headless console/daemon targets alike. The *only* unit that
+references FMX is the optional `Crash.Dialog.FMX` (the GUI report dialog) — leave
+it out and non-fatal exceptions fall back to a stderr message. `Demo/CrashDemo`
+is precisely this case: a pure console program that links the entire reporter
+with zero FMX units.
 
 Derived from [grijjy/JustAddCode](https://github.com/grijjy/JustAddCode)
 (ErrorReporting), BSD 2-Clause — see `LICENSE.txt`.
@@ -252,6 +260,27 @@ strict in a few non-obvious ways:
   dialog tab caption), with no stray text between the `EXP/STK` line and the
   `Stack:` / `Memory Dump:` header.
 - **Encoding.** UTF-16LE + BOM, matching a Windows EurekaLog build.
+
+## Demo / smoke test
+
+`Demo/CrashDemo.dpr` (+ `CrashDemo.dproj`) is a tiny console program that uses
+**only** `Crash.*` units — no host framework, no FMX. It is the library's
+self-containment check: if it links on a bare console target and produces a
+valid `.el`, nothing inside `Crash\` secretly depends on a host application.
+
+```
+# build (Linux64, from the repo root)
+build.cmd crash_demo                 # -> Demo/Linux64/Release/CrashDemo
+
+# run (CRASH_NO_UPLOAD=1 keeps the .el on disk and skips any network)
+CRASH_NO_UPLOAD=1 ./CrashDemo --crash=segv     # hardware fault -> .el with Registers
+CRASH_NO_UPLOAD=1 ./CrashDemo --crash=raise    # software raise -> .el without Registers
+# also: --crash=fpe (div-by-zero), --crash=callbad (call into unmapped memory)
+```
+
+With no `--crash` argument it just prints `Reporter Active = True`. The reporter
+consumes the library purely via the unit search path (a single entry pointing at
+the parent `Crash\` directory), exactly as an external consumer would.
 
 ## License
 
