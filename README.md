@@ -1,10 +1,11 @@
 # Crash Reporter
 
-A standalone, **EurekaLog-compatible** crash/exception reporter for Delphi
-cross-platform targets (Linux, macOS, Android, iOS), built on the Delphi RTL. No
-EurekaLog license required — it produces `.el` text reports that the EurekaLog
-Viewer opens natively, with call stacks, CPU registers, modules and source line
-numbers.
+A standalone crash/exception reporter for Delphi cross-platform targets (Linux,
+macOS, Android, iOS), built on the Delphi RTL. It writes reports in EurekaLog's
+**`.el` file format** — no EurekaLog license required — so they open natively in
+the EurekaLog Viewer, with call stacks, CPU registers, modules and source line
+numbers. The compatibility is with the report *format* and Viewer; the library
+does not use EurekaLog itself.
 
 On **Windows** it is a no-op by design (use EurekaLog there); the units still
 compile so the same code base builds on every platform.
@@ -266,11 +267,13 @@ strict in a few non-obvious ways:
 `Demo/CrashDemo.dpr` (+ `CrashDemo.dproj`) is a tiny console program that uses
 **only** `Crash.*` units — no host framework, no FMX. It is the library's
 self-containment check: if it links on a bare console target and produces a
-valid `.el`, nothing inside `Crash\` secretly depends on a host application.
+valid `.el`, nothing in the library secretly depends on a host application.
 
 ```
-# build (Linux64, from the repo root)
-build.cmd crash_demo                 # -> Demo/Linux64/Release/CrashDemo
+# build (Linux64) — open Demo/CrashDemo.dproj in the IDE, or from a RAD Studio
+# command prompt (rsvars.bat applied to the environment):
+msbuild Demo/CrashDemo.dproj /t:Build /p:Config=Release /p:Platform=Linux64
+# -> Demo/Linux64/Release/CrashDemo
 
 # run (CRASH_NO_UPLOAD=1 keeps the .el on disk and skips any network)
 CRASH_NO_UPLOAD=1 ./CrashDemo --crash=segv     # hardware fault -> .el with Registers
@@ -279,8 +282,8 @@ CRASH_NO_UPLOAD=1 ./CrashDemo --crash=raise    # software raise -> .el without R
 ```
 
 With no `--crash` argument it just prints `Reporter Active = True`. The reporter
-consumes the library purely via the unit search path (a single entry pointing at
-the parent `Crash\` directory), exactly as an external consumer would.
+consumes the library purely via the unit search path (a single `..` entry — the
+directory holding the `Crash.*` units), exactly as an external consumer would.
 
 ## License
 
