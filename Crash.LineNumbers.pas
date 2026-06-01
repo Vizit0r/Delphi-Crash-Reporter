@@ -182,6 +182,12 @@ type
     FBaseAddress: UInt64;
     FLines: TArray<TLine>;
     FStatus: TLineNumberStatus;
+    { Per-module mode (CreateForModule): a NON-main loaded module (.so/.dylib).
+      Default (Create) keeps the main-image behavior byte-identical. }
+    FModuleMode: Boolean;
+    FModuleFilename: String;
+    FModuleID: TGUID;
+    FModuleSlide: UInt64;
     {$IF Defined(LINUX)}
     FDiagFilename: String;
     FDiagFileExists: Boolean;
@@ -207,6 +213,11 @@ type
   {$ENDREGION 'Internal Declarations'}
   public
     constructor Create;
+    { Reader for a NON-main loaded module: reads <module>.gol, matches it against
+      AID, and uses the module's runtime slide ASlide. (The main-image Create is
+      the default path and stays unchanged.) }
+    constructor CreateForModule(const AFilename: String; const AID: TGUID;
+      const ASlide: UInt64);
 
     { Returns source line number corresponding to given address, or 0 if not
       available. }
@@ -232,6 +243,13 @@ type
     {$ENDIF}
   end;
 
+{ Create a TLineNumberInfo for a NON-main loaded module identified by its runtime
+  base (dladdr's dli_fbase) and path. Computes the module's ID (LC_UUID / ELF
+  build-id) and slide internally, then reads <path>.gol. Returns nil if the module
+  can't be identified or on unsupported platforms. Caller owns the result. }
+function CreateModuleLineNumberInfo(AModuleBase: Pointer;
+  const AModulePath: String): TLineNumberInfo;
+
 implementation
 
 uses
@@ -250,10 +268,15 @@ uses
 const
   libDyld = '/usr/lib/system/libdyld.dylib';
 
+function _dyld_image_count: UInt32;
+  cdecl; external libDyld;
+
 function _dyld_get_image_header(image_index: UInt32): Pmach_header_64;
   cdecl; external libDyld;
 
-function _dyld_get_image_vmaddr_slide(image_index: UInt32): UInt32;
+// intptr_t -- 64-bit on x86_64/arm64. (Declaring it UInt32 would truncate a
+// dylib's runtime slide, which on macOS often sits above the 4 GB line.)
+function _dyld_get_image_vmaddr_slide(image_index: UInt32): NativeInt;
   cdecl; external libDyld;
 
 function GetID: TGUID;
@@ -541,6 +564,17 @@ begin
   FStatus := Load;
 end;
 
+constructor TLineNumberInfo.CreateForModule(const AFilename: String;
+  const AID: TGUID; const ASlide: UInt64);
+begin
+  inherited Create;
+  FModuleMode := True;
+  FModuleFilename := AFilename;
+  FModuleID := AID;
+  FModuleSlide := ASlide;
+  FStatus := Load;
+end;
+
 {$IF Defined(MACOS64) and not Defined(IOS)}
 function TLineNumberInfo.DecodeBlock(const ABytes: TArray<Byte>;
   const AOffset, ABlockSize: UInt32; const ARuntimeID: TGUID): TLineNumberStatus;
@@ -575,7 +609,10 @@ begin
   if (Header.ID <> ARuntimeID) then
     Exit(TLineNumberStatus.ExecutableIDMismatch);
 
-  FBaseAddress := Header.StartVMAddress + _dyld_get_image_vmaddr_slide(0);
+  if FModuleMode then
+    FBaseAddress := Header.StartVMAddress + FModuleSlide
+  else
+    FBaseAddress := Header.StartVMAddress + UInt64(_dyld_get_image_vmaddr_slide(0));
   SetLength(Lines, Header.Count + 1);
 
   { Run state machine program }
@@ -661,12 +698,17 @@ begin
   FBaseAddress := 0;
   FLines := nil;
 
-  Filename := ParamStr(0) + '.gol';
-  if (not FileExists(Filename)) then
+  if FModuleMode then
+    Filename := FModuleFilename
+  else
   begin
-    { MacOS only allows modules that are signable in the /Contents/MacOS/ path for signed/notarized apps }
-    ContentsResourcesPath := NSStrToStr(TNSBundle.Wrap(TNSBundle.OCClass.mainBundle).bundlePath) + '/Contents/Resources/';
-    Filename := ContentsResourcesPath + TPath.GetFileName(ParamStr(0)) + '.gol';
+    Filename := ParamStr(0) + '.gol';
+    if (not FileExists(Filename)) then
+    begin
+      { MacOS only allows modules that are signable in the /Contents/MacOS/ path for signed/notarized apps }
+      ContentsResourcesPath := NSStrToStr(TNSBundle.Wrap(TNSBundle.OCClass.mainBundle).bundlePath) + '/Contents/Resources/';
+      Filename := ContentsResourcesPath + TPath.GetFileName(ParamStr(0)) + '.gol';
+    end;
   end;
 
   if (not FileExists(Filename)) then
@@ -680,7 +722,8 @@ begin
     // The running image's LC_UUID. On a universal binary dyld maps only the
     // slice for the running architecture, so this UUID *is* the right arch's --
     // matching on it both selects the architecture and verifies binary identity.
-    RuntimeID := GetID;
+    // In module mode the caller already resolved the module's UUID.
+    if FModuleMode then RuntimeID := FModuleID else RuntimeID := GetID;
     Move(Bytes[0], Sig, SizeOf(Sig));
 
     if (Sig = LINE_NUMBER_SIGNATURE) then
@@ -726,6 +769,48 @@ begin
     Result := TLineNumberStatus.Exception;
   end;
 end;
+
+function CreateModuleLineNumberInfo(AModuleBase: Pointer;
+  const AModulePath: String): TLineNumberInfo;
+var
+  I, J:    Integer;
+  Slide:   NativeInt;
+  UUID:    TGUID;
+  Header:  Pmach_header_64;
+  Cmd:     Pload_command;
+  UuidCmd: Puuid_command absolute Cmd;
+  Found:   Boolean;
+begin
+  Result := nil;
+  if (AModuleBase = nil) or (AModulePath = '') then Exit;
+
+  // Find the dyld image whose runtime mach_header == AModuleBase -> exact slide
+  // and LC_UUID (dladdr's dli_fbase is exactly the mach_header pointer).
+  Found := False;
+  Slide := 0;
+  UUID  := TGUID.Empty;
+  for I := 0 to Integer(_dyld_image_count) - 1 do
+    if Pointer(_dyld_get_image_header(I)) = AModuleBase then
+    begin
+      Slide  := _dyld_get_image_vmaddr_slide(I);
+      Header := _dyld_get_image_header(I);
+      Cmd := Pointer(UIntPtr(Header) + SizeOf(mach_header_64));
+      for J := 0 to Header.ncmds - 1 do
+      begin
+        if (Cmd.cmd = LC_UUID) then
+        begin
+          UUID := TGUID(UuidCmd.uuid);
+          Break;
+        end;
+        Cmd := Pointer(UIntPtr(Cmd) + Cmd.cmdsize);
+      end;
+      Found := True;
+      Break;
+    end;
+
+  if (not Found) or (UUID = TGUID.Empty) then Exit;
+  Result := TLineNumberInfo.CreateForModule(AModulePath + '.gol', UUID, UInt64(Slide));
+end;
 {$ELSEIF Defined(LINUX)}
 // Linux variant of Load. Same on-disk .gol format and same DWARF state
 // machine as the macOS path -- only the .gol search path, the ID source
@@ -744,6 +829,8 @@ var
   I: Integer;
   A1, A2: UInt32;
   ImageInfo: TLinuxElfImageInfo;
+  MatchID: TGUID;
+  BaseSlide: UInt64;
 begin
   FBaseAddress := 0;
   FLines := nil;
@@ -758,16 +845,31 @@ begin
   FDiagFilename := '';
   FDiagFileExists := False;
   try
-    Filename := ParamStr(0) + '.gol';
+    if FModuleMode then
+      Filename := FModuleFilename
+    else
+      Filename := ParamStr(0) + '.gol';
     FDiagFilename := Filename;
     FDiagFileExists := FileExists(Filename);
     if not FDiagFileExists then
       Exit(TLineNumberStatus.FileNotFound);
 
-    ImageInfo := GetLinuxImageInfo;
-    FDiagImageBuildId := ImageInfo.BuildID;
-    if (not ImageInfo.Found) or (ImageInfo.BuildID = TGUID.Empty) then
-      Exit(TLineNumberStatus.ExecutableIDMismatch);
+    if FModuleMode then
+    begin
+      // The caller already resolved the module's build-id + runtime slide.
+      MatchID := FModuleID;
+      BaseSlide := FModuleSlide;
+      FDiagImageBuildId := FModuleID;
+    end
+    else
+    begin
+      ImageInfo := GetLinuxImageInfo;
+      FDiagImageBuildId := ImageInfo.BuildID;
+      if (not ImageInfo.Found) or (ImageInfo.BuildID = TGUID.Empty) then
+        Exit(TLineNumberStatus.ExecutableIDMismatch);
+      MatchID := ImageInfo.BuildID;
+      BaseSlide := ImageInfo.BaseAddr;
+    end;
 
     Stream := TFileStream.Create(Filename, fmOpenRead or fmShareDenyWrite);
     try
@@ -784,7 +886,7 @@ begin
       if (Header.Size <> Stream.Size) then
         Exit(TLineNumberStatus.InvalidSize);
 
-      if (Header.ID <> ImageInfo.BuildID) then
+      if (Header.ID <> MatchID) then
         Exit(TLineNumberStatus.ExecutableIDMismatch);
 
       SetLength(StateMachineProgram, Header.Size - SizeOf(Header));
@@ -794,7 +896,7 @@ begin
       Stream.Free;
     end;
 
-    FBaseAddress := Header.StartVMAddress + ImageInfo.BaseAddr;
+    FBaseAddress := Header.StartVMAddress + BaseSlide;
     SetLength(Lines, Header.Count + 1);
 
     { Run state machine program (same as macOS branch). }
@@ -859,10 +961,70 @@ begin
     Result := TLineNumberStatus.Exception;
   end;
 end;
+
+function GetElfBuildID(const APath: String): TGUID;
+// Read the first 16 bytes of the .note.gnu.build-id from any ELF file. Generalises
+// GetLinuxImageInfo (which only reads ParamStr(0)) to an arbitrary module path.
+var
+  Stream: TFileStream;
+  Ehdr: Elf64_Ehdr;
+  Phdrs: array of Elf64_Phdr;
+  I: Integer;
+  Note: TBytes;
+begin
+  Result := TGUID.Empty;
+  try
+    Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
+    try
+      Stream.ReadBuffer(Ehdr, SizeOf(Ehdr));
+      if (Ehdr.e_ident[0] <> $7F) or (Ehdr.e_ident[1] <> Ord('E')) or
+         (Ehdr.e_ident[2] <> Ord('L')) or (Ehdr.e_ident[3] <> Ord('F')) then Exit;
+      if (Ehdr.e_phnum = 0) or (Ehdr.e_phentsize <> SizeOf(Elf64_Phdr)) then Exit;
+      SetLength(Phdrs, Ehdr.e_phnum);
+      Stream.Position := Ehdr.e_phoff;
+      Stream.ReadBuffer(Phdrs[0], Int64(Ehdr.e_phnum) * SizeOf(Elf64_Phdr));
+      for I := 0 to High(Phdrs) do
+      begin
+        if Phdrs[I].p_type <> PT_NOTE then Continue;
+        if (Phdrs[I].p_filesz = 0) or (Phdrs[I].p_filesz > 65536) then Continue;
+        SetLength(Note, Phdrs[I].p_filesz);
+        Stream.Position := Phdrs[I].p_offset;
+        Stream.ReadBuffer(Note[0], Phdrs[I].p_filesz);
+        Result := ExtractBuildIDFromNoteBytes(Note);
+        if Result <> TGUID.Empty then Break;
+      end;
+    finally
+      Stream.Free;
+    end;
+  except
+    Result := TGUID.Empty;
+  end;
+end;
+
+function CreateModuleLineNumberInfo(AModuleBase: Pointer;
+  const AModulePath: String): TLineNumberInfo;
+var
+  BuildID: TGUID;
+begin
+  Result := nil;
+  if (AModulePath = '') then Exit;
+  BuildID := GetElfBuildID(AModulePath);
+  if BuildID = TGUID.Empty then Exit;
+  // Delphi shared objects are ET_DYN with link base 0, so the runtime slide is
+  // simply the module's load base (dladdr's dli_fbase).
+  Result := TLineNumberInfo.CreateForModule(AModulePath + '.gol', BuildID,
+                                            UInt64(NativeUInt(AModuleBase)));
+end;
 {$ELSE}
 function TLineNumberInfo.Load: TLineNumberStatus;
 begin
   Result := TLineNumberStatus.FileNotFound;
+end;
+
+function CreateModuleLineNumberInfo(AModuleBase: Pointer;
+  const AModulePath: String): TLineNumberInfo;
+begin
+  Result := nil;
 end;
 {$ENDIF}
 

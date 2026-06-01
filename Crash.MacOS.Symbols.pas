@@ -68,8 +68,12 @@ const
   libSystem = '/usr/lib/libSystem.dylib';
   libDyld   = '/usr/lib/system/libdyld.dylib';
 
+function _dyld_image_count: UInt32; cdecl;
+  external libDyld name '_dyld_image_count';
 function _dyld_get_image_header(image_index: UInt32): Pmach_header_64; cdecl;
   external libDyld name '_dyld_get_image_header';
+function _dyld_get_image_name(image_index: UInt32): MarshaledAString; cdecl;
+  external libDyld name '_dyld_get_image_name';
 function _dyld_get_image_vmaddr_slide(image_index: UInt32): NativeInt; cdecl;
   external libDyld name '_dyld_get_image_vmaddr_slide';
 
@@ -83,11 +87,17 @@ type
     Address: UInt64;
     Name:    String;
   end;
+  { Per-image symbol cache: the image's runtime __TEXT range (for "is this
+    address in this image?") plus its symbols, address-sorted with the image's
+    slide already applied. One of these per cached (= our own) Mach-O image. }
+  TImageSymbols = record
+    LoBound, HiBound: UInt64;
+    Symbols:          TArray<TSymbolEntry>;
+  end;
 
 var
-  GSymbols: TArray<TSymbolEntry>;
-  GLoaded:  Boolean = False;
-  GExeLoBound, GExeHiBound: UInt64;
+  GImages: TArray<TImageSymbols>;
+  GLoaded: Boolean = False;
 
 function DemangleName(AMangled: MarshaledAString): String;
 // __cxa_demangle returns a malloc'd buffer that we must Posix.Stdlib.free.
@@ -127,35 +137,48 @@ begin
   Result := True;
 end;
 
-procedure CrashInitMacOSSymbolCache;
-var
-  Header:           Pmach_header_64;
-  Slide:            NativeInt;
-  LCmd:             Pload_command;
-  Seg:              Psegment_command_64;
-  Symtab:           Psymtab_command;
-  Linkedit:         Psegment_command_64;
-  TextSeg:          Psegment_command_64;
-  P:                PByte;
-  I, N:             Integer;
-  SymtabPtr:        Pnlist_64;
-  StrTabBase:       PAnsiChar;
-  Sym:              Pnlist_64;
-  LinkeditVMBase:   UInt64;
-  Symbols:          TList<TSymbolEntry>;
-  Entry:            TSymbolEntry;
-  NameC:            MarshaledAString;
+function IsSystemImagePath(const APath: String): Boolean;
+// System dylibs (AppKit/libsystem/...) live under /usr/ or /System/. We skip
+// them: their names resolve fine via dladdr (honest exports), and -- critically
+// -- they live in the dyld shared cache, whose __LINKEDIT is a single combined
+// region NOT laid out at each image's own (symoff - fileoff), so the per-image
+// pointer math below would read garbage for them. Our own modules (main exe +
+// bundled .dylib plugins) are regular on-disk Mach-Os mapped normally.
 begin
-  if GLoaded then Exit;
-  GLoaded := True;
-  GSymbols := nil;
+  Result := (APath = '') or
+            APath.StartsWith('/usr/') or
+            APath.StartsWith('/System/');
+end;
 
-  Header := _dyld_get_image_header(0);
+function TryBuildImage(AIndex: UInt32; out AImg: TImageSymbols): Boolean;
+// Parse one dyld image's LC_SYMTAB into an address-sorted symbol cache, with the
+// image's own slide applied. Returns False (and AImg empty) if the image has no
+// usable symtab/text. Same pointer math as before, now per-image.
+var
+  Header:         Pmach_header_64;
+  Slide:          NativeInt;
+  LCmd:           Pload_command;
+  Seg:            Psegment_command_64;
+  Symtab:         Psymtab_command;
+  Linkedit:       Psegment_command_64;
+  TextSeg:        Psegment_command_64;
+  P:              PByte;
+  I, N:           Integer;
+  SymtabPtr:      Pnlist_64;
+  StrTabBase:     PAnsiChar;
+  Sym:            Pnlist_64;
+  LinkeditVMBase: UInt64;
+  Symbols:        TList<TSymbolEntry>;
+  Entry:          TSymbolEntry;
+  NameC:          MarshaledAString;
+begin
+  Result := False;
+  AImg := Default(TImageSymbols);
+
+  Header := _dyld_get_image_header(AIndex);
   if Header = nil then Exit;
-  Slide := _dyld_get_image_vmaddr_slide(0);
+  Slide := _dyld_get_image_vmaddr_slide(AIndex);
 
-  // Walk load commands - find __LINKEDIT (for symtab/strtab address mapping),
-  // LC_SYMTAB, and __TEXT (for bounds checking exe-internal addresses).
   Linkedit := nil;
   Symtab   := nil;
   TextSeg  := nil;
@@ -178,18 +201,14 @@ begin
     Inc(P, LCmd.cmdsize);
   end;
 
-  if (Linkedit = nil) or (Symtab = nil) then Exit;
+  if (Linkedit = nil) or (Symtab = nil) or (TextSeg = nil) then Exit;
 
-  // __TEXT bounds (for fast "is this address in our exe" check).
-  if TextSeg <> nil then
-  begin
-    GExeLoBound := TextSeg.vmaddr + UInt64(Slide);
-    GExeHiBound := GExeLoBound + TextSeg.vmsize;
-  end;
+  AImg.LoBound := TextSeg.vmaddr + UInt64(Slide);
+  AImg.HiBound := AImg.LoBound + TextSeg.vmsize;
 
-  // symtab.symoff / .stroff are FILE offsets. In the running image,
-  // __LINKEDIT is mmap'd; the file offset within __LINKEDIT translates
-  // to (LINKEDIT.vmaddr + slide) + (file_offset - LINKEDIT.fileoff).
+  // symtab.symoff / .stroff are FILE offsets. In the running image, __LINKEDIT
+  // is mmap'd; the file offset within __LINKEDIT translates to
+  // (LINKEDIT.vmaddr + slide) + (file_offset - LINKEDIT.fileoff).
   LinkeditVMBase := Linkedit.vmaddr + UInt64(Slide);
   SymtabPtr := Pnlist_64(NativeUInt(LinkeditVMBase
                          + UInt64(Symtab.symoff) - Linkedit.fileoff));
@@ -202,24 +221,19 @@ begin
     Sym := SymtabPtr;
     for N := 0 to Symtab.nsyms - 1 do
     begin
-      // Skip debug stabs entries.
-      if (Sym.n_type and N_STAB) = 0 then
+      // Skip debug stabs; only "defined in section" symbols have real addresses.
+      if ((Sym.n_type and N_STAB) = 0) and ((Sym.n_type and N_TYPE) = N_SECT) then
       begin
-        // Only "defined in section" symbols have real addresses.
-        if (Sym.n_type and N_TYPE) = N_SECT then
+        // n_strx lives in the anonymous nested record n_un (see Crash.MacOS.Api).
+        NameC := MarshaledAString(StrTabBase + Sym.n_un.n_strx);
+        if (NameC <> nil) and (NameC^ <> #0) then
         begin
-          // n_strx lives in the anonymous nested record n_un (see Crash.MacOS.Api).
-          NameC := MarshaledAString(StrTabBase + Sym.n_un.n_strx);
-          if (NameC <> nil) and (NameC^ <> #0) then
-          begin
-            Entry.Address := Sym.n_value + UInt64(Slide);
-            // Mach-O convention: prepended underscore on every external
-            // symbol - strip it before demangling.
-            if NameC^ = '_' then Inc(NameC);
-            Entry.Name := DemangleName(NameC);
-            if Entry.Name <> '' then
-              Symbols.Add(Entry);
-          end;
+          Entry.Address := Sym.n_value + UInt64(Slide);
+          // Mach-O convention: prepended underscore on every external symbol.
+          if NameC^ = '_' then Inc(NameC);
+          Entry.Name := DemangleName(NameC);
+          if Entry.Name <> '' then
+            Symbols.Add(Entry);
         end;
       end;
       Inc(Sym);
@@ -233,47 +247,101 @@ begin
         else Result := 0;
       end));
 
-    GSymbols := Symbols.ToArray;
+    AImg.Symbols := Symbols.ToArray;
   finally
     Symbols.Free;
+  end;
+
+  Result := Length(AImg.Symbols) > 0;
+end;
+
+procedure CrashInitMacOSSymbolCache;
+// Cache LC_SYMTAB of the main exe (image 0) AND every non-system loaded image
+// (our bundled .dylib plugins), so Pascal frame names resolve in plugin code too
+// -- macOS dladdr can't see Pascal symbols. Snapshot at Init time; images loaded
+// later are not covered. Per-image failures are isolated (a malformed image just
+// gets skipped, never aborts startup).
+var
+  Count, I: UInt32;
+  NameC:    MarshaledAString;
+  Path:     String;
+  Img:      TImageSymbols;
+  List:     TList<TImageSymbols>;
+begin
+  if GLoaded then Exit;
+  GLoaded := True;
+  GImages := nil;
+
+  Count := _dyld_image_count;
+  List := TList<TImageSymbols>.Create;
+  try
+    for I := 0 to Count - 1 do
+    begin
+      NameC := _dyld_get_image_name(I);
+      Path  := '';
+      if NameC <> nil then
+        Path := String(AnsiString(NameC));
+      // Always include the main image (0); skip system images otherwise.
+      if (I <> 0) and IsSystemImagePath(Path) then Continue;
+      try
+        if TryBuildImage(I, Img) then
+          List.Add(Img);
+      except
+        // A malformed image must never break startup -- just skip it.
+      end;
+    end;
+    GImages := List.ToArray;
+  finally
+    List.Free;
   end;
 end;
 
 function CrashMacOSSymbolCacheCount: Integer;
+var
+  Img: TImageSymbols;
 begin
-  Result := Length(GSymbols);
+  Result := 0;
+  for Img in GImages do
+    Inc(Result, Length(Img.Symbols));
 end;
 
 function CrashLookupMacOSSymbol(AAddress: UInt64;
   out ASymbolName: String; out ASymbolAddress: UInt64): Boolean;
 var
-  Lo, Hi, Mid: Integer;
+  I, Lo, Hi, Mid: Integer;
 begin
   Result := False;
   ASymbolName := '';
   ASymbolAddress := 0;
-  if Length(GSymbols) = 0 then Exit;
-  // Reject addresses outside our exe's __TEXT - those resolve via dladdr
-  // (foreign modules: AppKit, dyld, libsystem - their dynsym is honest).
-  if (GExeHiBound > 0) and
-     ((AAddress < GExeLoBound) or (AAddress >= GExeHiBound)) then Exit;
-  if AAddress < GSymbols[0].Address then Exit;
 
-  // Binary search for largest entry with Address <= AAddress.
-  Lo := 0;
-  Hi := High(GSymbols);
-  while Lo < Hi do
+  // Find the cached image whose __TEXT contains AAddress. Addresses outside every
+  // cached (= our own) image resolve via dladdr (foreign/system modules export
+  // honest names).
+  for I := 0 to High(GImages) do
   begin
-    Mid := (Lo + Hi + 1) div 2;
-    if GSymbols[Mid].Address <= AAddress then
-      Lo := Mid
-    else
-      Hi := Mid - 1;
-  end;
+    if (AAddress < GImages[I].LoBound) or (AAddress >= GImages[I].HiBound) then
+      Continue;
+    if (Length(GImages[I].Symbols) = 0) or
+       (AAddress < GImages[I].Symbols[0].Address) then
+      Exit;  // inside this image's text but before its first symbol -> no match
 
-  ASymbolName    := GSymbols[Lo].Name;
-  ASymbolAddress := GSymbols[Lo].Address;
-  Result := True;
+    // Binary search for the largest entry with Address <= AAddress.
+    Lo := 0;
+    Hi := High(GImages[I].Symbols);
+    while Lo < Hi do
+    begin
+      Mid := (Lo + Hi + 1) div 2;
+      if GImages[I].Symbols[Mid].Address <= AAddress then
+        Lo := Mid
+      else
+        Hi := Mid - 1;
+    end;
+
+    ASymbolName    := GImages[I].Symbols[Lo].Name;
+    ASymbolAddress := GImages[I].Symbols[Lo].Address;
+    Result := True;
+    Exit;
+  end;
 end;
 
 {$ELSE}  // not (MACOS and not IOS) - no-op stubs

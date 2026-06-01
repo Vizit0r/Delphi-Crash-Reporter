@@ -19,7 +19,7 @@ Derived from [grijjy/JustAddCode](https://github.com/grijjy/JustAddCode)
 | Unhandled-exception trapping | ✅ | ✅ | ✅ | ✅ | ❌ (EurekaLog) |
 | Call stack (Pascal names) | ✅ | ✅ (LC_SYMTAB) | ✅ | ✅ | ❌ |
 | Source line numbers (`.gol`) | ✅ | ✅ | — | — | — |
-| CPU registers on hardware faults | ✅ | — (Mach ports) | — | — | — |
+| CPU registers on hardware faults | ✅ | ✅ (signal ucontext / Mach) | — | — | — |
 | Modules section | ✅ | ✅ | ✅ | — | — |
 | EL-compatible `.el` output | ✅ | ✅ | ✅ | ✅ | — |
 | Save / upload / dialog / restart | ✅ | ✅ | ✅ (no restart) | ✅ (no restart) | — |
@@ -199,6 +199,17 @@ to the binary; macOS also falls back to `Contents/Resources/<exe>.gol`):
 
 The generators need debug info on the target (DWARF / `.dSYM`) — see *Build
 requirements* above.
+
+**Optional — strip the binary.** The shipped Mach-O carries the DWARF debug map
+(STAB symbols) that only `dsymutil` needs at build time; at runtime the reporter
+uses the *regular* symbol table (names) and the `.gol` (lines), never the STABs.
+Running `strip -S <binary>` before `codesign` drops only those debug symbols
+(~27% smaller on a typical FMX build) while leaving `LC_UUID`, the code addresses
+and the name table untouched — so the `.gol` and the crash-stack names stay valid.
+Use **`-S` only**; a plain `strip` / `-x` removes local symbols and loses Pascal
+names. Strip invalidates the signature, so it must run *before* `codesign`. (The
+Linux pipeline does the equivalent with `objcopy --strip-all`, which keeps
+`.dynsym` + the build-id for the same reason.)
 
 ## Hardware faults (POSIX signals)
 

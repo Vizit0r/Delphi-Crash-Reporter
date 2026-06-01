@@ -21,6 +21,7 @@ interface
 uses
   {$IF (Defined(MACOS64) and not Defined(IOS)) or Defined(LINUX)}
   Crash.LineNumbers,
+  System.Generics.Collections,
   {$ENDIF}
   System.SysUtils;
 
@@ -131,7 +132,11 @@ type
     FOnReport: TCrashReportEvent;
     {$IF (Defined(MACOS64) and not Defined(IOS)) or Defined(LINUX)}
     FLineNumberInfo: TLineNumberInfo;
+    { Per-module .gol readers for NON-main loaded modules (.so/.dylib), keyed by
+      module base. Lazily populated; a nil value caches a "no .gol" miss. }
+    FModuleReaders: TDictionary<UIntPtr, TLineNumberInfo>;
     class function GetLineNumber(const AAddress: UIntPtr): Integer; static;
+    class function GetModuleLineNumber(const AAddress: UIntPtr): Integer; static;
   public class var
     class function GetLineNumberInfo: TLineNumberInfo; static;
   private class var
@@ -977,6 +982,43 @@ begin
   if (FLineNumberInfo = nil) then
     FLineNumberInfo := TLineNumberInfo.Create;
   Result := FLineNumberInfo.Lookup(AAddress);
+  // Main-exe reader had no line -> the address may be in a loaded module (.so/
+  // .dylib) that ships its own .gol. This only fires for non-main addresses, so
+  // the verified main path is untouched.
+  if (Result = 0) then
+    Result := GetModuleLineNumber(AAddress);
+end;
+
+class function TCrashCapture.GetModuleLineNumber(const AAddress: UIntPtr): Integer;
+// Per-module fallback. Fully guarded -- this runs while building a crash report,
+// so a fault here must never double-fault the process.
+var
+  Info: dl_info;
+  Base: UIntPtr;
+  Reader: TLineNumberInfo;
+begin
+  Result := 0;
+  try
+    if (dladdr(AAddress, Info) = 0) or (Info.dli_fbase = nil) then Exit;
+    Base := UIntPtr(Info.dli_fbase);
+    // Skip the main image -- handled by FLineNumberInfo (which already returned 0).
+    if (FInstance <> nil) and (Base = FInstance.FModuleAddress) then Exit;
+
+    if (FModuleReaders = nil) then
+      FModuleReaders := TDictionary<UIntPtr, TLineNumberInfo>.Create;
+
+    if not FModuleReaders.TryGetValue(Base, Reader) then
+    begin
+      // First sighting of this module: build its reader (nil = no/mismatched .gol).
+      Reader := CreateModuleLineNumberInfo(Info.dli_fbase, String(Info.dli_fname));
+      FModuleReaders.Add(Base, Reader);   // cache the miss (nil) too
+    end;
+
+    if (Reader <> nil) then
+      Result := Reader.Lookup(AAddress);
+  except
+    Result := 0;
+  end;
 end;
 
 // Expose the singleton for diagnostic surfacing.
