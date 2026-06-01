@@ -196,6 +196,14 @@ type
     class function ReadVarInt(var ABuf: PByte; const ABufEnd: PByte;
       out AValue: UInt32): Boolean; static;
     {$ENDIF}
+    {$IF Defined(MACOS64) and not Defined(IOS)}
+    { Decode a single self-contained 'GOLN' block that lives inside ABytes at
+      [AOffset, AOffset+ABlockSize). Used for both a legacy single-arch .gol
+      (the whole file is one block) and one slice of a universal 'GOLF'
+      container. Sets FBaseAddress/FLines on success. }
+    function DecodeBlock(const ABytes: TArray<Byte>; const AOffset, ABlockSize: UInt32;
+      const ARuntimeID: TGUID): TLineNumberStatus;
+    {$ENDIF}
   {$ENDREGION 'Internal Declarations'}
   public
     constructor Create;
@@ -266,6 +274,37 @@ begin
   end;
   Result := TGUID.Empty;
 end;
+
+const
+  { Signature of a universal (fat) .gol container: 'GOLF'. Distinct from the
+    single-arch block signature 'GOLN' (LINE_NUMBER_SIGNATURE) so the reader can
+    tell the two apart by sniffing the first 4 bytes, and so an old reader that
+    only knows 'GOLN' rejects a container cleanly (InvalidSignature) instead of
+    misreading it. A macOS universal binary keeps a distinct LC_UUID per arch
+    slice; one single-arch .gol can therefore only match one slice. The fat
+    container bundles one 'GOLN' block per arch and the reader picks the slice
+    whose embedded UUID == the running image's LC_UUID -- which automatically
+    selects the correct architecture. }
+  LINE_NUMBER_FAT_SIGNATURE = $464C4F47; // 'GOLF'
+  LINE_NUMBER_FAT_VERSION   = $00010000;
+
+type
+  { Header of a universal .gol container. Followed by Count TLineNumberFatEntry
+    records, then the Count embedded single-arch 'GOLN' blocks. }
+  TLineNumberFatHeader = packed record
+    Signature: UInt32;   // LINE_NUMBER_FAT_SIGNATURE
+    Version:   UInt32;   // LINE_NUMBER_FAT_VERSION (major-gated like the block version)
+    Count:     UInt32;   // number of arch slices that follow
+  end;
+
+  { Directory entry: locates one arch's embedded 'GOLN' block and carries its
+    slice UUID for runtime matching. }
+  TLineNumberFatEntry = packed record
+    CpuType: UInt32;     // Mach-O CPU_TYPE_* of the slice (informational; match is by ID)
+    ID:      TGUID;      // slice LC_UUID -- the actual key compared against GetID
+    Offset:  UInt64;     // file offset of the embedded 'GOLN' block
+    Size:    UInt64;     // size of that block (== the block's own Header.Size)
+  end;
 {$ENDIF}
 
 {$IF Defined(LINUX)}
@@ -503,18 +542,120 @@ begin
 end;
 
 {$IF Defined(MACOS64) and not Defined(IOS)}
-function TLineNumberInfo.Load: TLineNumberStatus;
+function TLineNumberInfo.DecodeBlock(const ABytes: TArray<Byte>;
+  const AOffset, ABlockSize: UInt32; const ARuntimeID: TGUID): TLineNumberStatus;
 var
-  Filename: String;
-  Stream: TFileStream;
   Header: TLineNumberHeader;
   Line: TLine;
   Lines: TArray<TLine>;
-  StateMachineProgram: TBytes;
   PC, PCEnd: PByte;
   Opcode: Byte;
   I: Integer;
   A1, A2: UInt32;
+  Base: PByte;
+begin
+  // Bounds: the block must fit inside ABytes and at least hold a header.
+  if (ABlockSize < SizeOf(Header)) then
+    Exit(TLineNumberStatus.InvalidSize);
+  if (UInt64(AOffset) + UInt64(ABlockSize) > UInt64(Length(ABytes))) then
+    Exit(TLineNumberStatus.InvalidSize);
+
+  Move(ABytes[AOffset], Header, SizeOf(Header));
+
+  if (Header.Signature <> LINE_NUMBER_SIGNATURE) then
+    Exit(TLineNumberStatus.InvalidSignature);
+
+  if ((Header.Version shr 16) > (LINE_NUMBER_VERSION shr 16)) then
+    Exit(TLineNumberStatus.UnsupportedVersion);
+
+  // The block's own Size field must describe exactly this block (not the file).
+  if (Header.Size <> ABlockSize) then
+    Exit(TLineNumberStatus.InvalidSize);
+
+  if (Header.ID <> ARuntimeID) then
+    Exit(TLineNumberStatus.ExecutableIDMismatch);
+
+  FBaseAddress := Header.StartVMAddress + _dyld_get_image_vmaddr_slide(0);
+  SetLength(Lines, Header.Count + 1);
+
+  { Run state machine program }
+  Base := PByte(@ABytes[AOffset]);
+  Line.RelAddress := 0;
+  Line.Line := Header.StartLine;
+  Lines[0] := Line;
+  PC := Base + SizeOf(Header);
+  PCEnd := Base + ABlockSize;
+  for I := 1 to Header.Count do
+  begin
+    if (PC >= PCEnd) then
+      Exit(TLineNumberStatus.FileCorrupt);
+
+    Opcode := PC^;
+    Inc(PC);
+
+    if (OpCode < OP_ADVANCE_ADDR) then
+    begin
+      { 1-byte opcode }
+      Inc(Line.RelAddress, (OpCode shr 2) + 1);
+      Inc(Line.Line, (OpCode and 3) + 1);
+    end
+    else case OpCode of
+      OP_ADVANCE_ADDR:
+        begin
+          { 2-byte opcode }
+          if (PC >= PCEnd) then
+            Exit(TLineNumberStatus.FileCorrupt);
+
+          Inc(Line.RelAddress, 63);
+          Opcode := PC^;
+          Inc(PC);
+
+          if (Opcode < OP_ADVANCE_ADDR) then
+          begin
+            Inc(Line.RelAddress, (OpCode shr 2) + 1);
+            Inc(Line.Line, (OpCode and 3) + 1);
+          end
+          else
+            Exit(TLineNumberStatus.FileCorrupt);
+        end;
+
+      OP_ADVANCE_REL,
+      OP_ADVANCE_ABS:
+        begin
+          { Updates are provided in 2 VarInt parameters }
+          if (not ReadVarInt(PC, PCEnd, A1)) then
+            Exit(TLineNumberStatus.FileCorrupt);
+
+          if (not ReadVarInt(PC, PCEnd, A2)) then
+            Exit(TLineNumberStatus.FileCorrupt);
+
+          Inc(Line.RelAddress, A1 + 1);
+          if (Opcode = OP_ADVANCE_REL) then
+            Inc(Line.Line, A2 + 1)
+          else
+            Line.Line := A2;
+        end;
+    else
+      Exit(TLineNumberStatus.FileCorrupt);
+    end;
+
+    Lines[I] := Line;
+  end;
+
+  FLines := Lines;
+  Result := TLineNumberStatus.Available;
+end;
+
+function TLineNumberInfo.Load: TLineNumberStatus;
+var
+  Filename: String;
+  Bytes: TBytes;
+  RuntimeID: TGUID;
+  Sig: UInt32;
+  FatHeader: TLineNumberFatHeader;
+  Entry: TLineNumberFatEntry;
+  EntryOff: UInt32;
+  I: Integer;
   ContentsResourcesPath: String;
 begin
   FBaseAddress := 0;
@@ -532,98 +673,55 @@ begin
     Exit(TLineNumberStatus.FileNotFound);
 
   try
-    Stream := TFileStream.Create(Filename, fmOpenRead or fmShareDenyWrite);
-    try
-      if (Stream.Read(Header, SizeOf(Header)) <> SizeOf(Header)) then
-        Exit(TLineNumberStatus.InvalidSize);
+    Bytes := TFile.ReadAllBytes(Filename);
+    if (Length(Bytes) < SizeOf(Sig)) then
+      Exit(TLineNumberStatus.InvalidSize);
 
-      if (Header.Signature <> LINE_NUMBER_SIGNATURE) then
-        Exit(TLineNumberStatus.InvalidSignature);
+    // The running image's LC_UUID. On a universal binary dyld maps only the
+    // slice for the running architecture, so this UUID *is* the right arch's --
+    // matching on it both selects the architecture and verifies binary identity.
+    RuntimeID := GetID;
+    Move(Bytes[0], Sig, SizeOf(Sig));
 
-      if ((Header.Version shr 16) > (LINE_NUMBER_VERSION shr 16)) then
-        Exit(TLineNumberStatus.UnsupportedVersion);
-
-      if (Header.Size <> Stream.Size) then
-        Exit(TLineNumberStatus.InvalidSize);
-
-      if (Header.ID <> GetID) then
-        Exit(TLineNumberStatus.ExecutableIDMismatch);
-
-      SetLength(StateMachineProgram, Header.Size - SizeOf(Header));
-      if (Stream.Read(StateMachineProgram[0], Length(StateMachineProgram)) <> Length(StateMachineProgram)) then
-        Exit(TLineNumberStatus.InvalidSize);
-    finally
-      Stream.Free;
-    end;
-
-    FBaseAddress := Header.StartVMAddress + _dyld_get_image_vmaddr_slide(0);
-    SetLength(Lines, Header.Count + 1);
-
-    { Run state machine program }
-    Line.RelAddress := 0;
-    Line.Line := Header.StartLine;
-    Lines[0] := Line;
-    PC := @StateMachineProgram[0];
-    PCEnd := @StateMachineProgram[Length(StateMachineProgram)];
-    for I := 1 to Header.Count do
+    if (Sig = LINE_NUMBER_SIGNATURE) then
+      // Legacy single-arch .gol: the whole file is one block.
+      Result := DecodeBlock(Bytes, 0, Length(Bytes), RuntimeID)
+    else if (Sig = LINE_NUMBER_FAT_SIGNATURE) then
     begin
-      if (PC >= PCEnd) then
+      // Universal container: pick the slice whose UUID matches the running image.
+      if (Length(Bytes) < SizeOf(FatHeader)) then
+        Exit(TLineNumberStatus.InvalidSize);
+      Move(Bytes[0], FatHeader, SizeOf(FatHeader));
+
+      if ((FatHeader.Version shr 16) > (LINE_NUMBER_FAT_VERSION shr 16)) then
+        Exit(TLineNumberStatus.UnsupportedVersion);
+      if (FatHeader.Count = 0) or (FatHeader.Count > 16) then
         Exit(TLineNumberStatus.FileCorrupt);
+      if (UInt64(SizeOf(FatHeader)) + UInt64(FatHeader.Count) * SizeOf(Entry)
+          > UInt64(Length(Bytes))) then
+        Exit(TLineNumberStatus.InvalidSize);
 
-      Opcode := PC^;
-      Inc(PC);
-
-      if (OpCode < OP_ADVANCE_ADDR) then
+      // Default if no slice matches the running arch (e.g. a container that
+      // omits this arch): same status a wrong single-arch .gol would yield.
+      Result := TLineNumberStatus.ExecutableIDMismatch;
+      EntryOff := SizeOf(FatHeader);
+      for I := 0 to Integer(FatHeader.Count) - 1 do
       begin
-        { 1-byte opcode }
-        Inc(Line.RelAddress, (OpCode shr 2) + 1);
-        Inc(Line.Line, (OpCode and 3) + 1);
-      end
-      else case OpCode of
-        OP_ADVANCE_ADDR:
-          begin
-            { 2-byte opcode }
-            if (PC >= PCEnd) then
-              Exit(TLineNumberStatus.FileCorrupt);
-
-            Inc(Line.RelAddress, 63);
-            Opcode := PC^;
-            Inc(PC);
-
-            if (Opcode < OP_ADVANCE_ADDR) then
-            begin
-              Inc(Line.RelAddress, (OpCode shr 2) + 1);
-              Inc(Line.Line, (OpCode and 3) + 1);
-            end
-            else
-              Exit(TLineNumberStatus.FileCorrupt);
-          end;
-
-        OP_ADVANCE_REL,
-        OP_ADVANCE_ABS:
-          begin
-            { Updates are provided in 2 VarInt parameters }
-            if (not ReadVarInt(PC, PCEnd, A1)) then
-              Exit(TLineNumberStatus.FileCorrupt);
-
-            if (not ReadVarInt(PC, PCEnd, A2)) then
-              Exit(TLineNumberStatus.FileCorrupt);
-
-            Inc(Line.RelAddress, A1 + 1);
-            if (Opcode = OP_ADVANCE_REL) then
-              Inc(Line.Line, A2 + 1)
-            else
-              Line.Line := A2;
-          end;
-      else
-        Exit(TLineNumberStatus.FileCorrupt);
+        Move(Bytes[EntryOff], Entry, SizeOf(Entry));
+        if (Entry.ID = RuntimeID) then
+        begin
+          if (Entry.Offset > UInt64(Length(Bytes))) or
+             (Entry.Size > UInt64(Length(Bytes))) or
+             (Entry.Offset + Entry.Size > UInt64(Length(Bytes))) then
+            Exit(TLineNumberStatus.InvalidSize);
+          Result := DecodeBlock(Bytes, UInt32(Entry.Offset), UInt32(Entry.Size), RuntimeID);
+          Break;
+        end;
+        Inc(EntryOff, SizeOf(Entry));
       end;
-
-      Lines[I] := Line;
-    end;
-
-    FLines := Lines;
-    Result := TLineNumberStatus.Available;
+    end
+    else
+      Result := TLineNumberStatus.InvalidSignature;
   except
     Result := TLineNumberStatus.Exception;
   end;

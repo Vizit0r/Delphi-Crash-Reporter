@@ -198,7 +198,8 @@ uses
   {$IF Defined(LINUX)} // Posix.Base for libc/_PU constants
   Posix.Base,
   {$ENDIF}
-  Crash.Demangle;
+  Crash.Demangle,
+  Crash.Signals;
 
 {$RANGECHECKS OFF}
 
@@ -319,6 +320,10 @@ var
   ExceptionLocation: TCrashStackEntry;
   Report: TCrashReport;
   I: Integer;
+  FaultAddr: UIntPtr;
+  CallerAddr: UIntPtr;
+  InsertIdx: Integer;
+  FaultEntry: TCrashStackEntry;
 begin
   { Ignore exception that occur while we are already reporting another
     exception. That can happen when the original exception left the application
@@ -357,6 +362,56 @@ begin
     GetCallStackEntry(ExceptionLocation);
     if (ExceptionLocation.ModuleAddress = FModuleAddress) then
       ExceptionLocation.RoutineName := CppSymbolToPascal(ExceptionLocation.RoutineName);
+
+    { Re-insert the faulting frame for a hardware exception (SIGSEGV/SIGFPE/...).
+      The POSIX signal model used by Crash.Signals returns from the handler and
+      lets the RTL re-raise, which drops the FAULTING frame from the libc
+      backtrace (the stack jumps straight to its caller). CrashPrimaryFaultAddr
+      returns the fault RIP/PC only when the fault is a primary one in our exe
+      range; we additionally require it to match this exception's address (guards
+      against a stale snapshot riding a later soft `raise`) and to resolve to one
+      of OUR source lines (LineNumber<>0 -> a unit with debug line info, i.e. our
+      code, not a precompiled RTL/FMX unit or a system library). When all hold,
+      prepend it as frame 0 so the crash line is visible in the call stack. A soft
+      `raise` has no snapshot (its backtrace already includes the raise site), so
+      nothing is inserted; a fault outside our code does not resolve to a line, so
+      nothing is inserted either. }
+    if CrashPrimaryFaultAddr(FaultAddr) and (FaultAddr = UIntPtr(AExceptionAddress)) then
+    begin
+      FaultEntry.Clear;
+      FaultEntry.CodeAddress := FaultAddr;
+      GetCallStackEntry(FaultEntry);
+      if (FaultEntry.ModuleAddress = FModuleAddress) then
+        FaultEntry.RoutineName := CppSymbolToPascal(FaultEntry.RoutineName);
+      if (FaultEntry.LineNumber <> 0) then
+      begin
+        { Splice point: the faulting frame's caller. Its return address ([FP+8],
+          from the snapshot) is still present in the libc backtrace -- only the
+          faulting frame itself was dropped. Insert the faulting frame right
+          before the caller so it lands in its TRUE position (between the RTL
+          signal-conversion frames and the caller). Match within an 8-byte window
+          because GetCallStack may bias the stored address (ARM64 subtracts 4).
+          If the caller can't be located, fall back to the top (frame 0). }
+        InsertIdx := 0;
+        if CrashPrimaryFaultCallerAddr(CallerAddr) then
+          for I := 0 to High(CallStack) do
+            if (CallStack[I].CodeAddress <= CallerAddr) and
+               (CallerAddr - CallStack[I].CodeAddress <= 8) then
+            begin
+              InsertIdx := I;
+              Break;
+            end;
+        { Idempotency: skip if the faulting frame already occupies that slot. }
+        if (InsertIdx >= Length(CallStack)) or
+           (CallStack[InsertIdx].CodeAddress <> FaultEntry.CodeAddress) then
+        begin
+          SetLength(CallStack, Length(CallStack) + 1);
+          for I := High(CallStack) downto InsertIdx + 1 do
+            CallStack[I] := CallStack[I - 1];
+          CallStack[InsertIdx] := FaultEntry;
+        end;
+      end;
+    end;
 
     Report.ExceptionMessage := ExceptionMessage;
     Report.ExceptionLocation := ExceptionLocation;

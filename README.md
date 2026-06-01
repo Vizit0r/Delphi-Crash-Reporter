@@ -136,6 +136,112 @@ Both emit the same `.gol` byte format that `Crash.LineNumbers` reads at runtime.
 - After changing `DCC_DebugInformation`, do one full rebuild (incremental Make
   reuses `.dcu` cache and the `.gol` ends up near-empty).
 
+### Building the generators
+
+`LNG` (macOS) and `LNG_ELF` (Linux) are **Win32 console utilities that run on the
+build host**, not on the target. Build them from
+`Tools/LineNumberGenerator/LNG.dproj` and `LNG_ELF.dproj` (MSBuild / `dcc32`); the
+prebuilt binaries live in `Tools/Bin/`.
+
+### Universal (fat) `.gol` for macOS
+
+A macOS *universal* binary keeps a distinct `LC_UUID` and address space per arch
+slice (x86_64, arm64). The runtime reader matches a `.gol` to the running image by
+UUID, so a single single-arch `.gol` only ever covers one slice — on the other
+arch it is rejected outright (`ExecutableIDMismatch`) and you get **no** line
+numbers, not approximate ones.
+
+The fix is a **universal container** (`'GOLF'` signature) that bundles one per-arch
+`.gol` and lets the reader pick the slice whose embedded UUID matches the running
+image — automatically selecting the right architecture. One file, exact lines on
+both arches. The container format is documented at the top of
+`Crash.LineNumbers.pas`; the reader detects it by sniffing the first 4 bytes, so a
+legacy single-arch `.gol` keeps working unchanged (and an old reader rejects a
+container cleanly instead of misreading it).
+
+Two host tools in `Tools/` produce it:
+
+| Tool | Input | Output |
+|---|---|---|
+| `build-universal-gol.ps1` | the two thin per-arch **binaries** | runs `LNG` on each, then muxes → one universal `.gol` |
+| `mux-gol-universal.ps1` | two existing single-arch **`.gol`s** | one universal `.gol` (the merge step alone) |
+
+```powershell
+# from the two thin per-arch builds (each with its sibling .dSYM alongside):
+powershell -NoProfile -ExecutionPolicy Bypass -File Tools\build-universal-gol.ps1 `
+    -Arm64Bin out\arm64\MyApp -X64Bin out\x86_64\MyApp -OutFile out\MyApp.gol
+```
+
+Each slice's `LC_UUID` survives `lipo` and ad-hoc `codesign` unchanged, so a
+container built from the thin `.gol`s matches the assembled universal binary.
+
+**Deploy:** place the `.gol` at `<app>.app/Contents/Resources/<exe>.gol` — the
+reader's macOS fallback looks for it there, and `codesign` rejects non-Mach-O
+files in `Contents/MacOS/`.
+
+## Wiring into your build
+
+Two stages, mirroring how the reader finds the `.gol` at runtime (`<exe>.gol` next
+to the binary; macOS also falls back to `Contents/Resources/<exe>.gol`):
+
+- **Per build (per arch)** — a natural PostBuild step. After linking each target,
+  run the matching generator on the binary so a single-arch `.gol` lands beside it:
+  - Linux: `LNG_ELF <elf>` → `<elf>.gol` (ship it next to the ELF).
+  - macOS (single-arch): `LNG <binary>` → `<binary>.gol`.
+- **At packaging (macOS universal only)** — once both thin arches exist, build the
+  container and place it in the bundle **before** `codesign` (so the resource is
+  sealed; never put a `.gol` in `Contents/MacOS/`):
+
+  ```
+  Tools\build-universal-gol.ps1 -Arm64Bin <arm64> -X64Bin <x86_64> -OutFile MyApp.gol
+  cp MyApp.gol  MyApp.app/Contents/Resources/MyApp.gol
+  ```
+
+The generators need debug info on the target (DWARF / `.dSYM`) — see *Build
+requirements* above.
+
+## Hardware faults (POSIX signals)
+
+A Pascal `raise` carries its own call stack, but a hardware fault
+(SIGSEGV/SIGFPE/SIGILL/SIGBUS) arrives through the kernel. `Crash.Signals` installs
+a `sigaction` handler that snapshots the CPU registers and a slice of the stack,
+then returns and lets the Delphi RTL re-raise the fault as a catchable Pascal
+exception, which the reporter turns into the `.el`.
+
+That "return + re-raise" path has one quirk: the libc backtrace taken at report
+time **drops the faulting frame** — the stack jumps straight from the RTL signal
+converter to the faulting function's *caller*. The reporter repairs this: from the
+snapshot it recovers the fault address (`RIP`/`PC`) and the caller's return address
+(`[FP+8]`), locates the caller in the backtrace, and splices the faulting frame
+back into its **true position** (right before the caller). The exception address
+(report field `2.2`) is additionally symbolicated to `Unit | Class | Procedure |
+Line`.
+
+The repair is conservative — it only fires for a primary fault **in your own code**
+(one that resolves to a source line). A soft `raise` has no snapshot (its backtrace
+is already complete → nothing is added); a fault inside a system library is treated
+as secondary and left alone (its nearest in-app frame is already shown).
+
+Scope: Linux x86-64, macOS x86-64 + ARM64. Other targets compile to no-ops.
+
+## EurekaLog `.el` compatibility
+
+The writer (`Crash.ELFormat`) targets the EurekaLog Viewer's parser, which is
+strict in a few non-obvious ways:
+
+- **Header prefix.** The file must begin with the literal `EurekaLog ` — rename it
+  and the Viewer silently drops the Call Stack tab. The version after it is free
+  (we emit `1.0`).
+- **Call Stack is the anchor.** The Call Stack table must always be present, so
+  Application / Exception / Call Stack are not omittable via `DisabledSections`.
+- **No blank trailing sections.** A section emitted with an empty `Title:----`
+  body makes the Viewer choke, so unused tail sections are omitted entirely rather
+  than left blank.
+- **Registers section.** Its header is `Registers:` (not `CPU:`, which is only the
+  dialog tab caption), with no stray text between the `EXP/STK` line and the
+  `Stack:` / `Memory Dump:` header.
+- **Encoding.** UTF-16LE + BOM, matching a Windows EurekaLog build.
+
 ## License
 
 BSD 2-Clause. Portions © 2017 Grijjy, Inc.; modifications under the same terms.

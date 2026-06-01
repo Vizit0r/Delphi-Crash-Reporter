@@ -40,6 +40,23 @@ interface
 procedure CrashInstallSignalHandlers;
 function  CrashHasSignalSnapshot: Boolean;
 
+// Returns the address of a PRIMARY hardware fault (RIP/PC) when one was captured
+// AND it lies in the executable's own range (not a shared-lib / unwinder
+// "secondary" fault). Lets the reporter re-insert the faulting frame -- which the
+// signal "return + RTL re-raise" model drops from the libc backtrace -- back into
+// the call stack. Read-only: does NOT consume the snapshot, so a later
+// CrashTakeAndFormatSnapshots still emits the Registers section. Returns False for
+// a soft Pascal `raise` (no signal -> no snapshot) and for syslib/secondary faults.
+function  CrashPrimaryFaultAddr(out AAddr: UIntPtr): Boolean;
+
+// The return address of the faulting frame's CALLER, read from the captured stack
+// snapshot at [FP+8] (standard x86_64/ARM64 frame record: [FP]=saved FP,
+// [FP+8]=saved return address). Lets the reporter splice the faulting frame into
+// its REAL position -- right before the caller -- instead of at the very top.
+// Bounded read from the 256-byte snapshot (never faults). False if that slot is
+// outside the captured window (a large local frame) -> caller falls back to top.
+function  CrashPrimaryFaultCallerAddr(out ACaller: UIntPtr): Boolean;
+
 // Takes the snapshot from the global and formats BOTH blocks:
 //   ARegistersSection  - EL-compatible "Registers:" + registers + Stack/Memory Dump.
 //   ASignalInfoSection - our own metadata (Signal/Code/Fault addr/Invocations/Note)
@@ -342,6 +359,52 @@ begin
   Result := RIP >= UInt64($700000000000);
 end;
 
+function CrashPrimaryFaultAddr(out AAddr: UIntPtr): Boolean;
+// Read-only probe of the captured snapshot (no consume/reset). True only for a
+// primary hardware fault in our exe range -- the case where the libc backtrace
+// dropped the faulting frame and the reporter should re-insert it.
+var
+  RIP: UInt64;
+begin
+  AAddr := 0;
+  Result := False;
+  if GSignalSnapshot.Captured <> 1 then Exit;     // no signal -> soft raise / nothing
+  {$IF Defined(CPUX64)}
+  RIP := GSignalSnapshot.Rip;
+  {$ELSEIF Defined(CPUARM64)}
+  RIP := GSignalSnapshot.Pc;
+  {$ELSE}
+  RIP := 0;
+  {$IFEND}
+  if (RIP = 0) or GuessSnapshotIsSecondary(RIP) then Exit;  // syslib / unwinder fault
+  AAddr := UIntPtr(RIP);
+  Result := True;
+end;
+
+function CrashPrimaryFaultCallerAddr(out ACaller: UIntPtr): Boolean;
+// [FP+8] = caller return address. The snapshot copied StackBytes starting at SP
+// (StackBaseAddr=SP), so [FP+8] sits at byte offset (FP - SP) + 8 within it.
+var
+  FP, SP: UInt64;
+  Offset: Integer;
+begin
+  ACaller := 0;
+  Result := False;
+  if GSignalSnapshot.Captured <> 1 then Exit;
+  {$IF Defined(CPUX64)}
+  FP := GSignalSnapshot.Rbp;  SP := GSignalSnapshot.Rsp;
+  {$ELSEIF Defined(CPUARM64)}
+  FP := GSignalSnapshot.Fp;   SP := GSignalSnapshot.Sp;
+  {$ELSE}
+  FP := 0;  SP := 0;
+  {$IFEND}
+  if (FP = 0) or (SP = 0) or (FP < SP) then Exit;
+  Offset := Integer(FP - SP) + SizeOf(Pointer);
+  if (Offset < 0) or (Offset + SizeOf(UInt64) > STACK_DUMP_BYTES) then Exit;
+  ACaller := UIntPtr(PUInt64(@GSignalSnapshot.StackBytes[Offset])^);
+  Result := ACaller <> 0;
+end;
+
 {$IF Defined(CPUX64)}
 function ReadStackQword(const S: TSignalSnapshot; ByteOffset: Integer): UInt64; inline;
 // Read an 8-byte qword at the given offset in our StackBytes (for column 1 of the dump).
@@ -623,6 +686,8 @@ end;
 
 procedure CrashInstallSignalHandlers;            begin end;
 function  CrashHasSignalSnapshot: Boolean;       begin Result := False; end;
+function  CrashPrimaryFaultAddr(out AAddr: UIntPtr): Boolean; begin AAddr := 0; Result := False; end;
+function  CrashPrimaryFaultCallerAddr(out ACaller: UIntPtr): Boolean; begin ACaller := 0; Result := False; end;
 procedure CrashTakeAndFormatSnapshots(out ARegistersSection, ASignalInfoSection: String);
 begin
   ARegistersSection := '';

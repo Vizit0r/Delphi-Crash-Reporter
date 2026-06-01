@@ -408,6 +408,24 @@ begin
     AppendSectionHeader(SB, 'Exception');
     AppendField(SB, '2.1 Date',           FormatELDate(ACtx.ExceptionTime), 18);
     AppendField(SB, '2.2 Address',        AddrHex(Loc.CodeAddress), 18);
+    // Symbolicated exception location as an extra line under 2.2 (the EL Viewer
+    // renders it as free text -- multi-line here is fine). Mirrors the call-stack
+    // columns: Unit | Class | Procedure | Line. Emitted only when the address
+    // resolved to a known routine (empty segments are dropped).
+    begin
+      var LocFrame := RenderFrame(Loc, 0, 1);
+      var LocLine := '';
+      if LocFrame.AUnit <> '' then
+        LocLine := LocFrame.AUnit;
+      if LocFrame.AClass <> '' then
+        LocLine := LocLine + ' | ' + LocFrame.AClass;
+      if LocFrame.AProcedure <> '' then
+        LocLine := LocLine + ' | ' + LocFrame.AProcedure;
+      if (LocLine <> '') and (LocFrame.Line <> '') then
+        LocLine := LocLine + ' | Line ' + LocFrame.Line;
+      if LocLine <> '' then
+        SB.Append(LocLine).Append(CRLF);
+    end;
     AppendField(SB, '2.3 Module Name',    ACtx.AppName, 18);
     AppendField(SB, '2.4 Module Version', ACtx.AppVersion, 18);
     AppendField(SB, '2.5 Type',           'Exception', 18);
