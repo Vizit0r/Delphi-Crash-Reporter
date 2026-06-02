@@ -209,16 +209,32 @@ to the binary; macOS also falls back to `Contents/Resources/<exe>.gol`):
 The generators need debug info on the target (DWARF / `.dSYM`) — see *Build
 requirements* above.
 
-**Optional — strip the binary.** The shipped Mach-O carries the DWARF debug map
-(STAB symbols) that only `dsymutil` needs at build time; at runtime the reporter
-uses the *regular* symbol table (names) and the `.gol` (lines), never the STABs.
-Running `strip -S <binary>` before `codesign` drops only those debug symbols
-(~27% smaller on a typical FMX build) while leaving `LC_UUID`, the code addresses
-and the name table untouched — so the `.gol` and the crash-stack names stay valid.
-Use **`-S` only**; a plain `strip` / `-x` removes local symbols and loses Pascal
-names. Strip invalidates the signature, so it must run *before* `codesign`. (The
-Linux pipeline does the equivalent with `objcopy --strip-all`, which keeps
-`.dynsym` + the build-id for the same reason.)
+**Optional — strip the binary.** Both platforms link a binary that still carries
+the build-time debug info, and the reporter never reads it at runtime — it
+resolves names from the regular/dynamic symbol table and lines from the `.gol`.
+Stripping that debug info shrinks the shipped binary substantially. On **both**
+platforms the strip must run **after** the generator (the `.gol` is built from the
+very debug info you are about to drop); on macOS it must *also* run **before**
+`codesign` (strip invalidates the signature). The right tool and how aggressive
+you can be differ per platform, because each resolves Pascal names from a
+different table:
+
+- **macOS** — `strip -S <binary>`. Drops only the DWARF debug map (STAB symbols)
+  that `dsymutil` needed at build time — ~27% smaller on a typical FMX build —
+  while leaving `LC_UUID`, the code addresses and the name table (`LC_SYMTAB`)
+  untouched, so the `.gol` and the crash-stack names stay valid. Use **`-S`
+  only**: a plain `strip` / `-x` removes local symbols and loses the Pascal names
+  that macOS symbolication reads straight from `LC_SYMTAB`. Run it *before*
+  `codesign`.
+- **Linux** — `objcopy --strip-all <elf>` (or the gentler `objcopy --strip-debug`
+  if you want to keep the static symbol table too). Removes `.debug_*` plus the
+  static `.symtab` / `.strtab`, while keeping `.dynsym` and `.note.gnu.build-id`.
+  This can be **more** aggressive than macOS's `-S`: Linux symbolication reads
+  names from `.dynsym` (exposed by the `--export-dynamic` link option), not
+  `.symtab`, and the reader matches the `.gol` to the image by the build-id — both
+  survive `--strip-all`. There is no signature on Linux, so the only ordering
+  constraint is to strip *after* `LNG_ELF`. (On a typical FMX build this takes the
+  linked ELF from ~150 MB down to the ~60–70 MB actually shipped.)
 
 ## Hardware faults (POSIX signals)
 
