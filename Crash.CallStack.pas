@@ -90,6 +90,13 @@ type
     Source: TCrashSource;
   end;
 
+const
+  { Sentinel ExceptionMessage set when the captured exception object is nil - a
+    "phantom" report with no real exception behind it. Lets consumers recognise
+    a content-less report (see GlobalHandleException). A non-nil but non-Exception
+    object yields 'Unknown Error (<ClassName>)' instead, which is NOT this. }
+  CrashMsgNilException = 'Unknown Error';
+
 type
   { Optional report sections the host can omit via TCrashConfig.DisabledSections.
     When a section is disabled, its header AND body vanish from the .el entirely.
@@ -340,7 +347,7 @@ begin
   try
     CallStack := nil;
     if (AExceptionObject = nil) then
-      ExceptionMessage := 'Unknown Error'
+      ExceptionMessage := CrashMsgNilException
     else if (AExceptionObject is EAbort) then
       Exit //  do nothing
     else if (AExceptionObject is Exception) then

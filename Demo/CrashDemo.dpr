@@ -7,13 +7,16 @@
   bare console target, nothing inside Crash\ secretly depends on the host app.
 
   Build:  Linux64 (Release) via CrashDemo.dproj.
-  Run:    ./CrashDemo --crash=segv|fpe|callbad|raise
+  Run:    ./CrashDemo --crash=segv|fpe|callbad|callhigh|raise
           CRASH_NO_UPLOAD=1 keeps the .el on disk and skips any network. }
 
 {$APPTYPE CONSOLE}
 
 uses
   System.SysUtils,
+  {$IF Defined(LINUX)}
+  Posix.SysMman,
+  {$IFEND}
   Crash.Reporter,
   Crash.CallStack;
 
@@ -21,8 +24,9 @@ procedure TriggerCrash(const AKind: String);
 type
   TProc0 = procedure; cdecl;
 var
-  P:    PInteger;
-  A, B: Integer;
+  P:     PInteger;
+  A, B:  Integer;
+  HighP: Pointer;
 begin
   if AKind = 'segv' then
   begin
@@ -36,12 +40,34 @@ begin
     Writeln(A);
   end
   else if AKind = 'callbad' then
-    TProc0(Pointer(NativeUInt($DEAD)))()   // call into unmapped memory
+    TProc0(Pointer(NativeUInt($DEAD)))()   // call into unmapped LOW memory (fetch fault, RIP < 0x700000000000)
+  else if AKind = 'callhigh' then
+  begin
+    // Wild jump to a HIGH but MAPPED address. mmap with PROT_READ (no PROT_EXEC)
+    // returns a page in the upper mmap region (>= 0x7000_0000_0000 on x86-64
+    // Linux) that is readable but NON-executable -> calling into it is an
+    // instruction-FETCH fault (si_addr == RIP). Being MAPPED + readable, the RTL
+    // unwinder reads it WITHOUT a secondary fault -> a single clean report that
+    // mirrors the production wild-jump .el (a jump into a loaded, non-exec library
+    // region). Before the FaultAddr==RIP fix this was misclassified "secondary"
+    // and its Registers section was dropped; now it must stay primary. (An
+    // UNMAPPED high target instead double-faults inside the unwinder and the
+    // secondary report overwrites the primary one - a separate scenario.)
+    {$IF Defined(LINUX)}
+    HighP := mmap(nil, 4096, PROT_READ, MAP_PRIVATE or $20, -1, 0);  // $20 = MAP_ANONYMOUS (Linux)
+    if (HighP <> nil) and (HighP <> Pointer(-1)) then
+      TProc0(HighP)()
+    else
+      Writeln(ErrOutput, 'CrashDemo: mmap failed, cannot run callhigh');
+    {$ELSE}
+    TProc0(Pointer(NativeUInt($7E00DEAD0000)))();
+    {$IFEND}
+  end
   else if AKind = 'raise' then
     raise Exception.Create('test raise from CrashDemo')
   else
     Writeln(ErrOutput, 'CrashDemo: unknown crash kind "', AKind,
-      '", expected segv|fpe|callbad|raise');
+      '", expected segv|fpe|callbad|callhigh|raise');
 end;
 
 var
@@ -72,7 +98,7 @@ begin
   if Kind = '' then
   begin
     Writeln('CrashDemo - Crash Reporter standalone smoke test.');
-    Writeln('Usage: CrashDemo --crash=segv|fpe|callbad|raise');
+    Writeln('Usage: CrashDemo --crash=segv|fpe|callbad|callhigh|raise');
     Writeln('Reporter Active = ', BoolToStr(TCrashReporter.Active, True));
     Exit;
   end;

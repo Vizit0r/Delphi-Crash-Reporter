@@ -347,15 +347,26 @@ begin
   Result := Format('%.16x', [V]);
 end;
 
-function GuessSnapshotIsSecondary(RIP: UInt64): Boolean; inline;
+function GuessSnapshotIsSecondary(RIP, AFaultAddr: UInt64): Boolean; inline;
 // Heuristic: on Linux/macOS x86-64 the exe is mapped into the lower half of the
 // address space (<= ~4 GiB here), shared libs/mmap into the upper half
-// (>= ~0x7000_0000_0000). If the snapshotted RIP is in the shared-lib range,
+// (>= ~0x7000_0000_0000). A snapshotted RIP in the shared-lib range USUALLY means
 // our handler fired not on the primary faulting instruction in our code but
 // already inside the Pascal RTL stack unwinder / call-stack reader. In that
 // case the primary crash went straight to the Pascal RTL SignalConverter, which
 // overwrote our sigaction before the fault.
+//
+// EXCEPTION - an instruction-fetch fault (FaultAddr = RIP): the CPU faulted
+// FETCHING the instruction at RIP, i.e. control flow jumped to a wild address
+// (call/jmp through a dangling function pointer, a smashed return address, a
+// corrupt vtable). That IS the primary crash even when the target lands in the
+// shared-lib range, so it must NOT be suppressed. The unwinder, in contrast,
+// faults on a DATA read (RIP = valid libc code, FaultAddr <> RIP). Keeping a
+// fetch fault primary preserves its Registers + Stack dump - which hold the bad
+// pointer and the caller return addresses needed to locate the call site.
 begin
+  if (AFaultAddr <> 0) and (AFaultAddr = RIP) then
+    Exit(False);
   Result := RIP >= UInt64($700000000000);
 end;
 
@@ -376,7 +387,7 @@ begin
   {$ELSE}
   RIP := 0;
   {$IFEND}
-  if (RIP = 0) or GuessSnapshotIsSecondary(RIP) then Exit;  // syslib / unwinder fault
+  if (RIP = 0) or GuessSnapshotIsSecondary(RIP, GSignalSnapshot.FaultAddr) then Exit;  // syslib / unwinder fault
   AAddr := UIntPtr(RIP);
   Result := True;
 end;
@@ -603,12 +614,21 @@ begin
     SB.AppendFormat('  Fault addr : %s', [Hex16(S.FaultAddr)]); SB.Append(CRLF);
     SB.AppendFormat('  Invocations: %d  (signal handler entries since last report)',
       [S.InvocationCount]); SB.Append(CRLF);
-    if GuessSnapshotIsSecondary(RIP) then
+    if GuessSnapshotIsSecondary(RIP, S.FaultAddr) then
     begin
       SB.Append('  Note       : RIP in shared-lib range - this is a SECONDARY signal'); SB.Append(CRLF);
       SB.Append('               (caught inside the Pascal RTL / call-stack unwinder).'); SB.Append(CRLF);
       SB.Append('               Registers section omitted - it would show the unwinder,'); SB.Append(CRLF);
       SB.Append('               not the fault. Primary crash details are in section 2.'); SB.Append(CRLF);
+    end
+    else if (S.FaultAddr <> 0) and (S.FaultAddr = RIP) then
+    begin
+      SB.Append('  Note       : instruction-fetch fault (FaultAddr = RIP) - control flow'); SB.Append(CRLF);
+      SB.Append('               jumped to a wild address (bad function pointer / smashed'); SB.Append(CRLF);
+      SB.Append('               return address / corrupt vtable). The faulting frame has no'); SB.Append(CRLF);
+      SB.Append('               symbol and the caller is dropped from the backtrace (unwind'); SB.Append(CRLF);
+      SB.Append('               breaks at the wild RIP) - read the return addresses in the'); SB.Append(CRLF);
+      SB.Append('               Stack dump above to locate the call site.'); SB.Append(CRLF);
     end;
     Result := SB.ToString;
   finally
@@ -639,7 +659,7 @@ begin
   // so they are noise. A primary hardware fault in our own code has RIP in the
   // exe's low range and its registers are kept. The Signal Info block is emitted
   // regardless (small, diagnostic; its Note explains the omission).
-  if not GuessSnapshotIsSecondary(RIP) then
+  if not GuessSnapshotIsSecondary(RIP, S.FaultAddr) then
     ARegistersSection := FormatRegistersSection(S);
   ASignalInfoSection := FormatSignalInfoSection(S);
 end;

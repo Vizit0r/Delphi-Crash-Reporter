@@ -313,9 +313,29 @@ begin
 end;
 
 procedure TCrashReporterImpl.WriteToFile(const AText: String);
+var
+  Base, Ext, Cand: String;
+  N: Integer;
 begin
   if FCrashFilePath = '' then
     FCrashFilePath := BuildCrashFilePath;
+  // Safety net: the file name is stamped per-second (yyyymmddhhnnss), so two
+  // distinct reports in the same second (two threads crashing, or a phantom that
+  // slipped past the skip above) would collide. Never clobber an existing report -
+  // append a numeric suffix instead. The root case (the content-less phantom) is
+  // already dropped in HandleReport; this just guarantees no real report is ever
+  // overwritten by another.
+  if TFile.Exists(FCrashFilePath) then
+  begin
+    Ext  := ExtractFileExt(FCrashFilePath);
+    Base := ChangeFileExt(FCrashFilePath, '');
+    N := 2;
+    repeat
+      Cand := Base + '_' + IntToStr(N) + Ext;
+      Inc(N);
+    until not TFile.Exists(Cand);
+    FCrashFilePath := Cand;
+  end;
   try
     // UTF-16LE + BOM - same encoding as a Windows EL build, so the Viewer
     // accepts it.
@@ -351,6 +371,22 @@ begin
     FAlreadyReported := True;
   finally
     FLock.Leave;
+  end;
+
+  // Skip a content-less "phantom" report. The capture hook fires 2-3x per raise
+  // (ExceptProc + ExceptionAcquired + fallback); the anti-cascade above coalesces
+  // adjacent ones, but a report following a non-fatal one (which re-armed via
+  // ResetAlreadyReported) can slip through with nothing behind it: a nil exception
+  // object (CrashMsgNilException), an empty call stack, AND no signal snapshot
+  // (the real report already consumed it). Such a report carries nothing
+  // actionable and would only overwrite the real .el - drop it, but re-arm first
+  // so a genuine later crash in a long-running process is still reported.
+  if (AReport.ExceptionMessage = CrashMsgNilException) and
+     (Length(AReport.CallStack) = 0) and
+     (not CrashHasSignalSnapshot) then
+  begin
+    ResetAlreadyReported;
+    Exit;
   end;
 
   IsFatal := AReport.Source = csFatalProc;
