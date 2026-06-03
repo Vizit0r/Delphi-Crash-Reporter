@@ -185,6 +185,7 @@ type
     FLock: TCriticalSection;
     FAlreadyReported: Boolean;  // anti-cascade: the capture hook can fire 2-3 times for one raise (ExceptProc + ExceptionAcquired + fallback). Reset after processing (non-fatal).
     FCrashFilePath: String;     // computed once so cascade calls don't fight over different names
+    FExceptionID: String;       // EL-style BugID of the current report; the .el file-name token (set in HandleReport before WriteToFile)
     FPendingReports: TArray<String>;
     FAppStartTime: TDateTime;   // captured in Init for the Up Time field
     function EffectiveFileNamePrefix: String;
@@ -265,14 +266,20 @@ end;
 
 function TCrashReporterImpl.BuildCrashFilePath: String;
 var
-  Dir, Stamp: String;
+  Dir, Tail: String;
 begin
   Dir := EffectiveReportDir;
-  // <prefix><yyyymmddhhnnss>.el - prefix (project + platform by default) keeps
-  // reports from different builds/targets from merging. .el lets the EurekaLog
-  // Viewer open it natively.
-  Stamp := FormatDateTime('yyyymmddhhnnss', Now);
-  Result := IncludeTrailingPathDelimiter(Dir) + EffectiveFileNamePrefix + Stamp + '.el';
+  // <prefix><id>.el - prefix (project + platform + version) keeps reports from
+  // different builds/targets from merging; the EL-style exception ID (stable
+  // BugID) is the uniqueness token, mirroring EurekaLog's "<proj>_<ver>_<id>".
+  // The same bug yields the same name (WriteToFile appends a numeric suffix for
+  // repeated instances). Fall back to a timestamp if the id is somehow empty, so
+  // we never emit "<prefix>.el". .el lets the EurekaLog Viewer open it natively.
+  if FExceptionID <> '' then
+    Tail := FExceptionID
+  else
+    Tail := FormatDateTime('yyyymmddhhnnss', Now);
+  Result := IncludeTrailingPathDelimiter(Dir) + EffectiveFileNamePrefix + Tail + '.el';
 end;
 
 procedure TCrashReporterImpl.WriteFatalBriefToConsole(const AReport: TCrashReport);
@@ -421,6 +428,11 @@ begin
     // A faulty context provider must not break reporting.
   end;
   Text := CrashBuildELReportText(AReport, Ctx);
+
+  // The .el file name uses the exception's EL-style BugID as its token (see
+  // BuildCrashFilePath). Compute it here, where AReport is in hand, before
+  // WriteToFile builds the path.
+  FExceptionID := CrashGenerateExceptionID(AReport);
 
   if FConfig.SaveToFile then
     WriteToFile(Text); // WriteToFile locks FCrashFilePath itself

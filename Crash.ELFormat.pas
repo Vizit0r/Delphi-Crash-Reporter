@@ -49,6 +49,12 @@ function CrashBuildELReportText(
 
 function CrashDefaultELContext(const AStartTime: TDateTime = 0): TCrashELContext;
 
+{ EurekaLog-style BugID for AReport (CRC-32 over the relocation-independent
+  identities of the exception location + same-module call-stack frames). The same
+  logical crash yields the same 8-hex-digit id across runs, machines and rebuilds.
+  Exposed so the reporter can use it as the .el file-name token. }
+function CrashGenerateExceptionID(const AReport: TCrashReport): String;
+
 implementation
 
 uses
@@ -314,18 +320,66 @@ begin
     Result.Line := '';
 end;
 
-function GenerateExceptionID(const AReport: TCrashReport): String;
+{ CRC-32 (IEEE 802.3, reflected poly $EDB88320) over raw bytes - the same
+  algorithm EurekaLog uses for its BugID. Table-less (8 shifts per byte); the ID
+  source is short, so the per-byte loop is negligible. }
+function CrashCRC32(const ABytes: TBytes): UInt32;
 var
-  Loc: TCrashStackEntry;
-  Hash: UInt32;
-  Msg: String;
+  I, J: Integer;
+  Crc: UInt32;
 begin
-  Loc := AReport.ExceptionLocation;
-  Msg := AReport.ExceptionMessage;
-  Hash := UInt32(Loc.CodeAddress xor (Loc.CodeAddress shr 32));
-  if Msg <> '' then
-    Hash := Hash xor (UInt32(Length(Msg)) * UInt32(2654435761));
-  Result := IntToHex(Hash, 8);
+  Crc := $FFFFFFFF;
+  for I := 0 to High(ABytes) do
+  begin
+    Crc := Crc xor ABytes[I];
+    for J := 0 to 7 do
+      if (Crc and 1) <> 0 then
+        Crc := (Crc shr 1) xor $EDB88320
+      else
+        Crc := Crc shr 1;
+  end;
+  Result := Crc xor $FFFFFFFF;
+end;
+
+{ Append one frame's REBUILD-STABLE identity to the BugID source. Mirrors EL's
+  BuildBugID: never the absolute address (it moves with ASLR and every relink) -
+  instead the routine name + the byte offset WITHIN that routine
+  (CodeAddress - RoutineAddress), which is invariant as long as the routine's own
+  code is unchanged. Frames without a resolved routine fall back to the module
+  name + module-relative offset (EL's non-source 'R' form). }
+procedure AppendBugIDFrame(var ASource: String; const AEntry: TCrashStackEntry);
+begin
+  if (AEntry.RoutineName <> '') and (AEntry.RoutineAddress <> 0) and
+     (AEntry.CodeAddress >= AEntry.RoutineAddress) then
+    ASource := ASource + AEntry.RoutineName + #10 +
+               IntToHex(AEntry.CodeAddress - AEntry.RoutineAddress, 1) + #10
+  else
+    ASource := ASource + AEntry.ModuleName + #10 + 'R' + #10 +
+               IntToHex(AEntry.CodeAddress - AEntry.ModuleAddress, 1) + #10;
+end;
+
+{ EurekaLog-style BugID: a CRC-32 over the exception location + the call-stack
+  frames that belong to OUR module (EL's bugIDUseExceptionModuleCallStack), each
+  reduced to a relocation-independent key (see AppendBugIDFrame). Effect: the
+  SAME logical crash yields the SAME id across runs, machines and rebuilds, while
+  a crash at a different site/path yields a different one. The exception message
+  text is intentionally excluded - exactly like EL, the location identifies the
+  bug (a varying message at the same site must not split the id). }
+function CrashGenerateExceptionID(const AReport: TCrashReport): String;
+var
+  Source: String;
+  ExeModule: UIntPtr;
+  I: Integer;
+begin
+  Source := '';
+  AppendBugIDFrame(Source, AReport.ExceptionLocation);
+  // Keep only frames in the faulting module: libc/ld/RTL frames vary by OS and
+  // library version and would destabilise the id across machines.
+  ExeModule := AReport.ExceptionLocation.ModuleAddress;
+  for I := 0 to High(AReport.CallStack) do
+    if (ExeModule = 0) or (AReport.CallStack[I].ModuleAddress = ExeModule) then
+      AppendBugIDFrame(Source, AReport.CallStack[I]);
+  Result := IntToHex(CrashCRC32(TEncoding.UTF8.GetBytes(LowerCase(Source))), 8);
 end;
 
 function CrashBuildELReportText(
@@ -430,7 +484,7 @@ begin
     AppendField(SB, '2.4 Module Version', ACtx.AppVersion, 18);
     AppendField(SB, '2.5 Type',           'Exception', 18);
     AppendField(SB, '2.6 Message',        AReport.ExceptionMessage, 18);
-    AppendField(SB, '2.7 ID',             GenerateExceptionID(AReport), 18);
+    AppendField(SB, '2.7 ID',             CrashGenerateExceptionID(AReport), 18);
     AppendField(SB, '2.8 Count',          '1', 18);
     AppendField(SB, '2.11 Sent',          '0', 18);
     SB.Append(CRLF);
