@@ -293,6 +293,7 @@ begin
   begin
     if (Cmd.cmd = LC_UUID) then
       Exit(TGUID(Uuid.uuid));
+    if (Cmd.cmdsize = 0) then Break; // malformed image - avoid an infinite walk
     Cmd := Pointer(UIntPtr(Cmd) + Cmd.cmdsize);
   end;
   Result := TGUID.Empty;
@@ -609,6 +610,11 @@ begin
   if (Header.ID <> ARuntimeID) then
     Exit(TLineNumberStatus.ExecutableIDMismatch);
 
+  // Sanity: every entry takes at least one opcode byte - a Count beyond the
+  // block size is corruption; reject it before the big allocation.
+  if (Header.Count < 0) or (UInt32(Header.Count) > ABlockSize) then
+    Exit(TLineNumberStatus.FileCorrupt);
+
   if FModuleMode then
     FBaseAddress := Header.StartVMAddress + FModuleSlide
   else
@@ -802,6 +808,7 @@ begin
           UUID := TGUID(UuidCmd.uuid);
           Break;
         end;
+        if (Cmd.cmdsize = 0) then Break; // malformed image - avoid an infinite walk
         Cmd := Pointer(UIntPtr(Cmd) + Cmd.cmdsize);
       end;
       Found := True;
@@ -895,6 +902,11 @@ begin
     finally
       Stream.Free;
     end;
+
+    // Sanity: every entry takes at least one opcode byte - a Count beyond the
+    // file size is corruption; reject it before the big allocation.
+    if (Header.Count < 0) or (UInt32(Header.Count) > Header.Size) then
+      Exit(TLineNumberStatus.FileCorrupt);
 
     FBaseAddress := Header.StartVMAddress + BaseSlide;
     SetLength(Lines, Header.Count + 1);
@@ -1099,7 +1111,11 @@ begin
   if (not TArray.BinarySearch<TLine>(FLines, Line, Index, TComparer<TLine>.Construct(
     function(const ALeft, ARight: TLine): Integer
     begin
-      Result := ALeft.RelAddress - ARight.RelAddress;
+      // Branchy compare: a UInt32 subtraction narrowed to Integer flips sign
+      // for deltas > 2^31 and derails the binary search.
+      if ALeft.RelAddress < ARight.RelAddress then Result := -1
+      else if ALeft.RelAddress > ARight.RelAddress then Result := 1
+      else Result := 0;
     end)))
   then
     { When there is not an exact match, Index is set to the index in the array

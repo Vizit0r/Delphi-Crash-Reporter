@@ -105,7 +105,8 @@ type
   TSnapshotKind = (skNone, skLinuxX64, skMacOSX64, skMacOSArm64);
 
   TSignalSnapshot = packed record
-    Captured:      Integer;                         // atomic flag: 0=empty, 1=valid
+    Claimed:       Integer;                         // atomic claim: writer wins the slot, fills the fields, THEN publishes
+    Captured:      Integer;                         // atomic publish flag: 0=empty, 1=complete (set LAST by the writer)
     InvocationCount: Integer;                       // total times handler was entered (any signal)
     SignalNum:     Integer;
     SignalCode:    Integer;
@@ -128,6 +129,42 @@ var
   GSignalSnapshot: TSignalSnapshot;
   GOldHandlers:    array[1..31] of sigaction_t;
   GInstalled:      Boolean = False;
+  GAltStackDone:   Boolean = False;
+  GAltStack:       Pointer = nil; // registered with the kernel for process lifetime - never freed
+
+const
+  // 64 KB: comfortably above every platform's MINSIGSTKSZ (macOS demands 32 KB;
+  // Linux with AVX-512 xsave frames can require ~12 KB).
+  ALT_STACK_BYTES = 64 * 1024;
+  // SS_DISABLE is absent from Delphi's Linux Posix.Signal, and its value
+  // differs per platform (Linux=2, macOS=4).
+  ALT_SS_DISABLE  = {$IF Defined(LINUX)}2{$ELSEIF Defined(MACOS)}4{$IFEND};
+
+procedure InstallAltStackOnce;
+// Register an alternate signal stack for the CALLING thread (first call only;
+// Init runs on the main thread, so that is the covered one). Without it
+// SA_ONSTACK is inert and a stack-overflow SIGSEGV kills the process before the
+// handler can even start (no room for the kernel's signal frame). With it the
+// handler runs and snapshots the registers; whether a full .el follows still
+// depends on the RTL conversion surviving on the exhausted original stack.
+var
+  SS, OldSS: stack_t;
+begin
+  if GAltStackDone then Exit;
+  GAltStackDone := True;
+  // Respect a pre-registered alt-stack (host or RTL): it is per-thread state
+  // owned by whoever set it.
+  FillChar(OldSS, SizeOf(OldSS), 0);
+  if (sigaltstack(nil, @OldSS) = 0) and (OldSS.ss_sp <> nil) and
+     ((OldSS.ss_flags and ALT_SS_DISABLE) = 0) then
+    Exit;
+  GetMem(GAltStack, ALT_STACK_BYTES);
+  FillChar(SS, SizeOf(SS), 0);
+  SS.ss_sp    := GAltStack;
+  SS.ss_size  := ALT_STACK_BYTES;
+  SS.ss_flags := 0;
+  sigaltstack(@SS, nil);
+end;
 
 function ExtractFaultAddr(SigInfo: Psiginfo_t): UInt64; inline;
 begin
@@ -228,7 +265,7 @@ var
 begin
   TInterlocked.Increment(GSignalSnapshot.InvocationCount);
 
-  if TInterlocked.CompareExchange(GSignalSnapshot.Captured, 1, 0) = 0 then
+  if TInterlocked.CompareExchange(GSignalSnapshot.Claimed, 1, 0) = 0 then
   begin
     GSignalSnapshot.SignalNum := SigNum;
     if SigInfo <> nil then
@@ -238,6 +275,9 @@ begin
     end;
     CaptureFromUContext(Context);
     CopyStackTop(GetStackPointer);
+    // Publish AFTER the fields are complete - a reader keying on Captured=1
+    // must never see a half-filled snapshot.
+    TInterlocked.Exchange(GSignalSnapshot.Captured, 1);
   end;
 
   if (SigNum >= Low(GOldHandlers)) and (SigNum <= High(GOldHandlers)) then
@@ -288,6 +328,8 @@ begin
   FillChar(Act, SizeOf(Act), 0);
   FillChar(Prev, SizeOf(Prev), 0);
   SetHandlerInAction(Act, CrashSignalHandler);
+  // SA_ONSTACK pairs with the alternate stack registered in InstallAltStackOnce
+  // - without one the handler could not even start on a stack-overflow fault.
   Act.sa_flags := SA_SIGINFO or SA_ONSTACK;
   sigemptyset(Act.sa_mask);
   sigaction(SigNum, @Act, @Prev);
@@ -318,6 +360,7 @@ begin
   if not GInstalled then
     FillChar(GSignalSnapshot, SizeOf(GSignalSnapshot), 0);
   GInstalled := True;
+  InstallAltStackOnce; // covers the calling thread (main at Init) - see there
   InstallOne(SIGSEGV);
   InstallOne(SIGFPE);
   InstallOne(SIGILL);
@@ -410,6 +453,7 @@ begin
   FP := 0;  SP := 0;
   {$IFEND}
   if (FP = 0) or (SP = 0) or (FP < SP) then Exit;
+  if (FP - SP) > STACK_DUMP_BYTES then Exit; // also keeps the Integer cast below truncation-safe
   Offset := Integer(FP - SP) + SizeOf(Pointer);
   if (Offset < 0) or (Offset + SizeOf(UInt64) > STACK_DUMP_BYTES) then Exit;
   ACaller := UIntPtr(PUInt64(@GSignalSnapshot.StackBytes[Offset])^);
@@ -487,6 +531,8 @@ begin
   S := GSignalSnapshot;
   TInterlocked.Exchange(GSignalSnapshot.Captured, 0);
   TInterlocked.Exchange(GSignalSnapshot.InvocationCount, 0);
+  // Reopen the slot LAST - a writer claims only after the copy above is done.
+  TInterlocked.Exchange(GSignalSnapshot.Claimed, 0);
 end;
 
 function FormatRegistersSection(const S: TSignalSnapshot): String;
@@ -671,7 +717,7 @@ begin
   TInterlocked.Increment(GSignalSnapshot.InvocationCount);
   // Capture only the FIRST exception (as the POSIX handler does) - a later
   // secondary fault must not overwrite the primary registers.
-  if TInterlocked.CompareExchange(GSignalSnapshot.Captured, 1, 0) = 0 then
+  if TInterlocked.CompareExchange(GSignalSnapshot.Claimed, 1, 0) = 0 then
   begin
     GSignalSnapshot.Kind       := Ord(skMacOSX64);
     GSignalSnapshot.SignalNum  := ASignalNum;
@@ -699,6 +745,7 @@ begin
       if AStackLen > STACK_DUMP_BYTES then AStackLen := STACK_DUMP_BYTES;
       Move(AStackBytes^, GSignalSnapshot.StackBytes[0], AStackLen);
     end;
+    TInterlocked.Exchange(GSignalSnapshot.Captured, 1); // publish after fill
   end;
 end;
 

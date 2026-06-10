@@ -7,7 +7,8 @@
   GUI exceptions.
 
   Call stacks are produced on macOS (backtrace), Android (frame/unwind) and
-  Linux (libgcc _Unwind_Backtrace); on Windows no call stack is produced.
+  Linux (libgcc _Unwind_Backtrace); on Windows the unit is a no-op - the
+  singleton is not created and no RTL hook is installed (EurekaLog territory).
 
   Part of the Crash Reporter library - standalone, EurekaLog-compatible
   crash/exception reporting for Delphi cross-platform targets.
@@ -154,7 +155,7 @@ type
   private
     FMaxCallStackDepth: Integer;
     FModuleAddress: UIntPtr;
-    FReportingException: Boolean;
+    FReportingException: Integer; // 0/1 via TInterlocked - single-flight gate across concurrently crashing threads
   private
     constructor InternalCreate(const ADummy: Integer = 0);
     procedure ReportException(const AExceptionObject: TObject;
@@ -203,6 +204,7 @@ implementation
 
 uses
   System.Classes,
+  System.SyncObjs,
   {$IF Defined(MACOS) or Defined(ANDROID) or Defined(LINUX)}
   Posix.Dlfcn,
   Posix.Stdlib,
@@ -337,13 +339,12 @@ var
   InsertIdx: Integer;
   FaultEntry: TCrashStackEntry;
 begin
-  { Ignore exception that occur while we are already reporting another
-    exception. That can happen when the original exception left the application
-    in such a state that other exceptions would happen (cascading errors). }
-  if (FReportingException) then
+  { Ignore exceptions that occur while we are already reporting another
+    exception (cascading errors). Atomic: two threads crashing at once must not
+    both proceed - the loser would race the shared resolver state
+    (FModuleReaders) mid-report. The losing report is dropped. }
+  if TInterlocked.CompareExchange(FReportingException, 1, 0) <> 0 then
     Exit;
-
-  FReportingException := True;
   try
     CallStack := nil;
     if (AExceptionObject = nil) then
@@ -436,7 +437,7 @@ begin
       { Ignore any exceptions in the report handler. }
     end;
   finally
-    FReportingException := False;
+    TInterlocked.Exchange(FReportingException, 0);
   end;
 end;
 
@@ -482,7 +483,7 @@ begin
     call stack. Instead, retrieve the entire call stack from within this method.
     Just return nil if we are already reporting an exception, or call stacks
     are disabled. }
-  if (FInstance = nil) or (FInstance.FReportingException) or (FInstance.FMaxCallStackDepth <= 0) then
+  if (FInstance = nil) or (FInstance.FReportingException <> 0) or (FInstance.FMaxCallStackDepth <= 0) then
     Exit(nil);
 
   { Allocate a PCallStack record large enough to hold just MaxCallStackDepth
@@ -580,7 +581,7 @@ begin
     call stack. Instead, retrieve the entire call stack from within this method.
     Just return nil if we are already reporting an exception, or call stacks
     are disabled. }
-  if (FInstance = nil) or (FInstance.FReportingException) or (FInstance.FMaxCallStackDepth <= 0) then
+  if (FInstance = nil) or (FInstance.FReportingException <> 0) or (FInstance.FMaxCallStackDepth <= 0) then
     Exit(nil);
 
   { Allocate a PCallStack record large enough to hold just MaxCallStackDepth
@@ -677,7 +678,7 @@ begin
     call stack. Instead, retrieve the entire call stack from within this method.
     Just return nil if we are already reporting an exception, or call stacks
     are disabled. }
-  if (FInstance = nil) or (FInstance.FReportingException) or (FInstance.FMaxCallStackDepth <= 0) then
+  if (FInstance = nil) or (FInstance.FReportingException <> 0) or (FInstance.FMaxCallStackDepth <= 0) then
     Exit(nil);
 
   MaxCallStackDepth := FInstance.FMaxCallStackDepth;
@@ -875,7 +876,7 @@ class function TCrashCapture.GlobalGetExceptionStackInfo(
 var
   CallStack: PCallStack;
 begin
-  if (FInstance = nil) or (FInstance.FReportingException) or (FInstance.FMaxCallStackDepth <= 0) then
+  if (FInstance = nil) or (FInstance.FReportingException <> 0) or (FInstance.FMaxCallStackDepth <= 0) then
     Exit(nil);
 
   GetMem(CallStack, SizeOf(Integer{TCallStack.Count}) +
@@ -1038,7 +1039,10 @@ end;
 {$ENDIF}
 
 initialization
+  // Windows = no-op by design: no singleton -> no RTL hooks (EurekaLog territory).
+  {$IF not Defined(MSWINDOWS)}
   TCrashCapture.FInstance := TCrashCapture.InternalCreate;
+  {$IFEND}
 
 finalization
   FreeAndNil(TCrashCapture.FInstance);

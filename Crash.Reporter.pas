@@ -191,7 +191,9 @@ type
     function EffectiveFileNamePrefix: String;
     function EffectiveReportDir: String;
     function BuildCrashFilePath: String;
-    procedure WriteFatalBriefToConsole(const AReport: TCrashReport);
+    procedure WriteCrashBriefToConsole(const AReport: TCrashReport;
+      const ATerminating: Boolean);
+    procedure ConsoleLine(const S: String);
     procedure WriteToFile(const AText: String);
     procedure ResetAlreadyReported;
     procedure HandleReport(const AReport: TCrashReport);
@@ -282,7 +284,20 @@ begin
   Result := IncludeTrailingPathDelimiter(Dir) + EffectiveFileNamePrefix + Tail + '.el';
 end;
 
-procedure TCrashReporterImpl.WriteFatalBriefToConsole(const AReport: TCrashReport);
+procedure TCrashReporterImpl.ConsoleLine(const S: String);
+// Best-effort stderr line: GUI builds may have no console, and a broken stderr
+// must never throw out of the crash path.
+begin
+  if not IsConsole then Exit;
+  try
+    Writeln(ErrOutput, S);
+    Flush(ErrOutput);
+  except
+  end;
+end;
+
+procedure TCrashReporterImpl.WriteCrashBriefToConsole(const AReport: TCrashReport;
+  const ATerminating: Boolean);
 var
   Loc: TCrashStackEntry;
   AtStr, AppLabel: String;
@@ -306,7 +321,10 @@ begin
     else                          AppLabel := GetExeBaseName;
 
     Writeln(ErrOutput);
-    Writeln(ErrOutput, '*** ', AppLabel, ': unhandled exception, process terminating ***');
+    if ATerminating then
+      Writeln(ErrOutput, '*** ', AppLabel, ': unhandled exception, process terminating ***')
+    else
+      Writeln(ErrOutput, '*** ', AppLabel, ': unhandled exception ***');
     Writeln(ErrOutput, 'Exception: ', AReport.ExceptionMessage);
     Writeln(ErrOutput, 'At: ', AtStr);
     if FCrashFilePath <> '' then
@@ -435,28 +453,27 @@ begin
   FExceptionID := CrashGenerateExceptionID(AReport);
 
   if FConfig.SaveToFile then
-    WriteToFile(Text); // WriteToFile locks FCrashFilePath itself
+    WriteToFile(Text); // un-locked is safe: HandleReport is single-flight via FAlreadyReported
 
   if IsFatal then
   begin
     // Process is about to die. Brief stderr is the only live signal; the full
     // text is already in the file. FAlreadyReported stays True - cascade calls
     // (RTL cleanup sometimes calls ExceptionAcquired after ExceptProc) are eaten.
-    WriteFatalBriefToConsole(AReport);
+    WriteCrashBriefToConsole(AReport, True);
     // EL-style: upload + delete-on-success, otherwise keep the file as-is.
     try
       if TCrashReporter.Upload(Text, ExtractFileName(FCrashFilePath)) then
       begin
-        Writeln(ErrOutput, 'Upload: OK (report sent, local file removed)');
+        ConsoleLine('Upload: OK (report sent, local file removed)');
         if FCrashFilePath <> '' then
           try TFile.Delete(FCrashFilePath); except end;
       end
       else if FConfig.UploadEnabled then
-        Writeln(ErrOutput, 'Upload: FAILED - report kept at ', FCrashFilePath);
-      Flush(ErrOutput);
+        ConsoleLine('Upload: FAILED - report kept at ' + FCrashFilePath);
     except
       on E: Exception do
-        Writeln(ErrOutput, 'Upload: EXCEPTION ' + E.ClassName + ': ' + E.Message);
+        ConsoleLine('Upload: EXCEPTION ' + E.ClassName + ': ' + E.Message);
     end;
     Exit;
   end;
@@ -511,18 +528,18 @@ begin
   else
   begin
     // No dialog handler (e.g. worker-thread exception in a console target). Behave
-    // like the fatal path: brief stderr + try upload + delete-or-keep.
-    WriteFatalBriefToConsole(AReport);
+    // like the fatal path: brief stderr + try upload + delete-or-keep. The process
+    // stays alive here, so the brief must not claim termination.
+    WriteCrashBriefToConsole(AReport, False);
     try
       if TCrashReporter.Upload(Text, ExtractFileName(FCrashFilePath)) then
       begin
-        Writeln(ErrOutput, 'Upload: OK (report sent, local file removed)');
+        ConsoleLine('Upload: OK (report sent, local file removed)');
         if FCrashFilePath <> '' then
           try TFile.Delete(FCrashFilePath); except end;
       end
       else if FConfig.UploadEnabled then
-        Writeln(ErrOutput, 'Upload: FAILED - report kept at ', FCrashFilePath);
-      Flush(ErrOutput);
+        ConsoleLine('Upload: FAILED - report kept at ' + FCrashFilePath);
     except
     end;
     ResetAlreadyReported;
@@ -776,24 +793,28 @@ begin
   end;
   Halt(0);
   {$ELSEIF Defined(LINUX) or Defined(MACOS)}
+  // Marshal argv BEFORE fork: in the child of a multithreaded process only
+  // async-signal-safe calls are allowed until execv - a heap allocation there
+  // can deadlock on a lock another thread held at fork time.
+  SetLength(ArgList, ParamCount + 1);
+  SetLength(Argv, ParamCount + 2); // +1 for the NULL terminator
+  for I := 0 to ParamCount do
+  begin
+    ArgList[I] := TEncoding.UTF8.GetBytes(ParamStr(I));
+    SetLength(ArgList[I], Length(ArgList[I]) + 1); // null-terminate
+    Argv[I] := MarshaledAString(@ArgList[I][0]);
+  end;
+  Argv[ParamCount + 1] := nil;
+  ExePath := TEncoding.UTF8.GetBytes(ParamStr(0));
+  SetLength(ExePath, Length(ExePath) + 1);
+
   ChildPid := fork;
   if ChildPid = 0 then
   begin
-    // Child: execv ourselves with the same argv. If execv returns, it failed.
-    SetLength(ArgList, ParamCount + 1);
-    SetLength(Argv, ParamCount + 2); // +1 for the NULL terminator
-    for I := 0 to ParamCount do
-    begin
-      ArgList[I] := TEncoding.UTF8.GetBytes(ParamStr(I));
-      SetLength(ArgList[I], Length(ArgList[I]) + 1); // null-terminate
-      Argv[I] := MarshaledAString(@ArgList[I][0]);
-    end;
-    Argv[ParamCount + 1] := nil;
-    ExePath := TEncoding.UTF8.GetBytes(ParamStr(0));
-    SetLength(ExePath, Length(ExePath) + 1);
+    // Child: execv ourselves with the same argv. If execv returns, it failed;
+    // _exit, not Halt - unit finalization is not fork-safe either.
     execv(MarshaledAString(@ExePath[0]), @Argv[0]);
-    // execv returned -> failure, exit.
-    Halt(127);
+    Posix.Unistd._exit(127);
   end;
   // Parent (or fork failed - ChildPid=-1) - exit.
   Halt(0);

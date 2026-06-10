@@ -46,7 +46,7 @@ implementation
 uses
   System.SysUtils
   {$IF Defined(LINUX) or Defined(ANDROID)}
-  , Posix.Fcntl, Posix.Unistd
+  , Posix.Fcntl, Posix.Unistd, Posix.Errno
   {$IFEND}
   ;
 
@@ -165,7 +165,9 @@ begin
     repeat
       if Length(Buffer) - Total < ChunkSize then
         SetLength(Buffer, Length(Buffer) + ChunkSize);
-      N := __read(Fd, @Buffer[Total], ChunkSize);
+      repeat
+        N := __read(Fd, @Buffer[Total], ChunkSize);
+      until (N >= 0) or (errno <> EINTR); // a signal mid-read must not truncate the module list
       if N <= 0 then Break;
       Inc(Total, N);
     until False;
@@ -327,6 +329,7 @@ begin
   for I := 1 to Header.ncmds do
   begin
     LC := Pload_command(P);
+    if LC.cmdsize = 0 then Break; // malformed image - avoid an infinite walk
     if LC.cmd = LC_SEGMENT_64 then
     begin
       Seg := Psegment_command_64(P);

@@ -186,6 +186,7 @@ begin
   for I := 1 to Integer(Header.ncmds) do
   begin
     LCmd := Pload_command(P);
+    if LCmd.cmdsize = 0 then Break; // malformed image - avoid an infinite walk
     case LCmd.cmd of
       LC_SEGMENT_64:
       begin
@@ -222,7 +223,8 @@ begin
     for N := 0 to Symtab.nsyms - 1 do
     begin
       // Skip debug stabs; only "defined in section" symbols have real addresses.
-      if ((Sym.n_type and N_STAB) = 0) and ((Sym.n_type and N_TYPE) = N_SECT) then
+      if ((Sym.n_type and N_STAB) = 0) and ((Sym.n_type and N_TYPE) = N_SECT) and
+         (UInt32(Sym.n_un.n_strx) < UInt32(Symtab.strsize)) then // a wild n_strx must not walk past __LINKEDIT
       begin
         // n_strx lives in the anonymous nested record n_un (see Crash.MacOS.Api).
         NameC := MarshaledAString(StrTabBase + Sym.n_un.n_strx);

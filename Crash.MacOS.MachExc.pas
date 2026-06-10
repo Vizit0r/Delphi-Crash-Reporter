@@ -33,9 +33,9 @@ unit Crash.MacOS.MachExc;
 
   STATUS: x86-64 only. ARM64 path is TODO (the snapshot/format side in
   Crash.Signals already supports skMacOSArm64). No-op stub on every other target.
-
-  !!! UNVERIFIED ON A REAL MAC YET - the KERN_FAILURE-fallthrough hypothesis for
-  EXCEPTION_STATE_IDENTITY must be confirmed on macOS. Compile-only so far. !!!
+  Runtime-verified on macOS x86-64 (Intel): a hardware fault yields primary
+  registers in the .el (RIP = fault address) and the KERN_FAILURE reply falls
+  through to the RTL, which raises the Pascal exception as before.
 
   Message layout (EXCEPTION_STATE_IDENTITY, msgh_id 2403) mirrors the Delphi RTL
   System.Internal.MachExceptions.MachMsgSend. }
@@ -201,7 +201,9 @@ var
   R:     mach_msg_return_t;
   Req:   TMachExcRequest;
   Reply: mig_reply_error_t;
+  Fails: Integer;
 begin
+  Fails := 0;
   while True do
   begin
     FillChar(Req, SizeOf(Req), 0);
@@ -210,7 +212,16 @@ begin
     R := mach_msg(Req.header, MACH_RCV_MSG or MACH_RCV_LARGE, 0, SizeOf(Req),
                   GExcPort, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
     if R <> MACH_MSG_SUCCESS then
-      Continue; // defensive: never abort, just keep listening
+    begin
+      // Defensive: never abort. A permanently broken port would busy-spin this
+      // thread, though - back out after a failure streak (the RTL then handles
+      // faults as if we were never here).
+      Inc(Fails);
+      if Fails >= 100 then
+        Exit(nil);
+      Continue;
+    end;
+    Fails := 0;
 
     // Snapshot registers for the exceptions we asked for. Anything unexpected -
     // skip the capture and still reply-fail so the kernel falls through.
@@ -242,6 +253,7 @@ var
   KR:   kern_return_t;
   Attr: pthread_attr_t;
   Th:   pthread_t;
+  Thr:  thread_act_t;
 begin
   // One-time: allocate the receive port (+ a send right) and spin the watcher.
   if TInterlocked.CompareExchange(GInstalled, 1, 0) = 0 then
@@ -268,9 +280,11 @@ begin
   // Register THIS thread's exception port (thread-level -> tried before the
   // task-level RTL port). EXCEPTION_STATE_IDENTITY + MACHINE_THREAD_STATE mirror
   // the RTL so the kernel hands us the same message shape it gives the RTL.
-  thread_set_exception_ports(mach_thread_self,
+  Thr := mach_thread_self;
+  thread_set_exception_ports(Thr,
     EXC_MASK_BAD_ACCESS or EXC_MASK_ARITHMETIC or EXC_MASK_BAD_INSTRUCTION,
     GExcPort, EXCEPTION_STATE_IDENTITY, MACHINE_THREAD_STATE);
+  mach_port_deallocate(mach_task_self, Thr); // mach_thread_self returns a +1 send right
 end;
 
 {$ELSE}  // ---- not macOS x86-64: no-op stub ----

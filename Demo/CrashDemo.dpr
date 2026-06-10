@@ -7,7 +7,7 @@
   bare console target, nothing inside Crash\ secretly depends on the host app.
 
   Build:  Linux64 (Release) via CrashDemo.dproj.
-  Run:    ./CrashDemo --crash=segv|fpe|callbad|callhigh|raise
+  Run:    ./CrashDemo --crash=segv|fpe|callbad|callhigh|stackoverflow|raise
           CRASH_NO_UPLOAD=1 keeps the .el on disk and skips any network. }
 
 {$APPTYPE CONSOLE}
@@ -19,6 +19,17 @@ uses
   {$IFEND}
   Crash.Reporter,
   Crash.CallStack;
+
+function BurnStack(N: Integer): Integer;
+// Unbounded recursion with a fat frame (4 KB) - exhausts an 8 MB stack in ~2000
+// frames. The result feeds back into the caller so nothing gets optimised away.
+var
+  Pad: array[0..511] of NativeInt;
+begin
+  Pad[0] := N;
+  Pad[High(Pad)] := N + 1;
+  Result := BurnStack(N + 1) + Pad[0] + Pad[High(Pad)];
+end;
 
 procedure TriggerCrash(const AKind: String);
 type
@@ -63,11 +74,17 @@ begin
     TProc0(Pointer(NativeUInt($7E00DEAD0000)))();
     {$IFEND}
   end
+  else if AKind = 'stackoverflow' then
+    // Stack exhaustion SIGSEGV. The handler itself runs on the alternate signal
+    // stack (sigaltstack, registered at Init); whether the RTL conversion that
+    // follows can still produce a full .el on the exhausted stack is exactly
+    // what this trigger lets you observe.
+    Writeln(BurnStack(1))
   else if AKind = 'raise' then
     raise Exception.Create('test raise from CrashDemo')
   else
     Writeln(ErrOutput, 'CrashDemo: unknown crash kind "', AKind,
-      '", expected segv|fpe|callbad|callhigh|raise');
+      '", expected segv|fpe|callbad|callhigh|stackoverflow|raise');
 end;
 
 var
@@ -98,7 +115,7 @@ begin
   if Kind = '' then
   begin
     Writeln('CrashDemo - Crash Reporter standalone smoke test.');
-    Writeln('Usage: CrashDemo --crash=segv|fpe|callbad|callhigh|raise');
+    Writeln('Usage: CrashDemo --crash=segv|fpe|callbad|callhigh|stackoverflow|raise');
     Writeln('Reporter Active = ', BoolToStr(TCrashReporter.Active, True));
     Exit;
   end;
