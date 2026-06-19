@@ -83,10 +83,12 @@ type
       but those three. }
     DisabledSections: TCrashReportSections;
     { Directory for the .el reports (both writing and the boot-recovery scan).
-      Empty -> platform default: on macOS the directory NEXT TO the .app bundle
-      (never inside it - writing into a bundle breaks code signing, fails on
-      read-only install locations, and is invisible to users); the executable's
-      own directory on Linux/Windows. Trailing path delimiter optional. }
+      Empty -> platform default: on Android/iOS the app's private documents dir
+      (TPath.GetDocumentsPath - the package dir is read-only); on macOS the
+      directory NEXT TO the .app bundle (never inside it - writing into a bundle
+      breaks code signing, fails on read-only install locations, and is invisible
+      to users); the executable's own directory on Linux/Windows. Trailing path
+      delimiter optional. }
     ReportDir: String;
   end;
 
@@ -140,6 +142,7 @@ uses
   Crash.Signals,
   Crash.MacOS.Symbols,
   Crash.MacOS.MachExc,
+  Crash.Android.Symbols,
   {$IF Defined(MSWINDOWS)}
   Winapi.Windows,
   {$IFEND}
@@ -241,7 +244,14 @@ begin
   if FConfig.ReportDir <> '' then
     Exit(IncludeTrailingPathDelimiter(FConfig.ReportDir));
 
-  {$IF Defined(MACOS)}
+  {$IF Defined(ANDROID) or Defined(IOS)}
+  // 2. Sandboxed mobile: the "exe" lives inside the read-only app package
+  // (Android nativeLibraryDir / the iOS bundle), so ParamStr(0)'s directory is
+  // not writable. Use the app's private documents dir - always writable, needs
+  // no storage permission - which is exactly what a crash reporter wants
+  // (it must succeed even when the process is already failing).
+  ExeDir := TPath.GetDocumentsPath;
+  {$ELSEIF Defined(MACOS)}
   // 2. macOS: if we're inside a .app bundle (.../<X>.app/Contents/MacOS/<exe>),
   // write reports NEXT TO the bundle, never inside it - writing into a bundle
   // breaks code signing, fails on read-only install locations, and is invisible
@@ -633,6 +643,9 @@ begin
   // call stack shows real function names (not the nearest dladdr export). No-op
   // elsewhere.
   CrashInitMacOSSymbolCache;
+  // Android: load the .gosym side-file (an offline address->name map for the
+  // stripped .so) so the call stack shows Pascal names. No-op elsewhere.
+  CrashInitAndroidSymbols;
   // Eager-init the LineNumberInfo singleton on a quiet startup path. Otherwise
   // the first .gol read happens during the FIRST exception inside
   // GetCallStackEntry; if loading itself crashes, that's a double-fault inside

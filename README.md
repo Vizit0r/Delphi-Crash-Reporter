@@ -26,12 +26,19 @@ Derived from [grijjy/JustAddCode](https://github.com/grijjy/JustAddCode)
 | Capability | Linux | macOS | Android | iOS | Windows |
 |---|---|---|---|---|---|
 | Unhandled-exception trapping | ✅ | ✅ | ✅ | ✅ | ❌ (EurekaLog) |
-| Call stack (Pascal names) | ✅ | ✅ (LC_SYMTAB) | ✅ | ✅ | ❌ |
-| Source line numbers (`.gol`) | ✅ | ✅ | — | — | — |
+| Call stack (Pascal names) | ✅ | ✅ (LC_SYMTAB) | ✅ (`.gosym`) | ✅ | ❌ |
+| Source line numbers (`.gol`) | ✅ | ✅ | ✅ | — | — |
 | CPU registers on hardware faults | ✅ | ✅ (signal ucontext / Mach) | — | — | — |
 | Modules section | ✅ | ✅ | ✅ | — | — |
 | EL-compatible `.el` output | ✅ | ✅ | ✅ | ✅ | — |
 | Save / upload / dialog / restart | ✅ | ✅ | ✅ (no restart) | ✅ (no restart) | — |
+
+On **Android** the deployed `.so` is stripped and the linker localizes Pascal symbols,
+so names + lines come from two side-files shipped with the app — `.gosym` (names) and
+`.gol` (lines); see their sections below. There is also no usable modal report dialog on
+mobile (FMX `ShowModal` is async-only), so wire `OnShowDialog := nil`: non-fatal
+exceptions are saved + uploaded headlessly, and an unhandled main-thread Pascal exception
+is caught by FMX's `HandleException` (the app survives), not the `ExceptProc` fatal path.
 
 ## Quick start
 
@@ -116,6 +123,7 @@ Core (framework-agnostic):
 - `Crash.Signals` — POSIX `sigaction` CPU-register snapshot for hardware faults.
 - `Crash.Modules` — loaded-module enumeration.
 - `Crash.LineNumbers` — `.gol` line-number reader.
+- `Crash.Android.Symbols` — `.gosym` reader: address → Pascal name + source file on Android.
 - `Crash.ELFormat` — EurekaLog `.el` text writer.
 - `Crash.MacOS.Api` / `Crash.MacOS.Symbols` — Mach-O structs + LC_SYMTAB symbolication.
 - `Crash.Demangle` — C++ (Itanium) → Pascal symbol translation.
@@ -128,12 +136,18 @@ Optional UI:
 ## Source line numbers (`.gol`)
 
 Line numbers come from a `.gol` file generated at build time from the binary's
-debug info and deployed next to the executable.
+debug info and deployed alongside the app (next to the executable on Linux/macOS; as an
+APK asset on Android — the mobile deploy is shared with `.gosym`, see *Function names*).
 
 - **Linux**: `Tools/LineNumberGenerator/LNG_ELF` reads DWARF from the ELF.
 - **macOS**: `Tools/LineNumberGenerator/LNG` reads DWARF from the `.dSYM`.
+- **Android**: the same `LNG_ELF` reads DWARF from the **unstripped** `.so`. Link with
+  `--build-id=sha1` so the reader can match the `.gol` to the stripped, on-device `.so`
+  (which keeps the build-id note but drops DWARF). Lines resolve identically to Linux;
+  what differs is only where the file is found at runtime (the app documents dir, not
+  next to the binary).
 
-Both emit the same `.gol` byte format that `Crash.LineNumbers` reads at runtime.
+All emit the same `.gol` byte format that `Crash.LineNumbers` reads at runtime.
 
 ### Build requirements
 
@@ -142,6 +156,11 @@ Both emit the same `.gol` byte format that `Crash.LineNumbers` reads at runtime.
   the latter the call stack falls back to module-offset proxies.
 - **macOS** (Release): Local symbols = True and Output debug information = True,
   otherwise the linker strips the symbol table and names resolve poorly.
+- **Android**: `DCC_DebugInformation=2` here too, so `LNG_ELF` can read the DWARF, plus
+  `--build-id=sha1` so the reader can match the `.gol` to the stripped on-device `.so`.
+  (Unlike Linux, `--export-dynamic` is pointless on Android — the version script localizes
+  the symbols anyway; on-device *names* come from the `.gosym`, which has its own
+  build requirements.)
 - After changing `DCC_DebugInformation`, do one full rebuild (incremental Make
   reuses `.dcu` cache and the `.gol` ends up near-empty).
 
@@ -187,6 +206,67 @@ container built from the thin `.gol`s matches the assembled universal binary.
 **Deploy:** place the `.gol` at `<app>.app/Contents/Resources/<exe>.gol` — the
 reader's macOS fallback looks for it there, and `codesign` rejects non-Mach-O
 files in `Contents/MacOS/`.
+
+## Function names (`.gosym`) — Android
+
+On Linux/macOS the call-stack *names* come from the binary's own symbol table at runtime
+(`dladdr` over `--export-dynamic` on Linux; `LC_SYMTAB` on macOS). On Android neither is
+available: the Delphi linker localizes every Pascal symbol with a version script, and the
+deployed `.so` is stripped to a tiny `.dynsym` export whitelist, so `dladdr` resolves only
+the few entry points. The `.gosym` side-file restores names on-device, the same way the
+`.gol` restores lines — and it is deployed and matched (by build-id) identically.
+
+A `.gosym` is an address-sorted table of `(VM address, size, mangled name, source file)`,
+generated offline from the **unstripped** `.so`:
+
+- **Names** come from the `.so`'s `.symtab` (`llvm-nm`) — stored mangled, demangled at
+  runtime via `__cxa_demangle`, exactly as `dladdr` names are on the other POSIX targets.
+- **The source file** per function comes from the DWARF line info (`llvm-symbolizer`).
+  Knowing the unit (from the file — with correct casing) lets the reporter split
+  Unit/Class/Procedure **the way EurekaLog does** (`TEurekaBaseStackList.ParseClassName`):
+  strip the unit prefix, then take the last dot outside any brackets — no guessing from
+  the flat dotted name. It also fills the `Source` column with the real `.pas`. Functions
+  with no DWARF (~18%, RTL stubs) carry no file and fall back to `module + offset`.
+
+The byte format is documented at the top of `Crash.Android.Symbols`, which reads the file
+once at startup, verifies its build-id against the running `.so`, and serves lookups from
+an in-memory binary search (cheap on the crash path).
+
+### Build requirements
+
+The same two link settings as the `.gol` (both come from one `.so`): `DCC_DebugInformation=2`
+and `--build-id=sha1`. The build-id matches the file to the stripped on-device `.so`. DWARF
+is what yields the **source file** per function — hence the correct unit, the EurekaLog-style
+class/method split and the `Source` column; the *names* come from the `.symtab` and survive
+even without DWARF, but then the split falls back to the dotted-name heuristic and there is
+no source file. `--export-dynamic` does nothing here (the version script localizes the
+symbols regardless).
+
+### Building the generator
+
+`Tools/gen-android-symfile.ps1` is a host PowerShell script (it shells out to the NDK
+`llvm-nm`, `llvm-readelf` and `llvm-symbolizer`). It is the `.gosym` counterpart of
+`LNG_ELF` for the `.gol`:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File Tools\gen-android-symfile.ps1 `
+    -SoPath out\Android64\libMyApp.so          # -> libMyApp.so.gosym
+```
+
+### Mobile deploy (`.gosym` + `.gol`)
+
+Both files are produced together and shipped together:
+
+1. Link the `.so` with `--build-id=sha1` and keep DWARF (`DCC_DebugInformation=2`).
+2. From the just-linked **unstripped** `.so`, run `LNG_ELF` → `<so>.gol` and
+   `gen-android-symfile.ps1` → `<so>.gosym`. Regenerate every build (a fresh link gives a
+   new build-id; a stale side-file is rejected, not mis-read).
+3. Ship both inside the APK as assets with RemoteDir `assets\internal\`, which lands them
+   in the app's documents dir — where `Crash.Android.Symbols` / `Crash.LineNumbers` look
+   for `<so-name>.gosym` / `<so-name>.gol`.
+4. **Archive the unstripped `.so` per release** so any leftover `module + offset` report
+   (a no-DWARF frame, or an old report whose side-files were lost) can still be symbolized
+   offline against it.
 
 ## Wiring into your build
 

@@ -62,10 +62,16 @@ uses
   System.DateUtils,
   System.TimeSpan,
   System.Generics.Collections,
+  System.StrUtils,
   {$IF not Defined(MSWINDOWS)}
   Posix.Unistd,
   Posix.SysUtsname,
   {$IFEND}
+  {$IFDEF ANDROID}
+  Androidapi.JNI.JavaTypes,
+  Androidapi.JNI.Os,
+  Androidapi.Helpers,
+  {$ENDIF}
   System.IOUtils,
   Crash.Signals,       // CrashTakeAndFormatSnapshots
   Crash.Modules,       // CrashEnumerateModules + format
@@ -188,6 +194,10 @@ end;
 procedure SplitDottedName(const AFull: String; out AUnit, AClass, AProc: String);
 { "Foo.Bar.Baz.Qux" -> Unit="Foo.Bar", Class="Baz", Proc="Qux".
   With fewer than 2 dots the whole tail goes into Proc.
+  Heuristic fallback used when the unit name is NOT known from debug info (the
+  always-2nd-last-is-a-class guess; right for methods, wrong for plain functions in
+  dotted-name units). When a source file IS known (Android .gosym, macOS LC_SYMTAB
+  with a source unit) UnitAwareSplit is used instead - that is unambiguous.
   Parameters (from the first '(' on) count as part of Proc and are NOT split on
   dots - otherwise demangled C++ names like "Foo.Bar.Baz(Quux.TFoo, ...)" would
   split on dots INSIDE the parameter types, and Class/Proc drift into neighbour
@@ -242,6 +252,55 @@ begin
   AProc  := Copy(Sig, LastDot + 1, MaxInt) + Params;
 end;
 
+procedure UnitAwareSplit(const AUnit, AFull: String; out AClass, AProc: String);
+{ EurekaLog-style split when the unit name IS known (from debug info / a source
+  file): strip the unit prefix, then take the LAST dot that is outside any round,
+  angle or curly brackets (so dots inside generic args or parameter lists do not
+  mis-split). What is before that dot is the class, after it the method. No
+  type-name guessing. Mirrors TEurekaBaseStackList.ParseClassName. AUnit may carry a
+  leading System namespace that the demangled name dropped (CppSymbolToPascal
+  strips it) - we tolerate that. }
+var
+  Name, UnitPrefix: String;
+  I, Depth, LastDot: Integer;
+  C: Char;
+begin
+  AClass := '';
+  AProc  := AFull;
+  Name := AFull;
+
+  // The demangled name has the leading "System" namespace stripped (CppSymbolToPascal),
+  // so match the unit without it too.
+  UnitPrefix := AUnit;
+  if SameText(UnitPrefix, 'System') then
+    UnitPrefix := ''
+  else if StartsText('System.', UnitPrefix) then
+    UnitPrefix := Copy(UnitPrefix, Length('System.') + 1, MaxInt);
+
+  if (UnitPrefix <> '') and StartsText(UnitPrefix + '.', Name) then
+    Name := Copy(Name, Length(UnitPrefix) + 2, MaxInt);
+
+  // Last '.' outside of (), <>, {} -> class | method boundary.
+  Depth := 0;
+  LastDot := 0;
+  for I := 1 to Length(Name) do
+  begin
+    C := Name[I];
+    case C of
+      '(', '<', '{': Inc(Depth);
+      ')', '>', '}': if Depth > 0 then Dec(Depth);
+      '.': if Depth = 0 then LastDot := I;
+    end;
+  end;
+  if LastDot > 0 then
+  begin
+    AClass := Copy(Name, 1, LastDot - 1);
+    AProc  := Copy(Name, LastDot + 1, MaxInt);
+  end
+  else
+    AProc := Name;
+end;
+
 type
   TRenderedFrame = record
     Methods, Details, Stack, Address, Module, Offset,
@@ -259,6 +318,14 @@ begin
   // is a no-op stub returning False, so we use the resolved RoutineName as usual.
   if CrashLookupMacOSSymbol(AEntry.CodeAddress, MacName, MacAddr) then
     SplitDottedName(MacName, UName, CName, PName)
+  else if AEntry.SourceFile <> '' then
+  begin
+    // Unit is known authoritatively (Android .gosym carries the source file):
+    // take it from the file - correct casing - and split class/method by stripping
+    // the unit prefix (EurekaLog-style), instead of guessing from the dotted name.
+    UName := ChangeFileExt(AEntry.SourceFile, '');
+    UnitAwareSplit(UName, AEntry.RoutineName, CName, PName);
+  end
   else
     SplitDottedName(AEntry.RoutineName, UName, CName, PName);
 
@@ -282,8 +349,11 @@ begin
     Result.Offset := AddrHex(AEntry.CodeAddress - AEntry.ModuleAddress)
   else
     Result.Offset := AddrHex(0);
-  // Source filename - not available from the resolver; best effort is <unit>.pas.
-  if UName <> '' then
+  // Source filename - from debug info when known (correct casing), else best
+  // effort <unit>.pas.
+  if AEntry.SourceFile <> '' then
+    Result.Source := AEntry.SourceFile
+  else if UName <> '' then
     Result.Source := UName + '.pas'
   else
     Result.Source := '';
@@ -828,6 +898,20 @@ begin
     Result.ComputerName := '';
     Result.OSDescription := 'POSIX';
   end;
+  {$IFDEF ANDROID}
+  // uname only reports the Linux kernel; prepend the actual Android OS + device.
+  try
+    Result.OSDescription := Format('Android %s (API %d); %s %s; %s',
+      [JStringToString(TJBuild_VERSION.JavaClass.RELEASE),
+       TJBuild_VERSION.JavaClass.SDK_INT,
+       JStringToString(TJBuild.JavaClass.MANUFACTURER),
+       JStringToString(TJBuild.JavaClass.MODEL),
+       Result.OSDescription]);
+    Result.ComputerName := JStringToString(TJBuild.JavaClass.MODEL);
+  except
+    // JNI unavailable -> keep the uname-based description
+  end;
+  {$ENDIF}
   {$IFEND}
   Result.AppDpi := 96;
   Result.ThreadID := 0;        // overridden by the reporter with the real crashing TID

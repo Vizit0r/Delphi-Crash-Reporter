@@ -63,6 +63,12 @@ type
       somewhere inside your (Delphi) code, then this will be the name of the
       executable module (or .so file on Android). }
     ModuleName: String;
+
+    { Source file (e.g. "MyApp.Forms.Main.pas") from debug info, when the
+      resolver knows it authoritatively. Lets the formatter take the unit from the
+      file (correct casing) and split class/method unambiguously instead of guessing
+      from the dotted name. Currently filled on Android (.gosym); '' elsewhere. }
+    SourceFile: String;
   public
     { Clears the entry (sets everything to 0) }
     procedure Clear;
@@ -213,7 +219,8 @@ uses
   Posix.Base,
   {$ENDIF}
   Crash.Demangle,
-  Crash.Signals;
+  Crash.Signals,
+  Crash.Android.Symbols; // .gosym name resolution (no-op off Android)
 
 {$RANGECHECKS OFF}
 
@@ -228,6 +235,7 @@ begin
   RoutineLineNumber := 0;
   RoutineName := '';
   ModuleName := '';
+  SourceFile := '';
 end;
 
 { TCrashCapture }
@@ -970,9 +978,23 @@ begin
       AEntry.RoutineAddress := AEntry.ModuleAddress; // offset = code - module
     end;
 
+    {$IF Defined(ANDROID)}
+    // dladdr sees only the .dynsym export whitelist on Android (the linker
+    // localizes Pascal symbols), so RoutineName is empty above. Fill the name +
+    // function start from the .gosym side-file (an offline address->name map
+    // generated from the unstripped .so's symtab; see Crash.Android.Symbols).
+    if (AEntry.RoutineName = '') and (AEntry.ModuleAddress <> 0) then
+      CrashAndroidLookupName(AEntry.CodeAddress, AEntry.ModuleAddress,
+        AEntry.RoutineName, AEntry.RoutineAddress, AEntry.SourceFile);
+    {$ENDIF}
+
     {$IF (Defined(MACOS64) and not Defined(IOS)) or Defined(LINUX)}
     AEntry.LineNumber := GetLineNumber(AEntry.CodeAddress);
     AEntry.RoutineLineNumber := GetLineNumber(AEntry.RoutineAddress);
+    {$ELSEIF Defined(ANDROID)}
+    // Lines from the .gol side-file (LNG_ELF-generated; see Crash.Android.Symbols).
+    AEntry.LineNumber := CrashAndroidLookupLine(AEntry.CodeAddress, AEntry.ModuleAddress);
+    AEntry.RoutineLineNumber := CrashAndroidLookupLine(AEntry.RoutineAddress, AEntry.ModuleAddress);
     {$ELSE}
     AEntry.LineNumber := 0;
     AEntry.RoutineLineNumber := 0;
