@@ -32,8 +32,7 @@ unit Crash.Signals;
   Scope:
     - Linux x86-64.
     - macOS x86-64 (Intel) + ARM64 (Apple Silicon).
-    - Android ARM64 (aarch64 ucontext snapshot; opt-in via the host - see the
-      reporter's CaptureSignalRegisters gate).
+    - Android ARM64 (aarch64 ucontext snapshot).
     - Everything else (32-bit ARM, iOS, Windows) - the API compiles to no-op
       stubs. }
 

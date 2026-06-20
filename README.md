@@ -28,7 +28,7 @@ Derived from [grijjy/JustAddCode](https://github.com/grijjy/JustAddCode)
 | Unhandled-exception trapping | ✅ | ✅ | ✅ | ✅ | ❌ (EurekaLog) |
 | Call stack (Pascal names) | ✅ | ✅ (LC_SYMTAB) | ✅ (`.gosym`) | ❓ untested | ❌ |
 | Source line numbers (`.gol`) | ✅ | ✅ | ✅ | — | — |
-| CPU registers on hardware faults | ✅ | ✅ (signal ucontext / Mach) | ✅ (ARM64, opt-in) | — | — |
+| CPU registers on hardware faults | ✅ | ✅ (signal ucontext / Mach) | ✅ (ARM64) | — | — |
 | Modules section | ✅ | ✅ | ✅ | — | — |
 | EL-compatible `.el` output | ✅ | ✅ | ✅ | ✅ | — |
 | Save / upload / dialog / restart | ✅ | ✅ | ✅ (no restart) | ✅ (no restart) | — |
@@ -94,7 +94,6 @@ vary is a field — there are no compile-time constants baked into the library.
 | `UploadFieldName` | `el_upload_file_0` | Multipart file field name |
 | `UploadPendingOnStartup` | `False` | Re-upload leftover reports on `Init` |
 | `AllowRestart` | `True` | Allow the Restart action (platform-gated) |
-| `CaptureSignalRegisters` | `False` | **Android only:** opt into installing the signal handlers that capture CPU registers + a stack dump on hardware faults. Linux/macOS install them regardless (this flag is ignored there). |
 | `OnShowDialog` | `nil` | GUI dialog provider; `nil` → brief stderr |
 | `OnCollectContext` | `nil` | Optional extra text appended to the report |
 | `DisabledSections` | `[]` (full report) | Report sections to omit entirely (header + body); Application, Exception and Call Stack are mandatory and not omittable |
@@ -348,10 +347,10 @@ as secondary and left alone (its nearest in-app frame is already shown).
 Scope: Linux x86-64, macOS x86-64 + ARM64, and Android ARM64 (aarch64). Other
 targets compile to no-ops.
 
-On **Android** register capture is **opt-in** — set `Cfg.CaptureSignalRegisters := True`
-(default off, so the stock build is unchanged). The handler reads the bionic aarch64
-`ucontext` (`X0..X30`, `SP`, `PC`, `PSTATE`) and emits a `Registers:` + `Stack:` /
-`Memory Dump` block just like the x86/x64 path. One Android-specific wrinkle: the
+On **Android** register capture is on by default, like the other POSIX targets. The
+handler reads the bionic aarch64 `ucontext` (`X0..X30`, `SP`, `PC`, `PSTATE`) and emits
+a `Registers:` + `Stack:` / `Memory Dump` block just like the x86/x64 path. One
+Android-specific wrinkle: the
 EurekaLog Viewer keeps a CPU section only if it contains the literal `EAX` or `RAX`
 (an x86/x64 register-name check in `TLogFile.GetItem_CPU`), so the ARM64 block carries
 a single `EAX/RAX: n/a on ARM64 - …compatibility` note line to satisfy that gate; the
