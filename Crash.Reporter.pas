@@ -71,6 +71,12 @@ type
     UploadPendingOnStartup: Boolean;
     { Allow the Restart action (platform-gated at runtime). Default True. }
     AllowRestart: Boolean;
+    { Android only: install POSIX signal handlers to capture CPU registers + a
+      256-byte stack dump on hardware faults (SIGSEGV/SIGFPE/SIGILL/SIGBUS),
+      emitted as the "Registers:" / "Crash Signal Info:" sections. Default False
+      (opt in). Linux and macOS capture regardless of this flag (their handlers
+      are always installed - shipping behaviour). }
+    CaptureSignalRegisters: Boolean;
     { GUI dialog provider for non-fatal exceptions. nil -> stderr fallback. }
     OnShowDialog: TCrashShowDialogProc;
     { Optional extra-context provider appended to the report. nil -> none. }
@@ -167,6 +173,22 @@ end;
 function GetExeBaseName: String; inline;
 begin
   Result := ChangeFileExt(ExtractFileName(ParamStr(0)), '');
+end;
+
+procedure InstallSignalCaptureIfEnabled(ACapture: Boolean); inline;
+// On Android the POSIX register/stack capture is opt-in (ACapture, from
+// TCrashConfig.CaptureSignalRegisters) - installing the sigaction handlers there
+// is gated so the default build behaves exactly as before this feature. On Linux/
+// macOS the handlers are always installed (their capture is shipping behaviour),
+// so ACapture is ignored. CrashInstallSignalHandlers is itself a no-op on targets
+// without signal capture compiled in.
+begin
+  {$IFDEF ANDROID}
+  if ACapture then
+    CrashInstallSignalHandlers;
+  {$ELSE}
+  CrashInstallSignalHandlers;
+  {$ENDIF}
 end;
 
 function GetPlatformTag: String; inline;
@@ -495,7 +517,7 @@ begin
   // us -> later .el files would lack the "Registers:" section. This crash's
   // snapshot was already consumed in CrashBuildELReportText above, so re-install
   // is safe; GOldHandlers keeps the original Pascal RTL handler.
-  CrashInstallSignalHandlers;
+  InstallSignalCaptureIfEnabled(FConfig.CaptureSignalRegisters);
 
   LocalDialogProc := FConfig.OnShowDialog;
   if Assigned(LocalDialogProc) then
@@ -628,13 +650,19 @@ end;
 { ---- TCrashReporter façade ---- }
 
 class procedure TCrashReporter.Init(const AConfig: TCrashConfig);
+var
+  LCapture: Boolean;
 begin
+  // Captured into a local so the ForceQueue closure below doesn't reference the
+  // const AConfig parameter (Delphi can't safely capture const/var params).
+  LCapture := AConfig.CaptureSignalRegisters;
   if GReporter = nil then
     GReporter := TCrashReporterImpl.Create;
   GReporter.Install(AConfig);
   // POSIX: capture registers + stack for AV/div0/illegal-instruction before the
   // kernel re-delivers the signal to the Pascal RTL handler. No-op on Windows.
-  CrashInstallSignalHandlers;
+  // On Android this is opt-in (see InstallSignalCaptureIfEnabled).
+  InstallSignalCaptureIfEnabled(LCapture);
   // macOS: install our thread-level Mach exception port on the MAIN thread (we
   // run on it here). Captures CPU registers for hardware faults, which the RTL's
   // POSIX-bypassing Mach handler otherwise hides. No-op on non-(macOS x86-64).
@@ -668,7 +696,7 @@ begin
   // Pascal RTL handler on the repeat.
   TThread.ForceQueue(nil, procedure
   begin
-    CrashInstallSignalHandlers;
+    InstallSignalCaptureIfEnabled(LCapture);
   end);
 end;
 

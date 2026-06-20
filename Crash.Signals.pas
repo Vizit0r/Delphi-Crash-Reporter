@@ -32,8 +32,10 @@ unit Crash.Signals;
   Scope:
     - Linux x86-64.
     - macOS x86-64 (Intel) + ARM64 (Apple Silicon).
-    - Everything else (Linux ARM, Android, iOS, Windows) - the API compiles to
-      no-op stubs. }
+    - Android ARM64 (aarch64 ucontext snapshot; opt-in via the host - see the
+      reporter's CaptureSignalRegisters gate).
+    - Everything else (32-bit ARM, iOS, Windows) - the API compiles to no-op
+      stubs. }
 
 interface
 
@@ -86,8 +88,16 @@ procedure CrashRecordMacOSSnapshot(const ARegs: TCrashMacOSRegs;
 implementation
 
 {$IF (Defined(LINUX) and Defined(CPUX64)) or
+     (Defined(ANDROID) and Defined(CPUARM64)) or
      (Defined(MACOS) and (Defined(CPUX64) or Defined(CPUARM64)))}
   {$DEFINE CRASH_SIGCAP}
+{$IFEND}
+
+// Delphi does NOT define LINUX on Android, but bionic shares Linux's sigaction /
+// siginfo / ucontext field names, so the POSIX field-access code below selects on
+// this combined symbol (macOS keeps its own branches).
+{$IF Defined(LINUX) or Defined(ANDROID)}
+  {$DEFINE CRASH_LINUXLIKE}
 {$IFEND}
 
 {$IF Defined(CRASH_SIGCAP)}
@@ -102,7 +112,7 @@ const
   CRLF             = #13#10;
 
 type
-  TSnapshotKind = (skNone, skLinuxX64, skMacOSX64, skMacOSArm64);
+  TSnapshotKind = (skNone, skLinuxX64, skMacOSX64, skMacOSArm64, skLinuxArm64);
 
   TSignalSnapshot = packed record
     Claimed:       Integer;                         // atomic claim: writer wins the slot, fills the fields, THEN publishes
@@ -138,7 +148,7 @@ const
   ALT_STACK_BYTES = 64 * 1024;
   // SS_DISABLE is absent from Delphi's Linux Posix.Signal, and its value
   // differs per platform (Linux=2, macOS=4).
-  ALT_SS_DISABLE  = {$IF Defined(LINUX)}2{$ELSEIF Defined(MACOS)}4{$IFEND};
+  ALT_SS_DISABLE  = {$IF Defined(CRASH_LINUXLIKE)}2{$ELSEIF Defined(MACOS)}4{$IFEND};
 
 procedure InstallAltStackOnce;
 // Register an alternate signal stack for the CALLING thread (first call only;
@@ -170,7 +180,7 @@ function ExtractFaultAddr(SigInfo: Psiginfo_t): UInt64; inline;
 begin
   Result := 0;
   if SigInfo = nil then Exit;
-  {$IF Defined(LINUX)}
+  {$IF Defined(CRASH_LINUXLIKE)}
   Result := UInt64(NativeUInt(SigInfo._sifields._sigfault.si_addr));
   {$ELSEIF Defined(MACOS)}
   Result := UInt64(NativeUInt(SigInfo.si_addr));
@@ -232,6 +242,25 @@ begin
     Fp := __fp; Lr := __lr; Sp := __sp; Pc := __pc; Cpsr := __cpsr;
   end;
 end;
+{$ELSEIF Defined(ANDROID) and Defined(CPUARM64)}
+var
+  UC: Pucontext_t;
+  I:  Integer;
+begin
+  if Ctx = nil then Exit;
+  UC := Pucontext_t(Ctx);
+  // Android (bionic) aarch64 sigcontext: regs[0..30] = x0..x30, then arm_sp /
+  // arm_pc / pstate. uc_mcontext is by value (not a pointer) here. Layout from the
+  // RTL android SignalTypes.inc (sigcontext_t / ucontext_t).
+  GSignalSnapshot.Kind := Ord(skLinuxArm64);
+  for I := 0 to 28 do
+    GSignalSnapshot.X[I] := UC.uc_mcontext.regs[I];
+  GSignalSnapshot.Fp   := UC.uc_mcontext.regs[29];
+  GSignalSnapshot.Lr   := UC.uc_mcontext.regs[30];
+  GSignalSnapshot.Sp   := UC.uc_mcontext.arm_sp;
+  GSignalSnapshot.Pc   := UC.uc_mcontext.arm_pc;
+  GSignalSnapshot.Cpsr := UInt32(UC.uc_mcontext.pstate);
+end;
 {$IFEND}
 
 function GetStackPointer: UInt64; inline;
@@ -290,7 +319,7 @@ end;
 procedure SetHandlerInAction(var Act: sigaction_t; H: TSigActionHandler); inline;
 // The union field has different names on Linux vs macOS - isolate the difference.
 begin
-  {$IF Defined(LINUX)}
+  {$IF Defined(CRASH_LINUXLIKE)}
   Act._u.sa_sigaction := H;
   {$ELSEIF Defined(MACOS)}
   Act.__sigaction_handler.sa_sigaction := H;
@@ -310,7 +339,7 @@ var
   Self, Stored: NativeUInt;
 begin
   Self := NativeUInt(@CrashSignalHandler);
-  {$IF Defined(LINUX)}
+  {$IF Defined(CRASH_LINUXLIKE)}
   Stored := NativeUInt(@Prev._u.sa_sigaction);
   {$ELSEIF Defined(MACOS)}
   Stored := NativeUInt(@Prev.__sigaction_handler.sa_sigaction);
@@ -340,7 +369,7 @@ begin
   // we saved it, restore-prev would re-fault onto the stub -> pingpong/hang.
   // So we keep the first (Pascal RTL) prev and never overwrite it.
   if not PrevIsOurselves(Prev) then
-    {$IF Defined(LINUX)}
+    {$IF Defined(CRASH_LINUXLIKE)}
     if NativeUInt(@GOldHandlers[SigNum]._u.sa_sigaction) = 0 then
       GOldHandlers[SigNum] := Prev;
     {$ELSE}
@@ -410,7 +439,16 @@ function GuessSnapshotIsSecondary(RIP, AFaultAddr: UInt64): Boolean; inline;
 begin
   if (AFaultAddr <> 0) and (AFaultAddr = RIP) then
     Exit(False);
+  {$IF Defined(ANDROID)}
+  // The x64 "low exe vs high shared-lib" split does NOT hold on Android: our own
+  // code lives in the app's own .so, mmap'd high alongside the system libs, so the
+  // address-range test would misclassify real faults in our code as secondary and
+  // suppress the Registers section. Treat every captured fault as primary here
+  // (a module-range check via dladdr could refine this later).
+  Result := False;
+  {$ELSE}
   Result := RIP >= UInt64($700000000000);
+  {$IFEND}
 end;
 
 function CrashPrimaryFaultAddr(out AAddr: UIntPtr): Boolean;
@@ -460,7 +498,7 @@ begin
   Result := ACaller <> 0;
 end;
 
-{$IF Defined(CPUX64)}
+{$IF Defined(CPUX64) or Defined(CPUARM64)}
 function ReadStackQword(const S: TSignalSnapshot; ByteOffset: Integer): UInt64; inline;
 // Read an 8-byte qword at the given offset in our StackBytes (for column 1 of the dump).
 var
@@ -586,16 +624,22 @@ begin
         SB.AppendFormat('EXP: %s   STK: %s', [Hex16(EXP_),  Hex16(STK_)]); SB.Append(CRLF);
         {$IFEND}
       end;
-      skMacOSArm64:
+      skMacOSArm64, skLinuxArm64:
       begin
         {$IF Defined(CPUARM64)}
         // ARM64 - EL has no defined format for ARM, emit a compact list of two.
-        for I := 0 to 14 do
+        // X0..X27 in pairs (loop 0..13: the last pair is X26/X27); X28 + FP, LR/SP,
+        // PC/CPSR follow explicitly. NB: 0..13, not 0..14 - X is [0..28], so X[29]
+        // would read past the array (onto the Fp field).
+        for I := 0 to 13 do
           SB.AppendFormat('X%-2d: %s   X%-2d: %s',
             [I*2, Hex16(S.X[I*2]), I*2+1, Hex16(S.X[I*2+1])]).Append(CRLF);
         SB.AppendFormat('X28: %s   FP : %s', [Hex16(S.X[28]), Hex16(S.Fp)]); SB.Append(CRLF);
         SB.AppendFormat('LR : %s   SP : %s', [Hex16(S.Lr),    Hex16(S.Sp)]); SB.Append(CRLF);
         SB.AppendFormat('PC : %s   CPSR: %.8x', [Hex16(S.Pc), S.Cpsr]);      SB.Append(CRLF);
+        // The EL Viewer keeps a CPU section only if it contains 'EAX' or 'RAX'
+        // (TLogFile.GetItem_CPU); ARM64 has neither, so this note carries the token.
+        SB.Append('EAX/RAX: n/a on ARM64 - added only for EurekaLog Viewer compatibility'); SB.Append(CRLF);
         {$IFEND}
       end;
     else
@@ -610,7 +654,7 @@ begin
     // "Stack:                       Memory Dump:". Our metadata
     // (Signal/Fault/Invocations/Note) goes into a separate "Crash Signal Info:"
     // section at the very end of the .el (see FormatSignalInfoSection).
-    {$IF Defined(CPUX64)}
+    {$IF Defined(CPUX64) or Defined(CPUARM64)}
     if S.StackBaseAddr <> 0 then
     begin
       // Header row "Stack:" padded to 36 + "Memory Dump:" (EL ECPUFmt).

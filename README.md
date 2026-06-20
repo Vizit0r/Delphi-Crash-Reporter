@@ -26,12 +26,18 @@ Derived from [grijjy/JustAddCode](https://github.com/grijjy/JustAddCode)
 | Capability | Linux | macOS | Android | iOS | Windows |
 |---|---|---|---|---|---|
 | Unhandled-exception trapping | ✅ | ✅ | ✅ | ✅ | ❌ (EurekaLog) |
-| Call stack (Pascal names) | ✅ | ✅ (LC_SYMTAB) | ✅ (`.gosym`) | ✅ | ❌ |
+| Call stack (Pascal names) | ✅ | ✅ (LC_SYMTAB) | ✅ (`.gosym`) | ❓ untested | ❌ |
 | Source line numbers (`.gol`) | ✅ | ✅ | ✅ | — | — |
-| CPU registers on hardware faults | ✅ | ✅ (signal ucontext / Mach) | — | — | — |
+| CPU registers on hardware faults | ✅ | ✅ (signal ucontext / Mach) | ✅ (ARM64, opt-in) | — | — |
 | Modules section | ✅ | ✅ | ✅ | — | — |
 | EL-compatible `.el` output | ✅ | ✅ | ✅ | ✅ | — |
 | Save / upload / dialog / restart | ✅ | ✅ | ✅ (no restart) | ✅ (no restart) | — |
+
+**iOS is not runtime-tested.** The units compile for iOS and its paths mirror the macOS
+Mach-O ones (so the call stack *should* resolve via `LC_SYMTAB`), but nothing in the iOS
+column has been verified on device — treat those marks as *expected, not confirmed*. The
+Pascal-name call stack is the least certain: iOS strips/signs binaries differently, which
+can leave `LC_SYMTAB` without the local symbols the resolver needs.
 
 On **Android** the deployed `.so` is stripped and the linker localizes Pascal symbols,
 so names + lines come from two side-files shipped with the app — `.gosym` (names) and
@@ -88,6 +94,7 @@ vary is a field — there are no compile-time constants baked into the library.
 | `UploadFieldName` | `el_upload_file_0` | Multipart file field name |
 | `UploadPendingOnStartup` | `False` | Re-upload leftover reports on `Init` |
 | `AllowRestart` | `True` | Allow the Restart action (platform-gated) |
+| `CaptureSignalRegisters` | `False` | **Android only:** opt into installing the signal handlers that capture CPU registers + a stack dump on hardware faults. Linux/macOS install them regardless (this flag is ignored there). |
 | `OnShowDialog` | `nil` | GUI dialog provider; `nil` → brief stderr |
 | `OnCollectContext` | `nil` | Optional extra text appended to the report |
 | `DisabledSections` | `[]` (full report) | Report sections to omit entirely (header + body); Application, Exception and Call Stack are mandatory and not omittable |
@@ -338,7 +345,17 @@ The repair is conservative — it only fires for a primary fault **in your own c
 is already complete → nothing is added); a fault inside a system library is treated
 as secondary and left alone (its nearest in-app frame is already shown).
 
-Scope: Linux x86-64, macOS x86-64 + ARM64. Other targets compile to no-ops.
+Scope: Linux x86-64, macOS x86-64 + ARM64, and Android ARM64 (aarch64). Other
+targets compile to no-ops.
+
+On **Android** register capture is **opt-in** — set `Cfg.CaptureSignalRegisters := True`
+(default off, so the stock build is unchanged). The handler reads the bionic aarch64
+`ucontext` (`X0..X30`, `SP`, `PC`, `PSTATE`) and emits a `Registers:` + `Stack:` /
+`Memory Dump` block just like the x86/x64 path. One Android-specific wrinkle: the
+EurekaLog Viewer keeps a CPU section only if it contains the literal `EAX` or `RAX`
+(an x86/x64 register-name check in `TLogFile.GetItem_CPU`), so the ARM64 block carries
+a single `EAX/RAX: n/a on ARM64 - …compatibility` note line to satisfy that gate; the
+Viewer then shows the real ARM registers as text.
 
 ## EurekaLog `.el` compatibility
 
