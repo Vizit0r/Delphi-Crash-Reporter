@@ -141,7 +141,7 @@ begin
   FMemo.TextSettings.Font.Family := 'DejaVu Sans Mono';
   {$ELSE}
   FMemo.TextSettings.Font.Family := 'Courier New';
-  {$IFEND}
+  {$ENDIF}
   FMemo.TextSettings.Font.Size := 10;
 end;
 

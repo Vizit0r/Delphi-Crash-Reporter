@@ -145,13 +145,13 @@ uses
   Crash.Android.Symbols,
   {$IF Defined(MSWINDOWS)}
   Winapi.Windows,
-  {$IFEND}
+  {$ENDIF}
   {$IF not Defined(MSWINDOWS)}
   Posix.Unistd, // getpid(), fork(), execv()
   Posix.Stdlib,
   Posix.SysTypes,
   Posix.Base,
-  {$IFEND}
+  {$ENDIF}
   System.SysUtils;
 
 function DefaultCrashConfig: TCrashConfig;
@@ -177,7 +177,7 @@ begin
   {$ELSEIF Defined(MACOS)}  Result := 'MACOS';
   {$ELSEIF Defined(LINUX)}  Result := 'LINUX';
   {$ELSE}                   Result := 'UNKNOWN';
-  {$IFEND}
+  {$ENDIF}
 end;
 
 type
@@ -238,7 +238,7 @@ var
   ExeDir: String;
   {$IF Defined(MACOS)}
   ExePath, MacOSDir, ContentsDir, AppDir: String;
-  {$IFEND}
+  {$ENDIF}
 begin
   // 1. Explicit host override always wins.
   if FConfig.ReportDir <> '' then
@@ -269,7 +269,7 @@ begin
   {$ELSE}
   // 3. Linux / Windows: the executable's own directory.
   ExeDir := ExtractFilePath(ParamStr(0));
-  {$IFEND}
+  {$ENDIF}
 
   if ExeDir = '' then
     ExeDir := TPath.GetTempPath;
@@ -533,7 +533,7 @@ begin
     finally
       ResetAlreadyReported;
     end;
-    {$IFEND}
+    {$ENDIF}
   end
   else
   begin
@@ -659,7 +659,7 @@ begin
     // Surviving an init failure here matters more than line numbers. The reporter
     // still works, just with the "0[+$N]" proxy in the Line column.
   end;
-  {$IFEND}
+  {$ENDIF}
   // The Pascal RTL and some libraries (FMX Linux init, libcurl, ...) may install
   // their own SIGFPE/SIGSEGV sigaction AFTER our Install, clobbering our handler
   // before the first crash. So we re-install via TThread.ForceQueue: it runs on
@@ -764,7 +764,7 @@ begin
   Result := True;
   {$ELSE}
   Result := False; // iOS/Android sandbox - not allowed
-  {$IFEND}
+  {$ENDIF}
 end;
 
 {$IF not Defined(MSWINDOWS)}
@@ -772,7 +772,7 @@ end;
 function fork: pid_t; cdecl; external libc name _PU + 'fork';
 function execv(path: MarshaledAString; argv: PMarshaledAString): Integer; cdecl;
   external libc name _PU + 'execv';
-{$IFEND}
+{$ENDIF}
 
 class procedure TCrashReporter.Restart;
 {$IF Defined(MSWINDOWS)}
@@ -787,7 +787,7 @@ var
   Argv: array of MarshaledAString;
   ExePath: TBytes;
   I: Integer;
-{$IFEND}
+{$ENDIF}
 begin
   if not CanRestart then
   begin
@@ -833,7 +833,7 @@ begin
   Halt(0);
   {$ELSE}
   Halt(0);
-  {$IFEND}
+  {$ENDIF}
 end;
 
 class procedure TCrashReporter.SurfacePendingToStderr;

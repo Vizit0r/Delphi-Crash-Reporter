@@ -16,7 +16,7 @@ uses
   System.SysUtils,
   {$IF Defined(LINUX)}
   Posix.SysMman,
-  {$IFEND}
+  {$ENDIF}
   Crash.Reporter,
   Crash.CallStack;
 
@@ -72,7 +72,7 @@ begin
       Writeln(ErrOutput, 'CrashDemo: mmap failed, cannot run callhigh');
     {$ELSE}
     TProc0(Pointer(NativeUInt($7E00DEAD0000)))();
-    {$IFEND}
+    {$ENDIF}
   end
   else if AKind = 'stackoverflow' then
     // Stack exhaustion SIGSEGV. The handler itself runs on the alternate signal

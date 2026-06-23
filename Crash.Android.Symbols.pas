@@ -481,6 +481,6 @@ begin
   Result := 0;
 end;
 
-{$IFEND}
+{$ENDIF}
 
 end.

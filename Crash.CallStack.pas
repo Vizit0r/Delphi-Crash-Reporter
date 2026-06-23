@@ -1064,7 +1064,7 @@ initialization
   // Windows = no-op by design: no singleton -> no RTL hooks (EurekaLog territory).
   {$IF not Defined(MSWINDOWS)}
   TCrashCapture.FInstance := TCrashCapture.InternalCreate;
-  {$IFEND}
+  {$ENDIF}
 
 finalization
   FreeAndNil(TCrashCapture.FInstance);

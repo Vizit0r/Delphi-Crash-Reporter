@@ -293,6 +293,6 @@ procedure CrashInstallMacOSMachHandlerForCurrentThread;
 begin
 end;
 
-{$IFEND}
+{$ENDIF}
 
 end.

@@ -50,7 +50,7 @@ function CrashLookupMacOSSymbol(AAddress: UInt64;
   out ASymbolName: String; out ASymbolAddress: UInt64): Boolean;
 function CrashMacOSSymbolCacheCount: Integer;
 
-{$IFEND}
+{$ENDIF}
 
 implementation
 
@@ -363,6 +363,6 @@ begin
   Result := 0;
 end;
 
-{$IFEND}
+{$ENDIF}
 
 end.

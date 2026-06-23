@@ -90,21 +90,22 @@ implementation
      (Defined(ANDROID) and Defined(CPUARM64)) or
      (Defined(MACOS) and (Defined(CPUX64) or Defined(CPUARM64)))}
   {$DEFINE CRASH_SIGCAP}
-{$IFEND}
+{$ENDIF}
 
 // Delphi does NOT define LINUX on Android, but bionic shares Linux's sigaction /
 // siginfo / ucontext field names, so the POSIX field-access code below selects on
 // this combined symbol (macOS keeps its own branches).
 {$IF Defined(LINUX) or Defined(ANDROID)}
   {$DEFINE CRASH_LINUXLIKE}
-{$IFEND}
+{$ENDIF}
 
 {$IF Defined(CRASH_SIGCAP)}
 
 uses
   System.SysUtils,
   System.SyncObjs,
-  Posix.Signal;
+  Posix.Signal,
+  Posix.String_;
 
 const
   STACK_DUMP_BYTES = 256;
@@ -129,7 +130,7 @@ type
     X:      array[0..28] of UInt64;
     Fp, Lr, Sp, Pc: UInt64;
     Cpsr:   UInt32;
-    {$IFEND}
+    {$ENDIF}
     StackBaseAddr: UInt64;
     StackBytes:    array[0..STACK_DUMP_BYTES-1] of Byte;
   end;
@@ -147,7 +148,7 @@ const
   ALT_STACK_BYTES = 64 * 1024;
   // SS_DISABLE is absent from Delphi's Linux Posix.Signal, and its value
   // differs per platform (Linux=2, macOS=4).
-  ALT_SS_DISABLE  = {$IF Defined(CRASH_LINUXLIKE)}2{$ELSEIF Defined(MACOS)}4{$IFEND};
+  ALT_SS_DISABLE  = {$IF Defined(CRASH_LINUXLIKE)}2{$ELSEIF Defined(MACOS)}4{$ENDIF};
 
 procedure InstallAltStackOnce;
 // Register an alternate signal stack for the CALLING thread (first call only;
@@ -183,7 +184,7 @@ begin
   Result := UInt64(NativeUInt(SigInfo._sifields._sigfault.si_addr));
   {$ELSEIF Defined(MACOS)}
   Result := UInt64(NativeUInt(SigInfo.si_addr));
-  {$IFEND}
+  {$ENDIF}
 end;
 
 procedure CaptureFromUContext(Ctx: Pointer);
@@ -260,7 +261,7 @@ begin
   GSignalSnapshot.Pc   := UC.uc_mcontext.arm_pc;
   GSignalSnapshot.Cpsr := UInt32(UC.uc_mcontext.pstate);
 end;
-{$IFEND}
+{$ENDIF}
 
 function GetStackPointer: UInt64; inline;
 begin
@@ -270,7 +271,7 @@ begin
   Result := GSignalSnapshot.Sp;
   {$ELSE}
   Result := 0;
-  {$IFEND}
+  {$ENDIF}
 end;
 
 procedure CopyStackTop(SP: UInt64);
@@ -322,7 +323,7 @@ begin
   Act._u.sa_sigaction := H;
   {$ELSEIF Defined(MACOS)}
   Act.__sigaction_handler.sa_sigaction := H;
-  {$IFEND}
+  {$ENDIF}
 end;
 
 function PrevIsOurselves(const Prev: sigaction_t): Boolean; inline;
@@ -344,7 +345,7 @@ begin
   Stored := NativeUInt(@Prev.__sigaction_handler.sa_sigaction);
   {$ELSE}
   Stored := 0;
-  {$IFEND}
+  {$ENDIF}
   Result := Stored = Self;
 end;
 
@@ -373,7 +374,7 @@ begin
       GOldHandlers[SigNum] := Prev;
     {$ELSE}
     GOldHandlers[SigNum] := Prev;
-    {$IFEND}
+    {$ENDIF}
 end;
 
 procedure CrashInstallSignalHandlers;
@@ -447,7 +448,7 @@ begin
   Result := False;
   {$ELSE}
   Result := RIP >= UInt64($700000000000);
-  {$IFEND}
+  {$ENDIF}
 end;
 
 function CrashPrimaryFaultAddr(out AAddr: UIntPtr): Boolean;
@@ -466,7 +467,7 @@ begin
   RIP := GSignalSnapshot.Pc;
   {$ELSE}
   RIP := 0;
-  {$IFEND}
+  {$ENDIF}
   if (RIP = 0) or GuessSnapshotIsSecondary(RIP, GSignalSnapshot.FaultAddr) then Exit;  // syslib / unwinder fault
   AAddr := UIntPtr(RIP);
   Result := True;
@@ -488,7 +489,7 @@ begin
   FP := GSignalSnapshot.Fp;   SP := GSignalSnapshot.Sp;
   {$ELSE}
   FP := 0;  SP := 0;
-  {$IFEND}
+  {$ENDIF}
   if (FP = 0) or (SP = 0) or (FP < SP) then Exit;
   if (FP - SP) > STACK_DUMP_BYTES then Exit; // also keeps the Integer cast below truncation-safe
   Offset := Integer(FP - SP) + SizeOf(Pointer);
@@ -557,7 +558,7 @@ begin
   Result := Format('%s: %s   %s: %s %s',
     [Hex16(StackAddr), Hex16(StackVal), Hex16(MemAddr), HexPart, AsciiPart]);
 end;
-{$IFEND}
+{$ENDIF}
 
 function TakeSnapshot(out S: TSignalSnapshot): Boolean;
 // Atomically grab + reset the global snapshot. Returns False if nothing
@@ -578,7 +579,9 @@ function FormatRegistersSection(const S: TSignalSnapshot): String;
 var
   SB:   TStringBuilder;
   Kind: TSnapshotKind;
+  {$IF Defined(CPUX64)}
   RIP, RSP_, EXP_, STK_: UInt64;
+  {$ENDIF}
   I:    Integer;
 begin
   Kind := TSnapshotKind(S.Kind);
@@ -586,15 +589,9 @@ begin
   {$IF Defined(CPUX64)}
   RIP  := S.Rip;
   RSP_ := S.Rsp;
-  {$ELSEIF Defined(CPUARM64)}
-  RIP  := S.Pc;
-  RSP_ := S.Sp;
-  {$ELSE}
-  RIP  := 0;
-  RSP_ := 0;
-  {$IFEND}
   EXP_ := RIP;   // ExceptionAddress - same RIP in our snapshot
   STK_ := RSP_;  // StackPoint - same RSP
+  {$ENDIF}
 
   SB := TStringBuilder.Create;
   try
@@ -621,7 +618,7 @@ begin
         SB.AppendFormat('R14: %s   R15: %s', [Hex16(S.R14), Hex16(S.R15)]); SB.Append(CRLF);
         SB.AppendFormat('RIP: %s   FLG: %s', [Hex16(S.Rip), Hex16(S.Rflags)]); SB.Append(CRLF);
         SB.AppendFormat('EXP: %s   STK: %s', [Hex16(EXP_),  Hex16(STK_)]); SB.Append(CRLF);
-        {$IFEND}
+        {$ENDIF}
       end;
       skMacOSArm64, skLinuxArm64:
       begin
@@ -639,7 +636,7 @@ begin
         // The EL Viewer keeps a CPU section only if it contains 'EAX' or 'RAX'
         // (TLogFile.GetItem_CPU); ARM64 has neither, so this note carries the token.
         SB.Append('EAX/RAX: n/a on ARM64 - added only for EurekaLog Viewer compatibility'); SB.Append(CRLF);
-        {$IFEND}
+        {$ENDIF}
       end;
     else
       SB.Append('(CPU arch not captured - signal info only)'); SB.Append(CRLF);
@@ -670,7 +667,7 @@ begin
         SB.Append(CRLF);
       end;
     end;
-    {$IFEND}
+    {$ENDIF}
 
     Result := SB.ToString;
   finally
@@ -692,7 +689,7 @@ begin
   RIP := S.Pc;
   {$ELSE}
   RIP := 0;
-  {$IFEND}
+  {$ENDIF}
 
   SB := TStringBuilder.Create;
   try
@@ -740,7 +737,7 @@ begin
   RIP := S.Pc;
   {$ELSE}
   RIP := 0;
-  {$IFEND}
+  {$ENDIF}
   // Emit the Registers section ONLY for a primary fault. A "secondary" snapshot
   // (RIP in the shared-lib range) is not the crash - it's a benign fault caught
   // inside the Pascal RTL / call-stack unwinder (e.g. _Unwind_Backtrace reading
@@ -777,7 +774,7 @@ begin
     GSignalSnapshot.R14 := ARegs.R14;  GSignalSnapshot.R15 := ARegs.R15;
     GSignalSnapshot.Rip := ARegs.Rip;  GSignalSnapshot.Rflags := ARegs.Rflags;
     GSignalSnapshot.Cs  := ARegs.Cs;
-    {$IFEND}
+    {$ENDIF}
     // Stack dump (read SAFELY by the caller, e.g. via vm_read_overwrite). It lets
     // the EL Viewer recognise the full "Registers:" + "Stack:/Memory Dump"
     // section - without the Stack Dump the Viewer's CPU tab stays blank even
@@ -807,6 +804,6 @@ procedure CrashRecordMacOSSnapshot(const ARegs: TCrashMacOSRegs;
   ASignalNum, ASignalCode: Integer; AFaultAddr: UInt64;
   AStackBase: UInt64; AStackBytes: Pointer; AStackLen: Integer); begin end;
 
-{$IFEND}
+{$ENDIF}
 
 end.

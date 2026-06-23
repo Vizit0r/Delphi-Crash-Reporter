@@ -66,7 +66,7 @@ uses
   {$IF not Defined(MSWINDOWS)}
   Posix.Unistd,
   Posix.SysUtsname,
-  {$IFEND}
+  {$ENDIF}
   {$IFDEF ANDROID}
   Androidapi.JNI.JavaTypes,
   Androidapi.JNI.Os,
@@ -794,7 +794,7 @@ var
   Params: TStringList;
   {$IF not Defined(MSWINDOWS)}
   UTS: utsname;
-  {$IFEND}
+  {$ENDIF}
 begin
   Result := Default(TCrashELContext);
   Result.AppName := ExtractFileName(ParamStr(0));
@@ -832,7 +832,7 @@ begin
       '               in section 2 (Exception).' + #13#10 +
       '               To resolve Pascal addresses on dev machine:' + #13#10 +
       '                 atos -o <exe>.app/Contents/MacOS/<exe> 0x<address>' + #13#10;
-  {$IFEND}
+  {$ENDIF}
 
   // Linux diagnostics: why is Line=0 on all frames? Fold the .gol loader's
   // status into Signal Info so the reader sees the real state.
@@ -876,7 +876,7 @@ begin
     else
       Result.SignalInfoSection := Result.SignalInfoSection + #13#10 + Diag;
   end;
-  {$IFEND}
+  {$ENDIF}
 
   {$IF Defined(MSWINDOWS)}
   Result.UserName := GetEnvironmentVariable('USERNAME');
@@ -912,7 +912,7 @@ begin
     // JNI unavailable -> keep the uname-based description
   end;
   {$ENDIF}
-  {$IFEND}
+  {$ENDIF}
   Result.AppDpi := 96;
   Result.ThreadID := 0;        // overridden by the reporter with the real crashing TID
   Result.ThreadName := 'MAIN'; // overridden by the reporter for worker threads

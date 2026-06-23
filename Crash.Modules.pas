@@ -47,7 +47,7 @@ uses
   System.SysUtils
   {$IF Defined(LINUX) or Defined(ANDROID)}
   , Posix.Fcntl, Posix.Unistd, Posix.Errno
-  {$IFEND}
+  {$ENDIF}
   ;
 
 const
@@ -375,6 +375,6 @@ begin
   Result := nil;
 end;
 
-{$IFEND}
+{$ENDIF}
 
 end.
