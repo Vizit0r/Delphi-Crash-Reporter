@@ -24,14 +24,13 @@ LNG.exe <path-to-MachO-executable>
 - Output: `<path>.gol` next to the executable.
 - Exit 0 on success, 1 on usage error or DWARF/Mach-O parse failure.
 
-## How it is wired into Stealth's FMX builds
+## How to wire it into an FMX build
 
-`FMX/FMX_MAC_LINUX/UOStealth.dproj` has a PostBuildEvent under the Release
-OSX64 / OSXARM64 configs that calls `tools\run-lng.ps1` with the just-linked
-binary path; the script makes sure `Crash\Tools\Bin\LNG.exe` exists (auto-building
-via `build.cmd lng_tool` on first use) and then invokes it. The resulting
-`.gol` is deployed into the `.app/Contents/MacOS/` bundle alongside the
-executable.
+Add a PostBuildEvent to your FMX project under the Release OSX64 / OSXARM64
+configs that runs `LNG.exe <linked-binary-path>` (build the generator once via
+`build.cmd lng_tool`). Deploy the resulting `.gol` into the
+`.app/Contents/MacOS/` bundle alongside the executable; the runtime reader
+(`Crash.LineNumbers`) loads it from there at startup.
 
 ## Source paths
 

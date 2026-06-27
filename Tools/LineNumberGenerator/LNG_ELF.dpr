@@ -1,6 +1,6 @@
 program LNG_ELF;
 { Linux ELF / DWARF -> .gol generator. Counterpart to LNG.dpr (which handles
-  macOS Mach-O + .dSYM). See README_stealth.md. }
+  macOS Mach-O + .dSYM). See README.md. }
 
 {$APPTYPE CONSOLE}
 {$WARN SYMBOL_PLATFORM OFF}

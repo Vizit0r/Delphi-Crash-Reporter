@@ -96,11 +96,34 @@ vary is a field — there are no compile-time constants baked into the library.
 | `AllowRestart` | `True` | Allow the Restart action (platform-gated) |
 | `OnShowDialog` | `nil` | GUI dialog provider; `nil` → brief stderr |
 | `OnCollectContext` | `nil` | Optional extra text appended to the report |
+| `OnFilterReport` | `nil` | Last-step veto: `function(const AReport): Boolean`; return `False` to drop the report |
 | `DisabledSections` | `[]` (full report) | Report sections to omit entirely (header + body); Application, Exception and Call Stack are mandatory and not omittable |
 | `ReportDir` | `''` (platform default) | Directory for `.el` files (write + boot-recovery scan). Empty → next to the `.app` on macOS (not inside the bundle), the exe's own dir on Linux/Windows |
 
 Set the env var `CRASH_NO_UPLOAD=1` to skip uploads and keep the file on disk
 (useful for local testing).
+
+### Vetoing a report (`OnFilterReport`)
+
+`OnFilterReport` is the last-step gate: it receives the fully-built `TCrashReport`
+(message, exception class name, call stack, source) just before the report is
+persisted or surfaced, and returning `False` drops it. Use it for host-specific
+policy — suppressing a known-benign exception, dropping reports during a planned
+shutdown, rate-limiting, and so on.
+
+```pascal
+Cfg.OnFilterReport :=
+  function(const AReport: TCrashReport): Boolean
+  begin
+    // keep everything except one known-benign app exception
+    Result := AReport.ExceptionClassName <> 'EMyExpectedAbort';
+  end;
+```
+
+It runs in the crash path, so keep it cheap and robust. An exception raised by the
+filter is swallowed and the report is **kept** — a faulty filter must never silence
+a real crash. `EAbort` and a clean Ctrl-C (`EControlC`) are dropped by the library
+itself, before the filter is consulted, so you don't need to handle those.
 
 ### Trimming report sections
 

@@ -12,7 +12,7 @@ unit Elf;
     http://www.sco.com/developers/gabi/latest/contents.html
   * GNU Build ID: https://fedoraproject.org/wiki/Releases/FeatureBuildId
 
-  STEALTH-specific notes:
+  Implementation notes:
   * The Build ID is sha1 -> 20 bytes; TGUID is 16 bytes. We truncate to the
     first 16 bytes. Collision risk at 128-bit truncation is statistically
     negligible for our scale of binaries.

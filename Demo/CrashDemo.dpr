@@ -2,7 +2,7 @@
 
 { Standalone smoke test for the Crash Reporter library.
 
-  Uses ONLY Crash.* units - no Stealth.*, no FMX. Its sole purpose is to prove
+  Uses ONLY Crash.* units - no host-app units, no FMX. Its sole purpose is to prove
   the library is self-contained: if this links and produces a valid .el on a
   bare console target, nothing inside Crash\ secretly depends on the host app.
 
@@ -88,39 +88,75 @@ begin
 end;
 
 var
-  Cfg:  TCrashConfig;
-  Kind: String;
-  Arg:  String;
-  I:    Integer;
+  Cfg:    TCrashConfig;
+  Kind:   String;
+  Filter: String;
+  DoWait: Boolean;
+  Arg:    String;
+  I:      Integer;
 begin
-  Cfg := DefaultCrashConfig;
-  Cfg.AppName         := 'CrashDemo';
-  Cfg.AppVersion      := '0.0.0.1';
-  Cfg.CompilationTime := FormatDateTime('dd.mm.yyyy hh:nn:ss', Now);
-  Cfg.SaveToFile      := True;
-  Cfg.UploadEnabled   := False;     // pure local test; never phones home
-  TCrashReporter.Init(Cfg);
-  TCrashReporter.SurfacePendingToStderr;
-
-  Kind := '';
+  Kind   := '';
+  Filter := '';
+  DoWait := False;
   for I := 1 to ParamCount do
   begin
     Arg := ParamStr(I);
     if Arg.StartsWith('--crash=') then
       Kind := Copy(Arg, Length('--crash=') + 1, MaxInt)
     else if Arg = '--crash' then
-      Kind := 'segv';
+      Kind := 'segv'
+    else if Arg.StartsWith('--filter=') then
+      Filter := Copy(Arg, Length('--filter=') + 1, MaxInt)
+    else if Arg = '--wait' then
+      DoWait := True;
   end;
 
-  if Kind = '' then
+  Cfg := DefaultCrashConfig;
+  Cfg.AppName         := 'CrashDemo';
+  Cfg.AppVersion      := '0.0.0.1';
+  Cfg.CompilationTime := FormatDateTime('dd.mm.yyyy hh:nn:ss', Now);
+  Cfg.SaveToFile      := True;
+  Cfg.UploadEnabled   := False;     // pure local test; never phones home
+
+  // Demonstrate the host veto (TCrashConfig.OnFilterReport):
+  //   --filter=drop    -> drop every report
+  //   --filter=byclass -> drop by exception class (here: the --crash=raise test Exception)
+  // A clean Ctrl-C (EControlC) is dropped by the library itself, before the filter -
+  // run --wait and press Ctrl-C to see that no report is written.
+  if Filter = 'drop' then
+    Cfg.OnFilterReport :=
+      function(const AReport: TCrashReport): Boolean
+      begin
+        Result := False;
+      end
+  else if Filter = 'byclass' then
+    Cfg.OnFilterReport :=
+      function(const AReport: TCrashReport): Boolean
+      begin
+        Result := AReport.ExceptionClassName <> 'Exception';
+      end;
+
+  TCrashReporter.Init(Cfg);
+  TCrashReporter.SurfacePendingToStderr;
+
+  if Kind <> '' then
+  begin
+    Writeln(ErrOutput, 'CrashDemo: triggering --crash=', Kind, ' ...');
+    Flush(ErrOutput);
+    TriggerCrash(Kind);
+  end
+  else if DoWait then
+  begin
+    Writeln('CrashDemo: waiting - press Ctrl-C; the library drops EControlC, so no report is written ...');
+    Flush(Output);
+    while True do
+      Sleep(200);
+  end
+  else
   begin
     Writeln('CrashDemo - Crash Reporter standalone smoke test.');
-    Writeln('Usage: CrashDemo --crash=segv|fpe|callbad|callhigh|stackoverflow|raise');
+    Writeln('Usage: CrashDemo [--crash=segv|fpe|callbad|callhigh|stackoverflow|raise]');
+    Writeln('                 [--filter=drop|byclass] [--wait]');
     Writeln('Reporter Active = ', BoolToStr(TCrashReporter.Active, True));
-    Exit;
   end;
-
-  Writeln(ErrOutput, 'CrashDemo: triggering --crash=', Kind, ' ...');
-  Flush(ErrOutput);
-  TriggerCrash(Kind);
 end.

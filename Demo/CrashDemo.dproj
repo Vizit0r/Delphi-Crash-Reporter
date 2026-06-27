@@ -46,7 +46,7 @@
         <SanitizedProjectName>CrashDemo</SanitizedProjectName>
         <!-- The whole point of the test: the library is consumed purely via the
              search path (one entry, the parent Crash\ dir). No DCCReference, no
-             Stealth paths. If a Crash.* unit needed a host unit, this would fail. -->
+             host-app paths. If a Crash.* unit needed a host unit, this would fail. -->
         <DCC_UnitSearchPath>..;$(DCC_UnitSearchPath)</DCC_UnitSearchPath>
         <DCC_ConsoleTarget>true</DCC_ConsoleTarget>
         <DCC_GenerateStackFrames>true</DCC_GenerateStackFrames>

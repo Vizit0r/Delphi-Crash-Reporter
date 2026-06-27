@@ -92,6 +92,7 @@ type
     which hook fired. A plain value type - no interface, no refcounting. }
   TCrashReport = record
     ExceptionMessage: String;
+    ExceptionClassName: String;
     ExceptionLocation: TCrashStackEntry;
     CallStack: TCrashStack;
     Source: TCrashSource;
@@ -338,6 +339,7 @@ procedure TCrashCapture.ReportException(const AExceptionObject: TObject;
 var
   E: Exception;
   ExceptionMessage: String;
+  ExcClassName: String;
   CallStack: TCrashStack;
   ExceptionLocation: TCrashStackEntry;
   Report: TCrashReport;
@@ -359,6 +361,8 @@ begin
       ExceptionMessage := CrashMsgNilException
     else if (AExceptionObject is EAbort) then
       Exit //  do nothing
+    else if (AExceptionObject is EControlC) then
+      Exit // user-initiated Ctrl-C (SIGINT): terminate without a crash report
     else if (AExceptionObject is Exception) then
     begin
       E := Exception(AExceptionObject);
@@ -377,6 +381,11 @@ begin
     end
     else
       ExceptionMessage := 'Unknown Error (' + AExceptionObject.ClassName + ')';
+
+    if AExceptionObject <> nil then
+      ExcClassName := AExceptionObject.ClassName
+    else
+      ExcClassName := '';
 
     ExceptionLocation.Clear;
     ExceptionLocation.CodeAddress := UIntPtr(AExceptionAddress);
@@ -435,6 +444,7 @@ begin
     end;
 
     Report.ExceptionMessage := ExceptionMessage;
+    Report.ExceptionClassName := ExcClassName;
     Report.ExceptionLocation := ExceptionLocation;
     Report.CallStack := CallStack;
     Report.Source := ASource;

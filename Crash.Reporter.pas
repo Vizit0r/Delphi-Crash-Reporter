@@ -44,6 +44,13 @@ type
     section (e.g. "what the app was doing"). Called at report time. }
   TCrashCollectContextProc = reference to function: String;
 
+  { Optional last-step veto. Called with the fully-built report (message, class,
+    stack, source) right before it is persisted/surfaced. Return False to drop the
+    report entirely; True (or a nil callback) keeps it. Runs in the crash path -
+    keep it cheap and robust. An exception raised by the filter is swallowed and
+    the report is KEPT: a faulty filter must never suppress a real crash. }
+  TCrashReportFilterProc = reference to function(const AReport: TCrashReport): Boolean;
+
   { Everything the host can configure. Fill the fields you care about (start from
     DefaultCrashConfig) and pass to TCrashReporter.Init once at startup. }
   TCrashConfig = record
@@ -75,6 +82,9 @@ type
     OnShowDialog: TCrashShowDialogProc;
     { Optional extra-context provider appended to the report. nil -> none. }
     OnCollectContext: TCrashCollectContextProc;
+    { Optional last-step veto: return False to drop a report (e.g. user-initiated
+      Ctrl-C / EControlC, or other known-benign exceptions). nil -> keep all. }
+    OnFilterReport: TCrashReportFilterProc;
     { Report sections to OMIT entirely (header + body vanish). Default [] = full
       report. Application, Exception and Call Stack are never omittable (the first
       two carry the core crash info; the EL Viewer needs the Call Stack as the
@@ -422,6 +432,24 @@ begin
   begin
     ResetAlreadyReported;
     Exit;
+  end;
+
+  // Optional host veto: drop this report if the filter returns False. A faulty
+  // filter must not suppress a real crash, so on exception we keep the report.
+  // Re-arm (like the phantom-skip) so a later genuine crash still reports.
+  if Assigned(FConfig.OnFilterReport) then
+  begin
+    var KeepReport := True;
+    try
+      KeepReport := FConfig.OnFilterReport(AReport);
+    except
+      // keep on filter failure
+    end;
+    if not KeepReport then
+    begin
+      ResetAlreadyReported;
+      Exit;
+    end;
   end;
 
   IsFatal := AReport.Source = csFatalProc;
