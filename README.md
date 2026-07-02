@@ -26,7 +26,7 @@ Derived from [grijjy/JustAddCode](https://github.com/grijjy/JustAddCode)
 | Capability | Linux | macOS | Android | iOS | Windows |
 |---|---|---|---|---|---|
 | Unhandled-exception trapping | ✅ | ✅ | ✅ | ✅ | ❌ (EurekaLog) |
-| Call stack (Pascal names) | ✅ | ✅ (LC_SYMTAB) | ✅ (`.gosym`) | ❓ untested | ❌ |
+| Call stack (Pascal names) | ✅ | ✅ (LC_SYMTAB) | ✅ (`.gosym`) | ❓ untested | — |
 | Source line numbers (`.gol`) | ✅ | ✅ | ✅ | — | — |
 | CPU registers on hardware faults | ✅ | ✅ (signal ucontext / Mach) | ✅ (ARM64) | — | — |
 | Modules section | ✅ | ✅ | ✅ | — | — |
@@ -367,6 +367,27 @@ The repair is conservative — it only fires for a primary fault **in your own c
 is already complete → nothing is added); a fault inside a system library is treated
 as secondary and left alone (its nearest in-app frame is already shown).
 
+**Snapshot↔exception correlation.** The handler is one-shot: after the first
+catch it restores the previous (RTL) disposition and is re-armed only after a
+report is written. A fault whose exception the app swallows therefore leaves a
+pending snapshot behind, and the *next* reported exception — possibly on
+another thread — would otherwise inherit it. Seen live (report `CDFC1215`):
+the report header carried the main thread's `CheckSynchronize` AV while
+Registers/Stack dump held a worker thread's `RemoveQueuedEvents` #GP context. The snapshot is now stamped with the
+faulting thread's pthread identity, and at report time it is correlated with
+the exception being reported (thread identity + fault RIP vs the exception
+address — the same predicate the call-stack splice uses). A foreign-thread or
+stale snapshot is *demoted*: the EL `Registers:` section is suppressed (the
+Viewer must not present a foreign CPU context as this exception's) and the
+registers/stack move into `Crash Signal Info:` as an explicitly-labeled dump
+with **lowercase** register names — lowercase so the Viewer's literal
+`EAX`/`RAX` content check never claims the block as the CPU tab. A second
+fault that enters the handler while a snapshot is pending is recorded
+location-only (signal, code, ip, thread) and printed as a `Concurrent :` line.
+`Invocations` counts entries into *this* handler only; faults converted by the
+RTL while the handler was uninstalled are invisible to it (the report wording
+says so).
+
 Scope: Linux x86-64, macOS x86-64 + ARM64, and Android ARM64 (aarch64). Other
 targets compile to no-ops.
 
@@ -414,6 +435,11 @@ msbuild Demo/CrashDemo.dproj /t:Build /p:Config=Release /p:Platform=Linux64
 CRASH_NO_UPLOAD=1 ./CrashDemo --crash=segv     # hardware fault -> .el with Registers
 CRASH_NO_UPLOAD=1 ./CrashDemo --crash=raise    # software raise -> .el without Registers
 # also: --crash=fpe (div-by-zero), --crash=callbad (call into unmapped memory)
+# snapshot<->exception correlation tests (the CDFC1215 mixed-report scenario):
+CRASH_NO_UPLOAD=1 ./CrashDemo --crash=stale    # swallowed fault, then soft raise on the SAME
+                                               # thread -> no Registers, "STALE snapshot" note
+CRASH_NO_UPLOAD=1 ./CrashDemo --crash=foreign  # worker's fault swallowed, main thread raises ->
+                                               # no Registers, "captured on ANOTHER thread" note
 ```
 
 With no `--crash` argument it just prints `Reporter Active = True`. The reporter

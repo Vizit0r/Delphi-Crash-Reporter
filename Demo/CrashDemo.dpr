@@ -7,13 +7,14 @@
   bare console target, nothing inside Crash\ secretly depends on the host app.
 
   Build:  Linux64 (Release) via CrashDemo.dproj.
-  Run:    ./CrashDemo --crash=segv|fpe|callbad|callhigh|stackoverflow|raise
+  Run:    ./CrashDemo --crash=segv|fpe|callbad|callhigh|stackoverflow|raise|stale|foreign
           CRASH_NO_UPLOAD=1 keeps the .el on disk and skips any network. }
 
 {$APPTYPE CONSOLE}
 
 uses
   System.SysUtils,
+  System.Classes,
   {$IF Defined(LINUX)}
   Posix.SysMman,
   {$ENDIF}
@@ -31,6 +32,35 @@ begin
   Result := BurnStack(N + 1) + Pad[0] + Pad[High(Pad)];
 end;
 
+procedure DoNullWrite;
+// Kept OUT of SwallowHardwareFault on purpose: Delphi-Linux exception tables are
+// call-site based (LLVM/Itanium ABI), so a hardware fault raised at a NON-call
+// instruction is not covered by ITS OWN frame's try - it only becomes catchable
+// one frame up, at the covered CALL instruction. Faulting inside a callee is
+// also what real code does.
+var
+  P: PInteger;
+begin
+  P := nil;
+  P^ := 42;
+end;
+
+procedure SwallowHardwareFault;
+// A hardware fault whose Pascal exception is CAUGHT by the app: the crash-lib
+// handler has already snapshotted it (and uninstalled itself, one-shot), but no
+// report is written - the snapshot stays PENDING. This is the precondition of
+// the CDFC1215 mixed-context report: the next reported exception used to
+// inherit that snapshot as its own Registers section.
+begin
+  try
+    DoNullWrite;
+  except
+    on E: Exception do
+      Writeln(ErrOutput, 'CrashDemo: swallowed ', E.ClassName,
+        ' (snapshot now pending, no report written)');
+  end;
+end;
+
 procedure TriggerCrash(const AKind: String);
 type
   TProc0 = procedure; cdecl;
@@ -38,6 +68,7 @@ var
   P:     PInteger;
   A, B:  Integer;
   HighP: Pointer;
+  W:     TThread;
 begin
   if AKind = 'segv' then
   begin
@@ -82,9 +113,31 @@ begin
     Writeln(BurnStack(1))
   else if AKind = 'raise' then
     raise Exception.Create('test raise from CrashDemo')
+  else if AKind = 'stale' then
+  begin
+    // Snapshot<->exception correlation, SAME-thread case: the swallowed fault
+    // leaves a pending snapshot on this thread, then a soft raise at a DIFFERENT
+    // address writes the report. Expect NO "Registers:" section and the "STALE
+    // snapshot" note (+ lowercase forensic dump) in Crash Signal Info.
+    SwallowHardwareFault;
+    raise Exception.Create('soft raise after a swallowed hardware fault (stale-snapshot test)');
+  end
+  else if AKind = 'foreign' then
+  begin
+    // Snapshot<->exception correlation, FOREIGN-thread case (the CDFC1215
+    // scenario): a worker's hardware fault is swallowed on the worker, then the
+    // main thread's raise writes the report. Expect NO "Registers:" section and
+    // the "captured on ANOTHER thread" note (+ lowercase dump) in Signal Info.
+    W := TThread.CreateAnonymousThread(SwallowHardwareFault);
+    W.FreeOnTerminate := False;
+    W.Start;
+    W.WaitFor;
+    W.Free;
+    raise Exception.Create('main-thread raise after a worker''s swallowed fault (foreign-snapshot test)');
+  end
   else
     Writeln(ErrOutput, 'CrashDemo: unknown crash kind "', AKind,
-      '", expected segv|fpe|callbad|callhigh|stackoverflow|raise');
+      '", expected segv|fpe|callbad|callhigh|stackoverflow|raise|stale|foreign');
 end;
 
 var
@@ -155,7 +208,7 @@ begin
   else
   begin
     Writeln('CrashDemo - Crash Reporter standalone smoke test.');
-    Writeln('Usage: CrashDemo [--crash=segv|fpe|callbad|callhigh|stackoverflow|raise]');
+    Writeln('Usage: CrashDemo [--crash=segv|fpe|callbad|callhigh|stackoverflow|raise|stale|foreign]');
     Writeln('                 [--filter=drop|byclass] [--wait]');
     Writeln('Reporter Active = ', BoolToStr(TCrashReporter.Active, True));
   end;

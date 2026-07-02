@@ -453,7 +453,11 @@ begin
   end;
 
   IsFatal := AReport.Source = csFatalProc;
-  Ctx := CrashDefaultELContext(FAppStartTime);
+  // ExceptionLocation.CodeAddress keys the snapshot<->exception correlation in
+  // CrashTakeAndFormatSnapshots (see Crash.Signals) - a snapshot left behind by
+  // a swallowed concurrent/earlier fault must not pose as this exception's
+  // Registers section.
+  Ctx := CrashDefaultELContext(FAppStartTime, AReport.ExceptionLocation.CodeAddress);
   // Overlay the host-supplied identity fields from the config.
   if FConfig.AppName <> '' then Ctx.AppName := FConfig.AppName;
   Ctx.AppVersion := FConfig.AppVersion;

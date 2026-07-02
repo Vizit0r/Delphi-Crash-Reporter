@@ -95,6 +95,13 @@ function vm_read_overwrite(target_task: vm_map_t; address: vm_address_t;
   size: vm_size_t; data: vm_address_t; var outsize: vm_size_t): kern_return_t; cdecl;
   external libc name _PU + 'vm_read_overwrite';
 
+// Mach thread port -> pthread of the same thread (Darwin-only, libSystem).
+// Identity value for the snapshot<->exception correlation in Crash.Signals
+// (matches pthread_self at report time). Returns nil for an invalid or already-
+// terminated thread. Not wrapped by Posix.Pthread.
+function pthread_from_mach_thread_np(thread: mach_port_t): Pointer; cdecl;
+  external libc name _PU + 'pthread_from_mach_thread_np';
+
 type
   NDR_record_t = packed record
     mig_vers, if_vers, reserved1, mig_encoding,
@@ -192,8 +199,14 @@ begin
        vm_address_t(@StackBuf[0]), OutCnt) <> KERN_SUCCESS then
     StackBase := 0; // unreadable - emit registers without a stack dump
 
+  // pthread identity of the FAULTING thread (the exception message carries its
+  // Mach port). Crash.Signals matches it against pthread_self at report time -
+  // the report is built on the faulting thread - to catch a snapshot that would
+  // otherwise be misattributed to another thread's exception. nil (invalid /
+  // terminated thread) becomes 0 = "unknown", which disables the check.
   CrashRecordMacOSSnapshot(Regs, SigNum, Code0, FaultA,
-    StackBase, @StackBuf[0], Integer(OutCnt));
+    StackBase, @StackBuf[0], Integer(OutCnt),
+    UInt64(NativeUInt(pthread_from_mach_thread_np(Req.thread.name))));
 end;
 
 function ExcWatcherThread(Param: Pointer): Pointer; cdecl;

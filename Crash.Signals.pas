@@ -64,8 +64,25 @@ function  CrashPrimaryFaultCallerAddr(out ACaller: UIntPtr): Boolean;
 //     as a separate "Crash Signal Info:" section - the EL Viewer does not parse
 //     it, but the text is human-readable and does not interfere with parsing of
 //     the Registers section.
+// AExceptAddr = address of the exception this report is being built for
+// (ExceptionLocation.CodeAddress); 0 = unknown, skips the address check. The
+// snapshot is correlated with that exception BEFORE being attributed to it:
+//   - captured on ANOTHER thread -> a CONCURRENT hardware fault: the EL Registers
+//     section is suppressed (the Viewer must not present a foreign CPU context as
+//     this exception's) and the registers/stack go into Crash Signal Info as an
+//     explicitly-labeled foreign dump;
+//   - same thread but RIP <> AExceptAddr (and not the secondary-unwinder
+//     pattern) -> a STALE snapshot from an earlier handled fault: demoted the
+//     same way.
+// Both cases exist because the handler is one-shot (it uninstalls itself after
+// the first catch until the reporter re-arms it), so a fault whose exception the
+// app swallows leaves a pending snapshot that the NEXT report would otherwise
+// inherit. Seen live (report CDFC1215): the header carried the main thread's
+// CheckSynchronize AV while Registers/Stack dump held a worker thread's
+// RemoveQueuedEvents #GP context.
 // Resets the Captured/InvocationCount flags. If there was no snapshot, both ''.
-procedure CrashTakeAndFormatSnapshots(out ARegistersSection, ASignalInfoSection: String);
+procedure CrashTakeAndFormatSnapshots(AExceptAddr: UIntPtr;
+  out ARegistersSection, ASignalInfoSection: String);
 
 type
   { CPU registers captured by the macOS Mach handler (Crash.MacOS.MachExc) and
@@ -79,10 +96,14 @@ type
 { Record a snapshot captured by the macOS Mach exception handler into the same
   global the POSIX path uses, so CrashTakeAndFormatSnapshots emits the Registers
   section. No stack dump is taken (the watcher thread is not the faulting one).
+  AFaultThreadID = pthread identity of the FAULTING thread (the watcher records
+  on the faulting thread's behalf, so its own pthread_self would be wrong);
+  0 = unknown, disables the thread-correlation check at report time.
   No-op when signal capture isn't compiled in. }
 procedure CrashRecordMacOSSnapshot(const ARegs: TCrashMacOSRegs;
   ASignalNum, ASignalCode: Integer; AFaultAddr: UInt64;
-  AStackBase: UInt64; AStackBytes: Pointer; AStackLen: Integer);
+  AStackBase: UInt64; AStackBytes: Pointer; AStackLen: Integer;
+  AFaultThreadID: UInt64 = 0);
 
 implementation
 
@@ -105,6 +126,7 @@ uses
   System.SysUtils,
   System.SyncObjs,
   Posix.Signal,
+  Posix.Pthread,
   Posix.String_;
 
 const
@@ -121,6 +143,7 @@ type
     SignalNum:     Integer;
     SignalCode:    Integer;
     FaultAddr:     UInt64;
+    ThreadID:      UInt64;                          // pthread identity of the faulting thread - correlation key for the reporter (0 = unknown)
     Kind:          Integer;                         // TSnapshotKind ordinal
     {$IF Defined(CPUX64)}
     Rax, Rbx, Rcx, Rdx, Rdi, Rsi, Rbp, Rsp: UInt64;
@@ -135,8 +158,23 @@ type
     StackBytes:    array[0..STACK_DUMP_BYTES-1] of Byte;
   end;
 
+  { Location-only record of a SECOND hardware fault that entered the handler
+    while the primary snapshot above was still pending (unconsumed). Full
+    registers are deliberately not kept - the point is to NAME the concurrent
+    fault in the report instead of silently losing it. }
+  TConcurrentSignal = packed record
+    Claimed:    Integer;   // atomic claim: the first extra fault wins this slot
+    Captured:   Integer;   // atomic publish flag (set LAST by the writer)
+    SignalNum:  Integer;
+    SignalCode: Integer;
+    FaultAddr:  UInt64;
+    IP:         UInt64;    // RIP/PC of the concurrent fault
+    ThreadID:   UInt64;    // pthread identity of that thread
+  end;
+
 var
   GSignalSnapshot: TSignalSnapshot;
+  GConcurrentSignal: TConcurrentSignal;
   GOldHandlers:    array[1..31] of sigaction_t;
   GInstalled:      Boolean = False;
   GAltStackDone:   Boolean = False;
@@ -184,6 +222,36 @@ begin
   Result := UInt64(NativeUInt(SigInfo._sifields._sigfault.si_addr));
   {$ELSEIF Defined(MACOS)}
   Result := UInt64(NativeUInt(SigInfo.si_addr));
+  {$ENDIF}
+end;
+
+function CurrentThreadIdent: UInt64; inline;
+// pthread_self is a thread-register/TLS read on glibc/bionic/macOS - async-
+// signal-safe in practice (no locks, no allocation). Used purely as an identity
+// value for snapshot<->exception correlation, never dereferenced. pthread_t is
+// an opaque integer/pointer whose declared Delphi type differs per platform -
+// the NativeUInt cast normalizes it; both sides of the comparison (handler and
+// report) go through this same function, so the width always matches.
+begin
+  Result := UInt64(NativeUInt(pthread_self));
+end;
+
+function ExtractIPFromContext(Ctx: Pointer): UInt64;
+// RIP/PC-only ucontext read for the concurrent-fault slot (the primary slot uses
+// the full CaptureFromUContext). Async-signal-safe: dereference + assignment.
+begin
+  Result := 0;
+  if Ctx = nil then Exit;
+  {$IF Defined(LINUX) and Defined(CPUX64)}
+  Result := UInt64(Pucontext_t(Ctx).uc_mcontext.gregs[REG_RIP]);
+  {$ELSEIF Defined(MACOS) and Defined(CPUX64)}
+  if Pucontext_t(Ctx).uc_mcontext <> nil then
+    Result := Pucontext_t(Ctx).uc_mcontext^.__ss.__rip;
+  {$ELSEIF Defined(MACOS) and Defined(CPUARM64)}
+  if Pucontext_t(Ctx).uc_mcontext <> nil then
+    Result := Pucontext_t(Ctx).uc_mcontext^.__ss.__pc;
+  {$ELSEIF Defined(ANDROID) and Defined(CPUARM64)}
+  Result := UInt64(Pucontext_t(Ctx).uc_mcontext.arm_pc);
   {$ENDIF}
 end;
 
@@ -297,6 +365,7 @@ begin
   if TInterlocked.CompareExchange(GSignalSnapshot.Claimed, 1, 0) = 0 then
   begin
     GSignalSnapshot.SignalNum := SigNum;
+    GSignalSnapshot.ThreadID  := CurrentThreadIdent;
     if SigInfo <> nil then
     begin
       GSignalSnapshot.SignalCode := SigInfo.si_code;
@@ -307,6 +376,23 @@ begin
     // Publish AFTER the fields are complete - a reader keying on Captured=1
     // must never see a half-filled snapshot.
     TInterlocked.Exchange(GSignalSnapshot.Captured, 1);
+  end
+  else if TInterlocked.CompareExchange(GConcurrentSignal.Claimed, 1, 0) = 0 then
+  begin
+    // The primary slot is already pending: a SECOND hardware fault arrived
+    // before the report consumed the first snapshot (report not written yet, or
+    // that fault's exception got swallowed by the app). Keep its location so
+    // the report can NAME the concurrent fault instead of losing it; a full
+    // second register set is not worth the extra handler complexity.
+    GConcurrentSignal.SignalNum := SigNum;
+    if SigInfo <> nil then
+    begin
+      GConcurrentSignal.SignalCode := SigInfo.si_code;
+      GConcurrentSignal.FaultAddr  := ExtractFaultAddr(SigInfo);
+    end;
+    GConcurrentSignal.IP       := ExtractIPFromContext(Context);
+    GConcurrentSignal.ThreadID := CurrentThreadIdent;
+    TInterlocked.Exchange(GConcurrentSignal.Captured, 1);
   end;
 
   if (SigNum >= Low(GOldHandlers)) and (SigNum <= High(GOldHandlers)) then
@@ -387,7 +473,10 @@ procedure CrashInstallSignalHandlers;
 // ones - see there.
 begin
   if not GInstalled then
+  begin
     FillChar(GSignalSnapshot, SizeOf(GSignalSnapshot), 0);
+    FillChar(GConcurrentSignal, SizeOf(GConcurrentSignal), 0);
+  end;
   GInstalled := True;
   InstallAltStackOnce; // covers the calling thread (main at Init) - see there
   InstallOne(SIGSEGV);
@@ -560,13 +649,18 @@ begin
 end;
 {$ENDIF}
 
-function TakeSnapshot(out S: TSignalSnapshot): Boolean;
-// Atomically grab + reset the global snapshot. Returns False if nothing
-// was captured.
+function TakeSnapshot(out S: TSignalSnapshot; out C: TConcurrentSignal): Boolean;
+// Atomically grab + reset the global snapshot, together with the concurrent-
+// fault slot that rides along with it. Returns False if nothing was captured.
 begin
+  FillChar(C, SizeOf(C), 0);
   Result := GSignalSnapshot.Captured = 1;
   if not Result then Exit;
   S := GSignalSnapshot;
+  if GConcurrentSignal.Captured = 1 then
+    C := GConcurrentSignal;
+  TInterlocked.Exchange(GConcurrentSignal.Captured, 0);
+  TInterlocked.Exchange(GConcurrentSignal.Claimed, 0);
   TInterlocked.Exchange(GSignalSnapshot.Captured, 0);
   TInterlocked.Exchange(GSignalSnapshot.InvocationCount, 0);
   // Reopen the slot LAST - a writer claims only after the copy above is done.
@@ -675,7 +769,60 @@ begin
   end;
 end;
 
-function FormatSignalInfoSection(const S: TSignalSnapshot): String;
+type
+  { Whom does the pending snapshot belong to, relative to the exception the
+    report is being built for? Decided in CrashTakeAndFormatSnapshots. }
+  TSnapshotAttribution = (
+    saOwnFault,       // the snapshot IS this exception's hardware fault
+    saForeignThread,  // captured on ANOTHER thread - a concurrent fault
+    saStaleAddress);  // same thread, but RIP <> the reported exception address
+
+{$IF Defined(CPUX64) or Defined(CPUARM64)}
+procedure AppendSnapshotDumpLowercase(SB: TStringBuilder; const S: TSignalSnapshot);
+// Forensic register/stack dump for a snapshot that must NOT be presented as the
+// reported exception's CPU context (foreign thread / stale). Lives inside the
+// "Crash Signal Info:" section. Register names are LOWERCASE on purpose: the EL
+// Viewer locates its CPU tab positionally and claims a block only if it contains
+// the literal 'EAX'/'RAX' (TLogFile.GetItem_CPU) - this dump must never be
+// claimed as the exception's CPU state.
+var
+  I: Integer;
+begin
+  {$IF Defined(CPUX64)}
+  SB.AppendFormat('    rip=%s  rsp=%s  rbp=%s', [Hex16(S.Rip), Hex16(S.Rsp), Hex16(S.Rbp)]); SB.Append(CRLF);
+  SB.AppendFormat('    rax=%s  rbx=%s  rcx=%s', [Hex16(S.Rax), Hex16(S.Rbx), Hex16(S.Rcx)]); SB.Append(CRLF);
+  SB.AppendFormat('    rdx=%s  rsi=%s  rdi=%s', [Hex16(S.Rdx), Hex16(S.Rsi), Hex16(S.Rdi)]); SB.Append(CRLF);
+  SB.AppendFormat('    r8 =%s  r9 =%s  r10=%s', [Hex16(S.R8),  Hex16(S.R9),  Hex16(S.R10)]); SB.Append(CRLF);
+  SB.AppendFormat('    r11=%s  r12=%s  r13=%s', [Hex16(S.R11), Hex16(S.R12), Hex16(S.R13)]); SB.Append(CRLF);
+  SB.AppendFormat('    r14=%s  r15=%s  flg=%s', [Hex16(S.R14), Hex16(S.R15), Hex16(S.Rflags)]); SB.Append(CRLF);
+  {$ELSEIF Defined(CPUARM64)}
+  for I := 0 to 6 do
+  begin
+    SB.AppendFormat('    x%-2d=%s  x%-2d=%s  x%-2d=%s  x%-2d=%s',
+      [I*4,   Hex16(S.X[I*4]),   I*4+1, Hex16(S.X[I*4+1]),
+       I*4+2, Hex16(S.X[I*4+2]), I*4+3, Hex16(S.X[I*4+3])]);
+    SB.Append(CRLF);
+  end;
+  SB.AppendFormat('    x28=%s  fp =%s  lr =%s', [Hex16(S.X[28]), Hex16(S.Fp), Hex16(S.Lr)]); SB.Append(CRLF);
+  SB.AppendFormat('    sp =%s  pc =%s  cpsr=%.8x', [Hex16(S.Sp), Hex16(S.Pc), S.Cpsr]); SB.Append(CRLF);
+  {$ENDIF}
+  if S.StackBaseAddr <> 0 then
+  begin
+    SB.AppendFormat('    stack dump (%d bytes from sp=%s):',
+      [STACK_DUMP_BYTES, Hex16(S.StackBaseAddr)]); SB.Append(CRLF);
+    for I := 0 to 15 do
+    begin
+      SB.Append('    ');
+      SB.Append(FormatStackDumpRow(S, I));
+      SB.Append(CRLF);
+    end;
+  end;
+end;
+{$ENDIF}
+
+function FormatSignalInfoSection(const S: TSignalSnapshot;
+  const C: TConcurrentSignal; AAttribution: TSnapshotAttribution;
+  AExceptAddr, AReportThreadID: UInt64): String;
 // A separate "Crash Signal Info:" section - outside the EL format, the EL Viewer
 // ignores it, but the text is human-readable and useful for diagnostics. Placed
 // at the very end of the .el file, after all EL-known sections.
@@ -698,8 +845,36 @@ begin
     SB.AppendFormat('  Signal     : %s (code=%d)',
       [SignalNameOf(S.SignalNum), S.SignalCode]); SB.Append(CRLF);
     SB.AppendFormat('  Fault addr : %s', [Hex16(S.FaultAddr)]); SB.Append(CRLF);
-    SB.AppendFormat('  Invocations: %d  (signal handler entries since last report)',
+    SB.AppendFormat('  Invocations: %d  (crash-handler entries since the previous snapshot;',
       [S.InvocationCount]); SB.Append(CRLF);
+    SB.Append('               faults converted by the RTL while the one-shot handler was'); SB.Append(CRLF);
+    SB.Append('               uninstalled are not counted)'); SB.Append(CRLF);
+    {$IF Defined(CPUX64) or Defined(CPUARM64)}
+    if AAttribution = saForeignThread then
+    begin
+      SB.AppendFormat('  Note       : snapshot captured on ANOTHER thread (id=%d; reporting',
+        [S.ThreadID]); SB.Append(CRLF);
+      SB.AppendFormat('               thread id=%d) - a CONCURRENT hardware fault whose exception',
+        [AReportThreadID]); SB.Append(CRLF);
+      SB.Append('               did not produce this report (likely handled/swallowed by the'); SB.Append(CRLF);
+      SB.Append('               app). The EL Registers section is omitted so the Viewer does'); SB.Append(CRLF);
+      SB.Append('               not attribute a foreign CPU context to the exception in'); SB.Append(CRLF);
+      SB.Append('               section 2; that thread''s context is preserved below.'); SB.Append(CRLF);
+      AppendSnapshotDumpLowercase(SB, S);
+    end
+    else if AAttribution = saStaleAddress then
+    begin
+      SB.AppendFormat('  Note       : snapshot ip=%s does not match this exception''s address',
+        [Hex16(RIP)]); SB.Append(CRLF);
+      SB.AppendFormat('               (%s) - a STALE snapshot from an EARLIER hardware fault on',
+        [Hex16(AExceptAddr)]); SB.Append(CRLF);
+      SB.Append('               this thread (its exception was handled without a report). The'); SB.Append(CRLF);
+      SB.Append('               EL Registers section is omitted; the stale context is kept'); SB.Append(CRLF);
+      SB.Append('               below for reference.'); SB.Append(CRLF);
+      AppendSnapshotDumpLowercase(SB, S);
+    end
+    else
+    {$ENDIF}
     if GuessSnapshotIsSecondary(RIP, S.FaultAddr) then
     begin
       SB.Append('  Note       : RIP in shared-lib range - this is a SECONDARY signal'); SB.Append(CRLF);
@@ -716,21 +891,33 @@ begin
       SB.Append('               breaks at the wild RIP) - read the return addresses in the'); SB.Append(CRLF);
       SB.Append('               Stack dump above to locate the call site.'); SB.Append(CRLF);
     end;
+    // A second fault that entered the handler while the snapshot above was still
+    // pending. Location-only; named here instead of being silently dropped.
+    if C.Captured = 1 then
+    begin
+      SB.AppendFormat('  Concurrent : %s (code=%d) at ip=%s, fault addr=%s, thread=%d',
+        [SignalNameOf(C.SignalNum), C.SignalCode, Hex16(C.IP),
+         Hex16(C.FaultAddr), C.ThreadID]); SB.Append(CRLF);
+      SB.Append('               (a second hardware fault hit while the primary snapshot above'); SB.Append(CRLF);
+      SB.Append('               was pending; only its location was recorded)'); SB.Append(CRLF);
+    end;
     Result := SB.ToString;
   finally
     SB.Free;
   end;
 end;
 
-procedure CrashTakeAndFormatSnapshots(out ARegistersSection,
-  ASignalInfoSection: String);
+procedure CrashTakeAndFormatSnapshots(AExceptAddr: UIntPtr;
+  out ARegistersSection, ASignalInfoSection: String);
 var
   S: TSignalSnapshot;
-  RIP: UInt64;
+  C: TConcurrentSignal;
+  RIP, SelfID: UInt64;
+  Attribution: TSnapshotAttribution;
 begin
   ARegistersSection := '';
   ASignalInfoSection := '';
-  if not TakeSnapshot(S) then Exit;
+  if not TakeSnapshot(S, C) then Exit;
   {$IF Defined(CPUX64)}
   RIP := S.Rip;
   {$ELSEIF Defined(CPUARM64)}
@@ -738,21 +925,41 @@ begin
   {$ELSE}
   RIP := 0;
   {$ENDIF}
-  // Emit the Registers section ONLY for a primary fault. A "secondary" snapshot
-  // (RIP in the shared-lib range) is not the crash - it's a benign fault caught
-  // inside the Pascal RTL / call-stack unwinder (e.g. _Unwind_Backtrace reading
-  // past the top stack frame); its registers are the unwinder's, not the crash's,
-  // so they are noise. A primary hardware fault in our own code has RIP in the
-  // exe's low range and its registers are kept. The Signal Info block is emitted
-  // regardless (small, diagnostic; its Note explains the omission).
-  if not GuessSnapshotIsSecondary(RIP, S.FaultAddr) then
+  // Attribute the snapshot to the exception being reported BEFORE presenting it
+  // as that exception's CPU state. The handler is one-shot (uninstalled until
+  // the reporter re-arms it), so a pending snapshot can belong to a DIFFERENT,
+  // already-swallowed fault: another thread's concurrent crash, or an earlier
+  // fault on this thread riding a later soft raise. We run on the crashing
+  // thread here (the report is built synchronously in it), so pthread_self is
+  // the exception's thread identity; the address check mirrors the splice gate
+  // in Crash.CallStack.ReportException (FaultAddr = AExceptionAddress).
+  SelfID := CurrentThreadIdent;
+  if (S.ThreadID <> 0) and (SelfID <> 0) and (S.ThreadID <> SelfID) then
+    Attribution := saForeignThread
+  else if (AExceptAddr <> 0) and (RIP <> 0) and (UInt64(AExceptAddr) <> RIP) and
+          (not GuessSnapshotIsSecondary(RIP, S.FaultAddr)) then
+    Attribution := saStaleAddress
+  else
+    Attribution := saOwnFault;
+  // Emit the Registers section ONLY for a primary fault attributed to THIS
+  // exception. A "secondary" snapshot (RIP in the shared-lib range) is not the
+  // crash - it's a benign fault caught inside the Pascal RTL / call-stack
+  // unwinder (e.g. _Unwind_Backtrace reading past the top stack frame); its
+  // registers are the unwinder's, not the crash's, so they are noise. A foreign
+  // or stale snapshot is real but belongs to another fault - it moves into the
+  // Signal Info section as a labeled dump. The Signal Info block is emitted
+  // regardless (small, diagnostic; its Note explains any omission).
+  if (Attribution = saOwnFault) and
+     (not GuessSnapshotIsSecondary(RIP, S.FaultAddr)) then
     ARegistersSection := FormatRegistersSection(S);
-  ASignalInfoSection := FormatSignalInfoSection(S);
+  ASignalInfoSection := FormatSignalInfoSection(S, C, Attribution,
+    UInt64(AExceptAddr), SelfID);
 end;
 
 procedure CrashRecordMacOSSnapshot(const ARegs: TCrashMacOSRegs;
   ASignalNum, ASignalCode: Integer; AFaultAddr: UInt64;
-  AStackBase: UInt64; AStackBytes: Pointer; AStackLen: Integer);
+  AStackBase: UInt64; AStackBytes: Pointer; AStackLen: Integer;
+  AFaultThreadID: UInt64);
 begin
   TInterlocked.Increment(GSignalSnapshot.InvocationCount);
   // Capture only the FIRST exception (as the POSIX handler does) - a later
@@ -763,6 +970,7 @@ begin
     GSignalSnapshot.SignalNum  := ASignalNum;
     GSignalSnapshot.SignalCode := ASignalCode;
     GSignalSnapshot.FaultAddr  := AFaultAddr;
+    GSignalSnapshot.ThreadID   := AFaultThreadID;
     {$IF Defined(CPUX64)}
     GSignalSnapshot.Rax := ARegs.Rax;  GSignalSnapshot.Rbx := ARegs.Rbx;
     GSignalSnapshot.Rcx := ARegs.Rcx;  GSignalSnapshot.Rdx := ARegs.Rdx;
@@ -786,6 +994,17 @@ begin
       Move(AStackBytes^, GSignalSnapshot.StackBytes[0], AStackLen);
     end;
     TInterlocked.Exchange(GSignalSnapshot.Captured, 1); // publish after fill
+  end
+  else if TInterlocked.CompareExchange(GConcurrentSignal.Claimed, 1, 0) = 0 then
+  begin
+    // Same policy as the POSIX handler: a SECOND fault while the primary
+    // snapshot is pending is recorded location-only, so the report can name it.
+    GConcurrentSignal.SignalNum  := ASignalNum;
+    GConcurrentSignal.SignalCode := ASignalCode;
+    GConcurrentSignal.FaultAddr  := AFaultAddr;
+    GConcurrentSignal.IP         := ARegs.Rip;
+    GConcurrentSignal.ThreadID   := AFaultThreadID;
+    TInterlocked.Exchange(GConcurrentSignal.Captured, 1);
   end;
 end;
 
@@ -795,14 +1014,16 @@ procedure CrashInstallSignalHandlers;            begin end;
 function  CrashHasSignalSnapshot: Boolean;       begin Result := False; end;
 function  CrashPrimaryFaultAddr(out AAddr: UIntPtr): Boolean; begin AAddr := 0; Result := False; end;
 function  CrashPrimaryFaultCallerAddr(out ACaller: UIntPtr): Boolean; begin ACaller := 0; Result := False; end;
-procedure CrashTakeAndFormatSnapshots(out ARegistersSection, ASignalInfoSection: String);
+procedure CrashTakeAndFormatSnapshots(AExceptAddr: UIntPtr;
+  out ARegistersSection, ASignalInfoSection: String);
 begin
   ARegistersSection := '';
   ASignalInfoSection := '';
 end;
 procedure CrashRecordMacOSSnapshot(const ARegs: TCrashMacOSRegs;
   ASignalNum, ASignalCode: Integer; AFaultAddr: UInt64;
-  AStackBase: UInt64; AStackBytes: Pointer; AStackLen: Integer); begin end;
+  AStackBase: UInt64; AStackBytes: Pointer; AStackLen: Integer;
+  AFaultThreadID: UInt64); begin end;
 
 {$ENDIF}
 
