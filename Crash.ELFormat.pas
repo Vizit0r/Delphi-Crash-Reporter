@@ -794,6 +794,46 @@ begin
   end;
 end;
 
+{$IF Defined(LINUX)}
+// PRETTY_NAME ("Ubuntu 24.04.1 LTS") from os-release (freedesktop standard).
+function ReadOsReleasePrettyName(const APath: String): String;
+var
+  Line: String;
+begin
+  Result := '';
+  if not FileExists(APath) then Exit;
+  try
+    for Line in TFile.ReadAllLines(APath, TEncoding.UTF8) do
+      if Line.StartsWith('PRETTY_NAME=') then
+        Exit(Line.Substring(Length('PRETTY_NAME=')).Trim
+                 .DeQuotedString('"').DeQuotedString(''''));
+  except
+    // unreadable -> caller keeps the uname-based description
+  end;
+end;
+
+function LinuxDistroPrettyName: String;
+begin
+  Result := ReadOsReleasePrettyName('/etc/os-release');
+  if Result = '' then
+    Result := ReadOsReleasePrettyName('/usr/lib/os-release');
+end;
+
+// Graphical session type: wayland / x11 / tty. A wayland session still means
+// XWayland rendering for FMX apps.
+function LinuxSessionType: String;
+begin
+  Result := GetEnvironmentVariable('XDG_SESSION_TYPE');
+  if Result <> '' then Exit;
+  if GetEnvironmentVariable('WAYLAND_DISPLAY') <> '' then
+    Result := 'wayland'
+  else if GetEnvironmentVariable('DISPLAY') <> '' then
+    Result := 'x11'
+  else
+    Result := 'tty';
+end;
+{$ENDIF}
+
 function CrashDefaultELContext(const AStartTime: TDateTime;
   const AExceptAddr: UIntPtr): TCrashELContext;
 var
@@ -900,12 +940,24 @@ begin
       String(MarshaledAString(@UTS.sysname)) + ' ' +
       String(MarshaledAString(@UTS.release)) + ' ' +
       String(MarshaledAString(@UTS.machine));
+    {$IF Defined(LINUX)}
+    // uname only reports the kernel; swap in the distro when available:
+    // "<distro>; kernel <release> <machine>".
+    var Distro := LinuxDistroPrettyName;
+    if Distro <> '' then
+      Result.OSDescription := Distro + '; kernel ' +
+        String(MarshaledAString(@UTS.release)) + ' ' +
+        String(MarshaledAString(@UTS.machine));
+    {$ENDIF}
   end
   else
   begin
     Result.ComputerName := '';
     Result.OSDescription := 'POSIX';
   end;
+  {$IF Defined(LINUX)}
+  Result.OSDescription := Result.OSDescription + '; ' + LinuxSessionType;
+  {$ENDIF}
   {$IFDEF ANDROID}
   // uname only reports the Linux kernel; prepend the actual Android OS + device.
   try
