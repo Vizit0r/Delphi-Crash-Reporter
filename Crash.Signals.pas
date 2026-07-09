@@ -877,10 +877,22 @@ begin
     {$ENDIF}
     if GuessSnapshotIsSecondary(RIP, S.FaultAddr) then
     begin
-      SB.Append('  Note       : RIP in shared-lib range - this is a SECONDARY signal'); SB.Append(CRLF);
-      SB.Append('               (caught inside the Pascal RTL / call-stack unwinder).'); SB.Append(CRLF);
-      SB.Append('               Registers section omitted - it would show the unwinder,'); SB.Append(CRLF);
-      SB.Append('               not the fault. Primary crash details are in section 2.'); SB.Append(CRLF);
+      if (AExceptAddr <> 0) and (AExceptAddr = RIP) then
+      begin
+        SB.Append('  Note       : primary fault INSIDE a shared library - snapshot RIP matches'); SB.Append(CRLF);
+        SB.Append('               this exception''s address (section 2), so a native lib faulted'); SB.Append(CRLF);
+        SB.Append('               on data handed to it from our code. The backtrace stops at the'); SB.Append(CRLF);
+        SB.Append('               library frames (no unwind info to cross them); the Registers'); SB.Append(CRLF);
+        SB.Append('               section holds the fault''s own CPU state - inspect it for the'); SB.Append(CRLF);
+        SB.Append('               bad pointer passed in.'); SB.Append(CRLF);
+      end
+      else
+      begin
+        SB.Append('  Note       : RIP in shared-lib range - this is a SECONDARY signal'); SB.Append(CRLF);
+        SB.Append('               (caught inside the Pascal RTL / call-stack unwinder).'); SB.Append(CRLF);
+        SB.Append('               Registers section omitted - it would show the unwinder,'); SB.Append(CRLF);
+        SB.Append('               not the fault. Primary crash details are in section 2.'); SB.Append(CRLF);
+      end;
     end
     else if (S.FaultAddr <> 0) and (S.FaultAddr = RIP) then
     begin
@@ -945,12 +957,17 @@ begin
   // exception. A "secondary" snapshot (RIP in the shared-lib range) is not the
   // crash - it's a benign fault caught inside the Pascal RTL / call-stack
   // unwinder (e.g. _Unwind_Backtrace reading past the top stack frame); its
-  // registers are the unwinder's, not the crash's, so they are noise. A foreign
+  // registers are the unwinder's, not the crash's, so they are noise -- UNLESS
+  // the snapshot RIP equals this exception's address, which proves the snapshot
+  // is the primary faulting instruction even when it sits in a shared library
+  // (a native lib faulting on a bad pointer from our code); then the registers
+  // are the fault's and are kept. A foreign
   // or stale snapshot is real but belongs to another fault - it moves into the
   // Signal Info section as a labeled dump. The Signal Info block is emitted
   // regardless (small, diagnostic; its Note explains any omission).
   if (Attribution = saOwnFault) and
-     (not GuessSnapshotIsSecondary(RIP, S.FaultAddr)) then
+     ((UInt64(AExceptAddr) = RIP) or
+      (not GuessSnapshotIsSecondary(RIP, S.FaultAddr))) then
     ARegistersSection := FormatRegistersSection(S);
   ASignalInfoSection := FormatSignalInfoSection(S, C, Attribution,
     UInt64(AExceptAddr), SelfID);
