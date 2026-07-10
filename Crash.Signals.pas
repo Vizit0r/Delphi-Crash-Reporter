@@ -826,6 +826,8 @@ function FormatSignalInfoSection(const S: TSignalSnapshot;
 // A separate "Crash Signal Info:" section - outside the EL format, the EL Viewer
 // ignores it, but the text is human-readable and useful for diagnostics. Placed
 // at the very end of the .el file, after all EL-known sections.
+const
+  SI_KERNEL = $80; // siginfo.si_code: kernel-originated fault (x86 #GP class) - no usable si_addr
 var
   SB:  TStringBuilder;
   RIP: UInt64;
@@ -845,6 +847,12 @@ begin
     SB.AppendFormat('  Signal     : %s (code=%d)',
       [SignalNameOf(S.SignalNum), S.SignalCode]); SB.Append(CRLF);
     SB.AppendFormat('  Fault addr : %s', [Hex16(S.FaultAddr)]); SB.Append(CRLF);
+    if (S.SignalNum = SIGSEGV) and (S.SignalCode = SI_KERNEL) then
+    begin
+      SB.Append('               (si_code=SI_KERNEL: #GP-class fault - the kernel reports no'); SB.Append(CRLF);
+      SB.Append('               fault address, so the 0 above does NOT mean a nil dereference;'); SB.Append(CRLF);
+      SB.Append('               typical cause is a non-canonical, i.e. wild/garbage, pointer)'); SB.Append(CRLF);
+    end;
     SB.AppendFormat('  Invocations: %d  (crash-handler entries since the previous snapshot;',
       [S.InvocationCount]); SB.Append(CRLF);
     SB.Append('               faults converted by the RTL while the one-shot handler was'); SB.Append(CRLF);
