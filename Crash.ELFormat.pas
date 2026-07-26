@@ -315,16 +315,11 @@ type
 
 function RenderFrame(const AEntry: TCrashStackEntry; AIndex, ATotal: Integer): TRenderedFrame;
 var
-  UName, CName, PName, ModBase, MacName: String;
-  MacAddr: UInt64;
+  UName, CName, PName, ModBase: String;
 begin
-  // macOS-only: if the address is inside our exe, prefer the name from our
-  // Mach-O LC_SYMTAB cache. dladdr on Mach-O returns garbage for all Pascal
-  // frames (see Crash.MacOS.Symbols). On other platforms CrashLookupMacOSSymbol
-  // is a no-op stub returning False, so we use the resolved RoutineName as usual.
-  if CrashLookupMacOSSymbol(AEntry.CodeAddress, MacName, MacAddr) then
-    SplitDottedName(MacName, UName, CName, PName)
-  else if AEntry.SourceFile <> '' then
+  // macOS needs no special-casing here: the LC_SYMTAB name + start address are
+  // adopted at capture time (see Crash.CallStack), flagged via NameTrusted.
+  if AEntry.SourceFile <> '' then
   begin
     // Unit is known authoritatively (Android .gosym carries the source file):
     // take it from the file - correct casing - and split class/method by stripping
@@ -618,28 +613,32 @@ begin
     // so they aren't mistaken for real ones. Module + Offset stay - they resolve
     // via `atos -o <exe> 0x<addr>` on a dev machine.
     //
-    // Threshold: 3 on all platforms. It used to be 2 on macOS to guard against
-    // dladdr clamping (when dladdr returned SignalConverter for every frame in
-    // our exe). Now Crash.MacOS.Symbols gives honest names from LC_SYMTAB, so
-    // duplicates are only legitimate (two consecutive Pascal RTL helper routines,
-    // the same function in recursion). Threshold 3 keeps those.
+    // Threshold: 3 DISTINCT code addresses per name. Genuine recursion repeats
+    // the same return address (1-2 distinct entries), while dladdr clamping
+    // spreads one export name over many unrelated addresses - only the latter
+    // is fake. Trusted names (NameTrusted: LC_SYMTAB / .gosym) are exempt
+    // entirely - genuine recursion must keep its name.
     const FakeNameThreshold = 3;
     if Length(Rendered) >= FakeNameThreshold then
     begin
       var NameCounts := TDictionary<String, Integer>.Create;
+      var SeenAddrs := TDictionary<String, Boolean>.Create;
       try
         var Cnt: Integer;
         for I := 0 to High(Rendered) do
-          if Rendered[I].AProcedure <> '' then
+          if (Rendered[I].AProcedure <> '') and (not Stack[I].NameTrusted) then
           begin
-            if NameCounts.TryGetValue(Rendered[I].AProcedure, Cnt) then
-              NameCounts[Rendered[I].AProcedure] := Cnt + 1
-            else
-              NameCounts.Add(Rendered[I].AProcedure, 1);
+            if SeenAddrs.TryAdd(Rendered[I].AProcedure + '|' + Rendered[I].Address, True) then
+            begin
+              if NameCounts.TryGetValue(Rendered[I].AProcedure, Cnt) then
+                NameCounts[Rendered[I].AProcedure] := Cnt + 1
+              else
+                NameCounts.Add(Rendered[I].AProcedure, 1);
+            end;
           end;
         for I := 0 to High(Rendered) do
         begin
-          if Rendered[I].AProcedure = '' then Continue;
+          if (Rendered[I].AProcedure = '') or Stack[I].NameTrusted then Continue;
           if NameCounts[Rendered[I].AProcedure] >= FakeNameThreshold then
           begin
             Rendered[I].Source     := '';
@@ -653,6 +652,7 @@ begin
           end;
         end;
       finally
+        SeenAddrs.Free;
         NameCounts.Free;
       end;
     end;

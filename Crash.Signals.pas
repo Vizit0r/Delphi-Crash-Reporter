@@ -41,6 +41,10 @@ interface
 procedure CrashInstallSignalHandlers;
 function  CrashHasSignalSnapshot: Boolean;
 
+// Drop a captured-but-unconsumed snapshot (host veto, discarded report) and
+// reopen both slots, so it cannot shadow a later fault's Registers section.
+procedure CrashDiscardPendingSnapshot;
+
 // Returns the address of a PRIMARY hardware fault (RIP/PC) when one was captured
 // AND it lies in the executable's own range (not a shared-lib / unwinder
 // "secondary" fault). Lets the reporter re-insert the faulting frame -- which the
@@ -657,14 +661,26 @@ begin
   Result := GSignalSnapshot.Captured = 1;
   if not Result then Exit;
   S := GSignalSnapshot;
+  // Reset the concurrent slot only when its writer has PUBLISHED: unclaiming a
+  // half-filled slot would let a second writer in mid-fill.
   if GConcurrentSignal.Captured = 1 then
+  begin
     C := GConcurrentSignal;
-  TInterlocked.Exchange(GConcurrentSignal.Captured, 0);
-  TInterlocked.Exchange(GConcurrentSignal.Claimed, 0);
+    TInterlocked.Exchange(GConcurrentSignal.Captured, 0);
+    TInterlocked.Exchange(GConcurrentSignal.Claimed, 0);
+  end;
   TInterlocked.Exchange(GSignalSnapshot.Captured, 0);
   TInterlocked.Exchange(GSignalSnapshot.InvocationCount, 0);
   // Reopen the slot LAST - a writer claims only after the copy above is done.
   TInterlocked.Exchange(GSignalSnapshot.Claimed, 0);
+end;
+
+procedure CrashDiscardPendingSnapshot;
+var
+  S: TSignalSnapshot;
+  C: TConcurrentSignal;
+begin
+  TakeSnapshot(S, C);
 end;
 
 function FormatRegistersSection(const S: TSignalSnapshot): String;
@@ -1037,6 +1053,7 @@ end;
 
 procedure CrashInstallSignalHandlers;            begin end;
 function  CrashHasSignalSnapshot: Boolean;       begin Result := False; end;
+procedure CrashDiscardPendingSnapshot;           begin end;
 function  CrashPrimaryFaultAddr(out AAddr: UIntPtr): Boolean; begin AAddr := 0; Result := False; end;
 function  CrashPrimaryFaultCallerAddr(out ACaller: UIntPtr): Boolean; begin ACaller := 0; Result := False; end;
 procedure CrashTakeAndFormatSnapshots(AExceptAddr: UIntPtr;

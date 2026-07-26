@@ -72,6 +72,9 @@ const
   // identical message format it sends the RTL.
   EXC_RAISE_STATE_IDENTITY_ID = 2403;
 
+  // mach_msg receive: the queued message is larger than rcv_size (mach/message.h).
+  MACH_RCV_TOO_LARGE = $10004004;
+
   // Map Mach exception types to the POSIX signal numbers our snapshot/format
   // code labels (Crash.Signals.SignalNameOf).
   SIG_SEGV = 11;
@@ -101,6 +104,12 @@ function vm_read_overwrite(target_task: vm_map_t; address: vm_address_t;
 // terminated thread. Not wrapped by Posix.Pthread.
 function pthread_from_mach_thread_np(thread: mach_port_t): Pointer; cdecl;
   external libc name _PU + 'pthread_from_mach_thread_np';
+
+// Removes every right the name holds (receive + our inserted send) in one call;
+// a kernel exception send to the dead name then fails fast instead of queueing.
+// Not wrapped by Macapi.Mach.
+function mach_port_destroy(task: mach_port_t; name: mach_port_t): kern_return_t; cdecl;
+  external libc name _PU + 'mach_port_destroy';
 
 type
   NDR_record_t = packed record
@@ -226,12 +235,22 @@ begin
                   GExcPort, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
     if R <> MACH_MSG_SUCCESS then
     begin
+      // MACH_RCV_LARGE leaves an oversized message QUEUED - purge it (a receive
+      // without the flag destroys it), or the failure streak below never clears.
+      if R = MACH_RCV_TOO_LARGE then
+        mach_msg(Req.header, MACH_RCV_MSG, 0, SizeOf(Req), GExcPort,
+                 MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
       // Defensive: never abort. A permanently broken port would busy-spin this
-      // thread, though - back out after a failure streak (the RTL then handles
-      // faults as if we were never here).
+      // thread, though - back out after a failure streak. Tear the port down
+      // first: registered threads' faults then fall through to the task-level
+      // RTL port instead of hanging on an unserviced queue.
       Inc(Fails);
       if Fails >= 100 then
+      begin
+        mach_port_destroy(mach_task_self, GExcPort);
+        GExcPort := 0;
         Exit(nil);
+      end;
       Continue;
     end;
     Fails := 0;
@@ -257,6 +276,16 @@ begin
     Reply.RetCode               := KERN_FAILURE;
     mach_msg(Reply.Head, MACH_SEND_MSG, SizeOf(mig_reply_error_t), 0,
              MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
+
+    // The request descriptors carry +1 send rights for the faulting thread and
+    // its task - release them, they leak otherwise (one pair per exception).
+    if Req.header.msgh_id = EXC_RAISE_STATE_IDENTITY_ID then
+    begin
+      if Req.thread.name <> 0 then
+        mach_port_deallocate(mach_task_self, Req.thread.name);
+      if Req.task.name <> 0 then
+        mach_port_deallocate(mach_task_self, Req.task.name);
+    end;
   end;
 end;
 

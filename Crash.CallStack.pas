@@ -69,6 +69,12 @@ type
       file (correct casing) and split class/method unambiguously instead of guessing
       from the dotted name. Currently filled on Android (.gosym); '' elsewhere. }
     SourceFile: String;
+
+    { True when RoutineName/RoutineAddress come from an authoritative source
+      (Mach-O LC_SYMTAB cache, Android .gosym) rather than a dladdr
+      nearest-export guess. Exempts the frame from the formatter's fake-name
+      pass, so genuine recursion keeps its name. }
+    NameTrusted: Boolean;
   public
     { Clears the entry (sets everything to 0) }
     procedure Clear;
@@ -221,6 +227,7 @@ uses
   {$ENDIF}
   Crash.Demangle,
   Crash.Signals,
+  Crash.MacOS.Symbols,   // LC_SYMTAB name adoption (no-op off macOS)
   Crash.Android.Symbols; // .gosym name resolution (no-op off Android)
 
 {$RANGECHECKS OFF}
@@ -237,6 +244,7 @@ begin
   RoutineName := '';
   ModuleName := '';
   SourceFile := '';
+  NameTrusted := False;
 end;
 
 { TCrashCapture }
@@ -506,8 +514,8 @@ begin
 
   { Allocate a PCallStack record large enough to hold just MaxCallStackDepth
     entries }
-  GetMem(CallStack, SizeOf(Integer{TCallStack.Count}) +
-    FInstance.FMaxCallStackDepth * SizeOf(Pointer));
+  GetMem(CallStack, SizeOf(TCallStack) +
+    (FInstance.FMaxCallStackDepth - 1) * SizeOf(UIntPtr));
 
   { Use backtrace API to retrieve call stack }
   CallStack.Count := backtrace(@CallStack.Stack, FInstance.FMaxCallStackDepth);
@@ -604,8 +612,8 @@ begin
 
   { Allocate a PCallStack record large enough to hold just MaxCallStackDepth
     entries }
-  GetMem(CallStack, SizeOf(Integer{TCallStack.Count}) +
-    FInstance.FMaxCallStackDepth * SizeOf(Pointer));
+  GetMem(CallStack, SizeOf(TCallStack) +
+    (FInstance.FMaxCallStackDepth - 1) * SizeOf(UIntPtr));
 
   { Use _Unwind_Backtrace API to retrieve call stack }
   CallStack.Count := 0;
@@ -703,8 +711,8 @@ begin
 
   { Allocate a PCallStack record large enough to hold just MaxCallStackDepth
     entries }
-  GetMem(CallStack, SizeOf(Integer{TCallStack.Count}) +
-    MaxCallStackDepth * SizeOf(TStackValues));
+  GetMem(CallStack, SizeOf(TCallStack) +
+    (MaxCallStackDepth - 1) * SizeOf(TStackValues));
 
   (*We manually walk the stack to create a stack trace. This is possible since
     Delphi creates a stack frame for each routine, by starting each routine with
@@ -897,8 +905,8 @@ begin
   if (FInstance = nil) or (FInstance.FReportingException <> 0) or (FInstance.FMaxCallStackDepth <= 0) then
     Exit(nil);
 
-  GetMem(CallStack, SizeOf(Integer{TCallStack.Count}) +
-    FInstance.FMaxCallStackDepth * SizeOf(Pointer));
+  GetMem(CallStack, SizeOf(TCallStack) +
+    (FInstance.FMaxCallStackDepth - 1) * SizeOf(UIntPtr));
   CallStack.Count := 0;
   _Unwind_Backtrace(CrashLinuxUnwindCallback, CallStack);
   Result := CallStack;
@@ -955,6 +963,10 @@ var
   Info: dl_info;
   Status: Integer;
   Demangled: MarshaledAString;
+  {$IF Defined(MACOS64) and not Defined(IOS)}
+  MacSymName: String;
+  MacSymAddr: UInt64;
+  {$ENDIF}
 begin
   // dladdr success is enough: even without a nearest exported symbol (typical
   // for internal RTL frames before the first Pascal export) Module/Offset are
@@ -988,14 +1000,27 @@ begin
       AEntry.RoutineAddress := AEntry.ModuleAddress; // offset = code - module
     end;
 
+    {$IF Defined(MACOS64) and not Defined(IOS)}
+    // Adopt the Mach-O LC_SYMTAB name + start address over the dladdr guess
+    // (see Crash.MacOS.Symbols), so BugID/offsets/RoutineLineNumber all match
+    // the shown name.
+    if CrashLookupMacOSSymbol(AEntry.CodeAddress, MacSymName, MacSymAddr) then
+    begin
+      AEntry.RoutineName := MacSymName;
+      AEntry.RoutineAddress := UIntPtr(MacSymAddr);
+      AEntry.NameTrusted := True;
+    end;
+    {$ENDIF}
+
     {$IF Defined(ANDROID)}
     // dladdr sees only the .dynsym export whitelist on Android (the linker
     // localizes Pascal symbols), so RoutineName is empty above. Fill the name +
     // function start from the .gosym side-file (an offline address->name map
     // generated from the unstripped .so's symtab; see Crash.Android.Symbols).
     if (AEntry.RoutineName = '') and (AEntry.ModuleAddress <> 0) then
-      CrashAndroidLookupName(AEntry.CodeAddress, AEntry.ModuleAddress,
-        AEntry.RoutineName, AEntry.RoutineAddress, AEntry.SourceFile);
+      AEntry.NameTrusted := CrashAndroidLookupName(AEntry.CodeAddress,
+        AEntry.ModuleAddress, AEntry.RoutineName, AEntry.RoutineAddress,
+        AEntry.SourceFile);
     {$ENDIF}
 
     {$IF (Defined(MACOS64) and not Defined(IOS)) or Defined(LINUX)}

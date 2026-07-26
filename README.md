@@ -88,11 +88,12 @@ vary is a field — there are no compile-time constants baked into the library.
 | `AppVersion` | `''` | Host-supplied version string |
 | `CompilationTime` | `''` | "1.5 Compilation Date" field |
 | `SaveToFile` | `True` | Persist the `.el` next to the exe |
-| `FileNamePrefix` | `<exe>_<PLATFORM>_` | `<prefix><timestamp>.el`; also the boot-scan pattern |
+| `FileNamePrefix` | `<exe>_<PLATFORM>_` | `<prefix><BugID>.el` file naming |
+| `ScanFileNamePrefix` | `''` (= `FileNamePrefix`) | Boot-recovery scan prefix; set a stable version-free prefix when `FileNamePrefix` embeds an app version, so older-version reports are still picked up |
 | `UploadEnabled` | `False` | Upload reports to `UploadUrl` |
 | `UploadUrl` | `''` | Full multipart-POST endpoint (host builds it) |
 | `UploadFieldName` | `el_upload_file_0` | Multipart file field name |
-| `UploadPendingOnStartup` | `False` | Re-upload leftover reports on `Init` |
+| `UploadPendingOnStartup` | `False` | Re-upload leftover reports after `Init` (background thread, max 3 files per launch) |
 | `AllowRestart` | `True` | Allow the Restart action (platform-gated) |
 | `OnShowDialog` | `nil` | GUI dialog provider; `nil` → brief stderr |
 | `OnCollectContext` | `nil` | Optional extra text appended to the report |

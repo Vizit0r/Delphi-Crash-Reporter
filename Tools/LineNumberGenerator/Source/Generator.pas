@@ -151,7 +151,11 @@ begin
   TArray.Sort<TLine>(Lines, TComparer<TLine>.Construct(
     function(const ALeft, ARight: TLine): Integer
     begin
-      Result := ALeft.Address - ARight.Address;
+      // Branchy compare: a UInt64 subtraction narrowed to Integer flips sign
+      // for far-apart addresses and breaks the sort order.
+      if ALeft.Address < ARight.Address then Result := -1
+      else if ALeft.Address > ARight.Address then Result := 1
+      else Result := 0;
     end));
   WriteLines(ExeID, Lines);
 end;
@@ -162,8 +166,9 @@ var
   Buffer: TMemoryStream;
   Header: TLineNumberHeader;
   Stream: TFileStream;
-  I, LineDelta, Count: Integer;
+  I, LineDelta, Count, PrevLine: Integer;
   AddressDelta: Int64;
+  PrevAddress: UInt64;
 begin
   if (ALines = nil) then
     raise EInvalidOperation.Create('Line number information not available');
@@ -185,13 +190,18 @@ begin
 
     { Create state machine program }
     Count := 0;
+    PrevAddress := ALines[0].Address;
+    PrevLine := ALines[0].Line;
     for I := 1 to Length(ALines) - 1 do
     begin
-      AddressDelta := ALines[I].Address - ALines[I - 1].Address;
+      { Deltas are relative to the last WRITTEN entry: the decoder never sees
+        the skipped duplicates below, its state advances only on written
+        records. }
+      AddressDelta := ALines[I].Address - PrevAddress;
       if (AddressDelta < 0) then
         raise EInvalidOperation.Create('Invalid line number sequence (addresses should be incrementing)');
 
-      LineDelta := ALines[I].Line - ALines[I - 1].Line;
+      LineDelta := ALines[I].Line - PrevLine;
       if (AddressDelta = 0) then
       begin
         // Skip duplicate-address line entries (silent Continue instead of
@@ -203,6 +213,8 @@ begin
       end
       else
       begin
+        PrevAddress := ALines[I].Address;
+        PrevLine := ALines[I].Line;
         if (LineDelta >= 1) and (LineDelta <= 4) then
         begin
           if (AddressDelta <= 63) then

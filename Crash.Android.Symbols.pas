@@ -300,7 +300,9 @@ begin
     if GGolRelAddrs[Mid] <= UInt32(Rel) then begin Found := Mid; Lo := Mid + 1; end
     else Hi := Mid - 1;
   end;
-  if Found >= 0 then
+  // Same unreliability cutoff as TLineNumberInfo.Lookup: a row more than 200
+  // bytes behind the address covers an uncoded stretch, not this code.
+  if (Found >= 0) and (UInt32(Rel) - GGolRelAddrs[Found] <= 200) then
     Result := GGolLines[Found];
 end;
 
@@ -352,7 +354,9 @@ begin
 
   if (HdrSig <> GOSY_SIGNATURE) or ((HdrVer shr 16) <> (GOSY_VERSION shr 16)) or
      (HdrSize <> UInt32(Length(GData))) or
-     (HEADER_SIZE + UInt64(HdrCount) * ENTRY_SIZE > UInt64(Length(GData))) then
+     (HEADER_SIZE + UInt64(HdrCount) * ENTRY_SIZE > UInt64(Length(GData))) or
+     (UInt64(HdrStrTabOff) > UInt64(Length(GData))) or
+     (UInt64(HdrFileTabOff) > UInt64(Length(GData))) then
   begin
     GData := nil; Exit;
   end;
@@ -380,6 +384,25 @@ begin
   Result := PUInt64(@GData[GEntriesOff + AIndex * ENTRY_SIZE])^;
 end;
 
+function BoundedCStr(const AOffset: UInt64; out AStr: MarshaledAString): Boolean;
+// True when GData holds a NUL-terminated string starting at AOffset. Keeps a
+// corrupt sidecar from walking past the buffer (the crash path must not fault).
+var
+  E: Integer;
+begin
+  Result := False;
+  AStr := nil;
+  if AOffset >= UInt64(Length(GData)) then
+    Exit;
+  E := Integer(AOffset);
+  while (E < Length(GData)) and (GData[E] <> 0) do
+    Inc(E);
+  if E >= Length(GData) then
+    Exit; // no NUL before EOF - corrupt
+  AStr := MarshaledAString(@GData[Integer(AOffset)]);
+  Result := True;
+end;
+
 function CrashAndroidLookupName(const ACodeAddr, AModuleBase: UIntPtr;
   out AName: String; out ARoutineAddr: UIntPtr; out ASourceFile: String): Boolean;
 var
@@ -387,9 +410,9 @@ var
   Lo, Hi, Mid: Integer;
   Found: Integer;
   EntBase: UInt32;
-  Size, NameOff, FileOff, NextAddr, StrPos: UInt32;
+  Size, NameOff, FileOff, NextAddr: UInt32;
   EntAddr: UInt64;
-  Mangled, Demangled: MarshaledAString;
+  Mangled, Demangled, FileStr: MarshaledAString;
   Status: Integer;
 begin
   Result := False;
@@ -437,13 +460,12 @@ begin
   ARoutineAddr := AModuleBase + UIntPtr(EntAddr); // absolute function start
 
   // source file (NUL-terminated in the file table); FileOff=0 -> unknown
-  if (FileOff > 0) and ((GFileTabOff + FileOff) < UInt32(Length(GData))) then
-    ASourceFile := String(AnsiString(MarshaledAString(@GData[GFileTabOff + FileOff])));
+  if (FileOff > 0) and BoundedCStr(UInt64(GFileTabOff) + FileOff, FileStr) then
+    ASourceFile := String(AnsiString(FileStr));
 
   // read mangled name from the string table (NUL-terminated)
-  StrPos := GStrTabOff + NameOff;
-  if StrPos >= UInt32(Length(GData)) then Exit;
-  Mangled := MarshaledAString(@GData[StrPos]);
+  if not BoundedCStr(UInt64(GStrTabOff) + NameOff, Mangled) then
+    Exit;
 
   Demangled := cxa_demangle(Mangled, nil, 0, Status);
   if Demangled = nil then

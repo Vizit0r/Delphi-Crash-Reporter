@@ -64,8 +64,13 @@ type
     { Persist the .el to disk next to the exe. Default True. }
     SaveToFile: Boolean;
     { File name prefix; the timestamp + ".el" are appended. Empty ->
-      "<ExeBaseName>_<PLATFORM>_". Also drives the boot-recovery scan pattern. }
+      "<ExeBaseName>_<PLATFORM>_". }
     FileNamePrefix: String;
+    { Boot-recovery scan prefix (the scan matches "<prefix>*.el"). Empty ->
+      FileNamePrefix. Set a STABLE prefix (no version token) when FileNamePrefix
+      embeds an app version, so reports written by a previous version are still
+      picked up after an update. }
+    ScanFileNamePrefix: String;
     { Upload reports to UploadUrl. Default False (don't phone home unless asked). }
     UploadEnabled: Boolean;
     { Full upload endpoint URL (the host builds it). Multipart POST. }
@@ -202,6 +207,7 @@ type
     FPendingReports: TArray<String>;
     FAppStartTime: TDateTime;   // captured in Init for the Up Time field
     function EffectiveFileNamePrefix: String;
+    function EffectiveScanPrefix: String;
     function EffectiveReportDir: String;
     function BuildCrashFilePath: String;
     procedure WriteCrashBriefToConsole(const AReport: TCrashReport;
@@ -210,6 +216,7 @@ type
     procedure WriteToFile(const AText: String);
     procedure ResetAlreadyReported;
     procedure HandleReport(const AReport: TCrashReport);
+    procedure DoHandleReport(const AReport: TCrashReport);
     procedure ScanPendingCrashReports;
   public
     constructor Create;
@@ -241,6 +248,14 @@ begin
     Result := FConfig.FileNamePrefix
   else
     Result := GetExeBaseName + '_' + GetPlatformTag + '_';
+end;
+
+function TCrashReporterImpl.EffectiveScanPrefix: String;
+begin
+  if FConfig.ScanFileNamePrefix <> '' then
+    Result := FConfig.ScanFileNamePrefix
+  else
+    Result := EffectiveFileNamePrefix;
 end;
 
 function TCrashReporterImpl.EffectiveReportDir: String;
@@ -382,11 +397,15 @@ begin
     FCrashFilePath := Cand;
   end;
   try
+    // A custom ReportDir may not exist yet; the platform defaults always do.
+    ForceDirectories(ExtractFilePath(FCrashFilePath));
     // UTF-16LE + BOM - same encoding as a Windows EL build, so the Viewer
     // accepts it.
     TFile.WriteAllText(FCrashFilePath, AText, TEncoding.Unicode);
   except
-    // Crashing inside a crash handler is the worst outcome. Stay silent.
+    // Crashing inside a crash handler is the worst outcome. Stay silent, but
+    // drop the path so the "saved to ..." messaging stays honest.
+    FCrashFilePath := '';
   end;
 end;
 
@@ -402,11 +421,6 @@ begin
 end;
 
 procedure TCrashReporterImpl.HandleReport(const AReport: TCrashReport);
-var
-  Text: String;
-  Ctx: TCrashELContext;
-  IsFatal: Boolean;
-  LocalDialogProc: TCrashShowDialogProc;
 begin
   // Anti-cascade under the lock. Long operations (dialog) happen outside it.
   FLock.Enter;
@@ -417,6 +431,25 @@ begin
   finally
     FLock.Leave;
   end;
+
+  try
+    DoHandleReport(AReport);
+  except
+    // Re-arm before the capture layer swallows this (ReportException ignores
+    // handler exceptions): a formatter failure must not disable every future
+    // report of this process.
+    ResetAlreadyReported;
+    raise;
+  end;
+end;
+
+procedure TCrashReporterImpl.DoHandleReport(const AReport: TCrashReport);
+var
+  Text: String;
+  Ctx: TCrashELContext;
+  IsFatal: Boolean;
+  LocalDialogProc: TCrashShowDialogProc;
+begin
 
   // Skip a content-less "phantom" report. The capture hook fires 2-3x per raise
   // (ExceptProc + ExceptionAcquired + fallback); the anti-cascade above coalesces
@@ -447,6 +480,10 @@ begin
     end;
     if not KeepReport then
     begin
+      // Leave the same state as a delivered report: drop the un-consumed
+      // hardware snapshot and re-arm the one-shot POSIX handlers.
+      CrashDiscardPendingSnapshot;
+      CrashInstallSignalHandlers;
       ResetAlreadyReported;
       Exit;
     end;
@@ -512,7 +549,12 @@ begin
           try TFile.Delete(FCrashFilePath); except end;
       end
       else if FConfig.UploadEnabled then
-        ConsoleLine('Upload: FAILED - report kept at ' + FCrashFilePath);
+      begin
+        if FCrashFilePath <> '' then
+          ConsoleLine('Upload: FAILED - report kept at ' + FCrashFilePath)
+        else
+          ConsoleLine('Upload: FAILED - report not saved to disk');
+      end;
     except
       on E: Exception do
         ConsoleLine('Upload: EXCEPTION ' + E.ClassName + ': ' + E.Message);
@@ -581,7 +623,12 @@ begin
           try TFile.Delete(FCrashFilePath); except end;
       end
       else if FConfig.UploadEnabled then
-        ConsoleLine('Upload: FAILED - report kept at ' + FCrashFilePath);
+      begin
+        if FCrashFilePath <> '' then
+          ConsoleLine('Upload: FAILED - report kept at ' + FCrashFilePath)
+        else
+          ConsoleLine('Upload: FAILED - report not saved to disk');
+      end;
     except
     end;
     ResetAlreadyReported;
@@ -606,19 +653,24 @@ begin
   ScanPendingCrashReports;
 end;
 
+const
+  { Startup-recovery upload budget per launch: a long backlog must not hold the
+    radio / endpoint for minutes; leftovers go out on the next launches. }
+  MaxStartupUploads = 3;
+
 procedure TCrashReporterImpl.ScanPendingCrashReports;
 var
-  Dir, FilePath, Text, Pattern: String;
+  Dir, FilePath, Pattern: String;
   Files: TArray<String>;
   Kept: TList<String>;
-  TryUpload: Boolean;
 begin
   Dir := EffectiveReportDir; // same directory we write to (see BuildCrashFilePath)
   if Dir = '' then
     Exit;
-  // Match this build's prefix only: different targets in one folder don't eat
-  // each other's files.
-  Pattern := EffectiveFileNamePrefix + '*.el';
+  // The scan prefix keeps different targets in one folder from eating each
+  // other's files, while (with a stable host-set ScanFileNamePrefix) still
+  // matching reports written by a previous app version.
+  Pattern := EffectiveScanPrefix + '*.el';
 
   Files := nil;
   try
@@ -626,21 +678,46 @@ begin
   except
     Exit; // directory unavailable - don't fail bootstrap
   end;
+  if Files = nil then
+    Exit;
 
-  TryUpload := FConfig.UploadEnabled and FConfig.UploadPendingOnStartup;
+  if FConfig.UploadEnabled and FConfig.UploadPendingOnStartup then
+  begin
+    // Upload OFF the startup path: a slow or offline endpoint must not block
+    // launch (up to 10s connect + 30s response PER FILE adds up to an ANR on
+    // mobile). Capped per launch; files stay on disk until sent.
+    TThread.CreateAnonymousThread(
+      procedure
+      var
+        I, Attempts: Integer;
+        UpFile, UpText: String;
+      begin
+        Attempts := 0;
+        for I := 0 to High(Files) do
+        begin
+          if Attempts >= MaxStartupUploads then
+            Break;
+          UpFile := Files[I];
+          try
+            UpText := TFile.ReadAllText(UpFile, TEncoding.Unicode);
+            Inc(Attempts);
+            if TCrashReporter.Upload(UpText, ExtractFileName(UpFile)) then
+              try TFile.Delete(UpFile); except end; // sent -> remove
+          except
+            // Unreadable - skip silently; the file stays.
+          end;
+        end;
+      end).Start;
+    Exit;
+  end;
 
+  // No startup upload: keep the texts for the host to surface (stderr etc.).
   Kept := TList<String>.Create;
   try
     for FilePath in Files do
     begin
       try
-        Text := TFile.ReadAllText(FilePath, TEncoding.Unicode);
-        if TryUpload and TCrashReporter.Upload(Text, ExtractFileName(FilePath)) then
-        begin
-          try TFile.Delete(FilePath); except end; // sent -> remove
-        end
-        else
-          Kept.Add(Text); // leave the file on disk; surfacing is optional
+        Kept.Add(TFile.ReadAllText(FilePath, TEncoding.Unicode));
       except
         // Couldn't read - skip silently; the file stays.
       end;
