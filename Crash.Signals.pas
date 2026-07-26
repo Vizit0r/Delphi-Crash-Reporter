@@ -169,6 +169,7 @@ type
   TConcurrentSignal = packed record
     Claimed:    Integer;   // atomic claim: the first extra fault wins this slot
     Captured:   Integer;   // atomic publish flag (set LAST by the writer)
+    Epoch:      Integer;   // capture cycle of the claim (GSnapshotEpoch stamp): a slot published after its cycle was consumed is dropped
     SignalNum:  Integer;
     SignalCode: Integer;
     FaultAddr:  UInt64;
@@ -179,6 +180,7 @@ type
 var
   GSignalSnapshot: TSignalSnapshot;
   GConcurrentSignal: TConcurrentSignal;
+  GSnapshotEpoch:  Integer = 0;  // bumped by TakeSnapshot; pairs a concurrent claim with its primary capture cycle
   GOldHandlers:    array[1..31] of sigaction_t;
   GInstalled:      Boolean = False;
   GAltStackDone:   Boolean = False;
@@ -388,6 +390,7 @@ begin
     // that fault's exception got swallowed by the app). Keep its location so
     // the report can NAME the concurrent fault instead of losing it; a full
     // second register set is not worth the extra handler complexity.
+    GConcurrentSignal.Epoch := GSnapshotEpoch;
     GConcurrentSignal.SignalNum := SigNum;
     if SigInfo <> nil then
     begin
@@ -665,10 +668,15 @@ begin
   // half-filled slot would let a second writer in mid-fill.
   if GConcurrentSignal.Captured = 1 then
   begin
-    C := GConcurrentSignal;
+    // Accept only a slot claimed during THIS capture cycle: a slot published
+    // late (after its cycle was consumed) must not pose as the companion of
+    // the next, unrelated fault.
+    if GConcurrentSignal.Epoch = GSnapshotEpoch then
+      C := GConcurrentSignal;
     TInterlocked.Exchange(GConcurrentSignal.Captured, 0);
     TInterlocked.Exchange(GConcurrentSignal.Claimed, 0);
   end;
+  TInterlocked.Increment(GSnapshotEpoch);
   TInterlocked.Exchange(GSignalSnapshot.Captured, 0);
   TInterlocked.Exchange(GSignalSnapshot.InvocationCount, 0);
   // Reopen the slot LAST - a writer claims only after the copy above is done.
@@ -1040,6 +1048,7 @@ begin
   begin
     // Same policy as the POSIX handler: a SECOND fault while the primary
     // snapshot is pending is recorded location-only, so the report can name it.
+    GConcurrentSignal.Epoch      := GSnapshotEpoch;
     GConcurrentSignal.SignalNum  := ASignalNum;
     GConcurrentSignal.SignalCode := ASignalCode;
     GConcurrentSignal.FaultAddr  := AFaultAddr;

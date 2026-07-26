@@ -435,9 +435,12 @@ begin
   try
     DoHandleReport(AReport);
   except
-    // Re-arm before the capture layer swallows this (ReportException ignores
-    // handler exceptions): a formatter failure must not disable every future
-    // report of this process.
+    // Restore the capture state in full before the capture layer swallows this
+    // (ReportException ignores handler exceptions): drop a possibly un-consumed
+    // snapshot, re-arm the one-shot signal handlers and the reporter - a
+    // formatter failure must not degrade every future report of this process.
+    CrashDiscardPendingSnapshot;
+    CrashInstallSignalHandlers;
     ResetAlreadyReported;
     raise;
   end;
@@ -653,6 +656,64 @@ begin
   ScanPendingCrashReports;
 end;
 
+function CrashUploadCore(const AUrl, AFieldName, AReportText,
+  AFileName: String): Boolean;
+// Self-contained multipart POST used by the facade Upload and by the startup
+// background worker. Deliberately touches NO reporter-singleton state: the
+// worker may still be running while the singleton is torn down at shutdown.
+var
+  Client: THTTPClient;
+  Form: TMultipartFormData;
+  Bytes: TBytes;
+  Stream: TBytesStream;
+  Resp: IHTTPResponse;
+  UploadName, FieldName: String;
+begin
+  Result := False;
+  if AUrl = '' then
+    Exit;
+  // Test/dev escape: env CRASH_NO_UPLOAD=1 -> skip the POST and keep the file,
+  // so a local .el can be read without a network side effect.
+  if GetEnvironmentVariable('CRASH_NO_UPLOAD') = '1' then Exit;
+
+  // File body bytes - UTF-16LE with BOM, same as the .el on disk.
+  Bytes := TEncoding.Unicode.GetPreamble + TEncoding.Unicode.GetBytes(AReportText);
+
+  // Server-side name = on-disk name, so logs/monitoring keep the context.
+  if AFileName <> '' then UploadName := AFileName
+  else                    UploadName := 'BugReport.el';
+
+  FieldName := AFieldName;
+  if FieldName = '' then FieldName := 'el_upload_file_0';
+
+  Stream := TBytesStream.Create(Bytes);
+  try
+    Client := THTTPClient.Create;
+    try
+      Client.ConnectionTimeout := 10000;
+      Client.ResponseTimeout := 30000;
+      Form := TMultipartFormData.Create(True);
+      try
+        Form.AddStream(FieldName, Stream, False, UploadName, 'application/octet-stream');
+        try
+          Resp := Client.Post(AUrl, Form);
+          Result := (Resp <> nil) and (Resp.StatusCode >= 200) and (Resp.StatusCode < 300);
+        except
+          // Network errors must not crash the process. The file is on disk, the
+          // report isn't lost.
+          Result := False;
+        end;
+      finally
+        Form.Free;
+      end;
+    finally
+      Client.Free;
+    end;
+  finally
+    Stream.Free;
+  end;
+end;
+
 const
   { Startup-recovery upload budget per launch: a long backlog must not hold the
     radio / endpoint for minutes; leftovers go out on the next launches. }
@@ -685,7 +746,12 @@ begin
   begin
     // Upload OFF the startup path: a slow or offline endpoint must not block
     // launch (up to 10s connect + 30s response PER FILE adds up to an ANR on
-    // mobile). Capped per launch; files stay on disk until sent.
+    // mobile). Capped per launch; files stay on disk until sent. The worker
+    // gets its own COPIES of the config strings and runs entirely on
+    // CrashUploadCore - it never touches the singleton, which may already be
+    // torn down at shutdown while an upload is still in flight.
+    var UploadUrl := FConfig.UploadUrl;
+    var UploadField := FConfig.UploadFieldName;
     TThread.CreateAnonymousThread(
       procedure
       var
@@ -701,7 +767,8 @@ begin
           try
             UpText := TFile.ReadAllText(UpFile, TEncoding.Unicode);
             Inc(Attempts);
-            if TCrashReporter.Upload(UpText, ExtractFileName(UpFile)) then
+            if CrashUploadCore(UploadUrl, UploadField, UpText,
+                 ExtractFileName(UpFile)) then
               try TFile.Delete(UpFile); except end; // sent -> remove
           except
             // Unreadable - skip silently; the file stays.
@@ -811,58 +878,13 @@ end;
 
 class function TCrashReporter.Upload(const AReportText: String;
   const AFileName: String): Boolean;
-var
-  Client: THTTPClient;
-  Form: TMultipartFormData;
-  Bytes: TBytes;
-  Stream: TBytesStream;
-  Resp: IHTTPResponse;
-  UploadName, FieldName: String;
 begin
   Result := False;
   if (GReporter = nil) or (not GReporter.FConfig.UploadEnabled) or
      (GReporter.FConfig.UploadUrl = '') then
     Exit;
-  // Test/dev escape: env CRASH_NO_UPLOAD=1 -> skip the POST and keep the file,
-  // so a local .el can be read without a network side effect.
-  if GetEnvironmentVariable('CRASH_NO_UPLOAD') = '1' then Exit;
-
-  // File body bytes - UTF-16LE with BOM, same as the .el on disk.
-  Bytes := TEncoding.Unicode.GetPreamble + TEncoding.Unicode.GetBytes(AReportText);
-
-  // Server-side name = on-disk name, so logs/monitoring keep the context.
-  if AFileName <> '' then UploadName := AFileName
-  else                    UploadName := 'BugReport.el';
-
-  FieldName := GReporter.FConfig.UploadFieldName;
-  if FieldName = '' then FieldName := 'el_upload_file_0';
-
-  Stream := TBytesStream.Create(Bytes);
-  try
-    Client := THTTPClient.Create;
-    try
-      Client.ConnectionTimeout := 10000;
-      Client.ResponseTimeout := 30000;
-      Form := TMultipartFormData.Create(True);
-      try
-        Form.AddStream(FieldName, Stream, False, UploadName, 'application/octet-stream');
-        try
-          Resp := Client.Post(GReporter.FConfig.UploadUrl, Form);
-          Result := (Resp <> nil) and (Resp.StatusCode >= 200) and (Resp.StatusCode < 300);
-        except
-          // Network errors must not crash the process. The file is on disk, the
-          // report isn't lost.
-          Result := False;
-        end;
-      finally
-        Form.Free;
-      end;
-    finally
-      Client.Free;
-    end;
-  finally
-    Stream.Free;
-  end;
+  Result := CrashUploadCore(GReporter.FConfig.UploadUrl,
+    GReporter.FConfig.UploadFieldName, AReportText, AFileName);
 end;
 
 class function TCrashReporter.CanRestart: Boolean;

@@ -11,6 +11,7 @@ uses
   Dwarf in 'Source\Dwarf.pas',
   Elf in 'Source\Elf.pas',
   GeneratorElf in 'Source\GeneratorElf.pas',
+  GolEncoder in 'Source\GolEncoder.pas',
   Crash.LineNumbers in '..\..\Crash.LineNumbers.pas';
 
 procedure Run;

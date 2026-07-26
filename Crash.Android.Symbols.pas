@@ -86,7 +86,9 @@ var
   GCount: UInt32 = 0;
   GEntriesOff: UInt32 = 0;      // = HEADER_SIZE
   GStrTabOff: UInt32 = 0;
+  GStrTabSize: UInt32 = 0;
   GFileTabOff: UInt32 = 0;
+  GFileTabSize: UInt32 = 0;
   // .gol decoded line table (address-sorted)
   GGolRelAddrs: TArray<UInt32> = nil; // VM address relative to GGolStartVA
   GGolLines: TArray<Integer> = nil;
@@ -234,7 +236,7 @@ begin
     Exit;
   for J := 0 to 15 do          // build-id at offset 16..31
     if B[16 + J] <> AId[J] then Exit;
-  GGolStartVA := PUInt64(@B[32])^;
+  Move(B[32], GGolStartVA, SizeOf(GGolStartVA));
   Line := PInteger(@B[40])^;    // StartLine
 
   SetLength(GGolRelAddrs, Count + 1);
@@ -312,7 +314,8 @@ procedure CrashInitAndroidSymbols;
 var
   SoPath, GosymPath: String;
   ImgId: TBuildId;
-  HdrSig, HdrVer, HdrSize, HdrCount, HdrStrTabOff, HdrFileTabOff: UInt32;
+  HdrSig, HdrVer, HdrSize, HdrCount: UInt32;
+  HdrStrTabOff, HdrStrTabSize, HdrFileTabOff, HdrFileTabSize: UInt32;
   I: Integer;
   Match: Boolean;
 begin
@@ -344,19 +347,24 @@ begin
   end;
   if Length(GData) < HEADER_SIZE then begin GData := nil; Exit; end;
 
-  HdrSig        := PUInt32(@GData[0])^;
-  HdrVer        := PUInt32(@GData[4])^;
-  HdrSize       := PUInt32(@GData[8])^;
-  HdrCount      := PUInt32(@GData[12])^;
+  HdrSig         := PUInt32(@GData[0])^;
+  HdrVer         := PUInt32(@GData[4])^;
+  HdrSize        := PUInt32(@GData[8])^;
+  HdrCount       := PUInt32(@GData[12])^;
   // build-id at offset 16..31
-  HdrStrTabOff  := PUInt32(@GData[32])^;
-  HdrFileTabOff := PUInt32(@GData[40])^;
+  HdrStrTabOff   := PUInt32(@GData[32])^;
+  HdrStrTabSize  := PUInt32(@GData[36])^;
+  HdrFileTabOff  := PUInt32(@GData[40])^;
+  HdrFileTabSize := PUInt32(@GData[44])^;
 
+  // Structural layout check: [header][entries][string table][file table], each
+  // region inside the file and none overlapping the next. A corrupt offset can
+  // then never read a "name" out of a neighbouring region.
   if (HdrSig <> GOSY_SIGNATURE) or ((HdrVer shr 16) <> (GOSY_VERSION shr 16)) or
      (HdrSize <> UInt32(Length(GData))) or
-     (HEADER_SIZE + UInt64(HdrCount) * ENTRY_SIZE > UInt64(Length(GData))) or
-     (UInt64(HdrStrTabOff) > UInt64(Length(GData))) or
-     (UInt64(HdrFileTabOff) > UInt64(Length(GData))) then
+     (HEADER_SIZE + UInt64(HdrCount) * ENTRY_SIZE > UInt64(HdrStrTabOff)) or
+     (UInt64(HdrStrTabOff) + HdrStrTabSize > UInt64(HdrFileTabOff)) or
+     (UInt64(HdrFileTabOff) + HdrFileTabSize > UInt64(Length(GData))) then
   begin
     GData := nil; Exit;
   end;
@@ -371,7 +379,9 @@ begin
   GCount := HdrCount;
   GEntriesOff := HEADER_SIZE;
   GStrTabOff := HdrStrTabOff;
+  GStrTabSize := HdrStrTabSize;
   GFileTabOff := HdrFileTabOff;
+  GFileTabSize := HdrFileTabSize;
 end;
 
 function CrashAndroidSymbolsActive: Boolean;
@@ -381,24 +391,29 @@ end;
 
 function EntryAddr(const AIndex: UInt32): UInt64; inline;
 begin
-  Result := PUInt64(@GData[GEntriesOff + AIndex * ENTRY_SIZE])^;
+  // Move, not PUInt64^: with ENTRY_SIZE=20 every odd entry sits at 4-byte
+  // alignment only, and this code also compiles for 32-bit ARM.
+  Move(GData[GEntriesOff + AIndex * ENTRY_SIZE], Result, SizeOf(Result));
 end;
 
-function BoundedCStr(const AOffset: UInt64; out AStr: MarshaledAString): Boolean;
-// True when GData holds a NUL-terminated string starting at AOffset. Keeps a
-// corrupt sidecar from walking past the buffer (the crash path must not fault).
+function BoundedCStr(const AOffset, ALimit: UInt64;
+  out AStr: MarshaledAString): Boolean;
+// True when GData holds a NUL-terminated string starting at AOffset and fully
+// inside [AOffset, ALimit) - ALimit is the owning table's end, so a corrupt
+// offset can neither leave the buffer nor read a "name" out of another region.
 var
-  E: Integer;
+  E, Lim: Integer;
 begin
   Result := False;
   AStr := nil;
-  if AOffset >= UInt64(Length(GData)) then
+  if (AOffset >= ALimit) or (ALimit > UInt64(Length(GData))) then
     Exit;
+  Lim := Integer(ALimit);
   E := Integer(AOffset);
-  while (E < Length(GData)) and (GData[E] <> 0) do
+  while (E < Lim) and (GData[E] <> 0) do
     Inc(E);
-  if E >= Length(GData) then
-    Exit; // no NUL before EOF - corrupt
+  if E >= Lim then
+    Exit; // no NUL inside the table - corrupt
   AStr := MarshaledAString(@GData[Integer(AOffset)]);
   Result := True;
 end;
@@ -437,7 +452,7 @@ begin
     Exit;
 
   EntBase := GEntriesOff + UInt32(Found) * ENTRY_SIZE;
-  EntAddr := PUInt64(@GData[EntBase])^;
+  Move(GData[EntBase], EntAddr, SizeOf(EntAddr));
   Size    := PUInt32(@GData[EntBase + 8])^;
   NameOff := PUInt32(@GData[EntBase + 12])^;
   FileOff := PUInt32(@GData[EntBase + 16])^;
@@ -460,11 +475,13 @@ begin
   ARoutineAddr := AModuleBase + UIntPtr(EntAddr); // absolute function start
 
   // source file (NUL-terminated in the file table); FileOff=0 -> unknown
-  if (FileOff > 0) and BoundedCStr(UInt64(GFileTabOff) + FileOff, FileStr) then
+  if (FileOff > 0) and BoundedCStr(UInt64(GFileTabOff) + FileOff,
+       UInt64(GFileTabOff) + GFileTabSize, FileStr) then
     ASourceFile := String(AnsiString(FileStr));
 
   // read mangled name from the string table (NUL-terminated)
-  if not BoundedCStr(UInt64(GStrTabOff) + NameOff, Mangled) then
+  if not BoundedCStr(UInt64(GStrTabOff) + NameOff,
+       UInt64(GStrTabOff) + GStrTabSize, Mangled) then
     Exit;
 
   Demangled := cxa_demangle(Mangled, nil, 0, Status);

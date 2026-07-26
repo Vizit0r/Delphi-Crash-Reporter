@@ -289,6 +289,18 @@ begin
   end;
 end;
 
+procedure MachSetupRollback;
+// Roll back a half-done one-time setup: release the port rights and reopen the
+// gate, so a later install call may retry after a transient failure.
+begin
+  if GExcPort <> 0 then
+  begin
+    mach_port_destroy(mach_task_self, GExcPort);
+    GExcPort := 0;
+  end;
+  TInterlocked.Exchange(GInstalled, 0);
+end;
+
 procedure CrashInstallMacOSMachHandlerForCurrentThread;
 var
   Task: mach_port_t;
@@ -302,15 +314,15 @@ begin
   begin
     Task := mach_task_self;
     KR := mach_port_allocate(Task, MACH_PORT_RIGHT_RECEIVE, GExcPort);
-    if KR <> KERN_SUCCESS then begin GExcPort := 0; Exit; end;
+    if KR <> KERN_SUCCESS then begin GExcPort := 0; MachSetupRollback; Exit; end;
     KR := mach_port_insert_right(Task, GExcPort, GExcPort, MACH_MSG_TYPE_MAKE_SEND);
-    if KR <> KERN_SUCCESS then begin GExcPort := 0; Exit; end;
-    if pthread_attr_init(Attr) <> 0 then begin GExcPort := 0; Exit; end;
+    if KR <> KERN_SUCCESS then begin MachSetupRollback; Exit; end;
+    if pthread_attr_init(Attr) <> 0 then begin MachSetupRollback; Exit; end;
     pthread_attr_setdetachstate(Attr, PTHREAD_CREATE_DETACHED);
     if pthread_create(Th, Attr, @ExcWatcherThread, nil) <> 0 then
     begin
       pthread_attr_destroy(Attr);
-      GExcPort := 0;
+      MachSetupRollback;
       Exit;
     end;
     pthread_attr_destroy(Attr);

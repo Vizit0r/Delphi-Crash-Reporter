@@ -613,11 +613,12 @@ begin
     // so they aren't mistaken for real ones. Module + Offset stay - they resolve
     // via `atos -o <exe> 0x<addr>` on a dev machine.
     //
-    // Threshold: 3 DISTINCT code addresses per name. Genuine recursion repeats
-    // the same return address (1-2 distinct entries), while dladdr clamping
-    // spreads one export name over many unrelated addresses - only the latter
-    // is fake. Trusted names (NameTrusted: LC_SYMTAB / .gosym) are exempt
-    // entirely - genuine recursion must keep its name.
+    // Threshold: 3 DISTINCT code addresses per full symbol identity
+    // (unit|class|procedure - TFoo.Create and TBar.Create stay apart). Genuine
+    // recursion repeats the same return address (1-2 distinct entries), while
+    // dladdr clamping spreads one export name over many unrelated addresses -
+    // only the latter is fake. Trusted names (NameTrusted: LC_SYMTAB / .gosym)
+    // are exempt entirely - genuine recursion must keep its name.
     const FakeNameThreshold = 3;
     if Length(Rendered) >= FakeNameThreshold then
     begin
@@ -625,21 +626,26 @@ begin
       var SeenAddrs := TDictionary<String, Boolean>.Create;
       try
         var Cnt: Integer;
+        var Key: String;
         for I := 0 to High(Rendered) do
           if (Rendered[I].AProcedure <> '') and (not Stack[I].NameTrusted) then
           begin
-            if SeenAddrs.TryAdd(Rendered[I].AProcedure + '|' + Rendered[I].Address, True) then
+            Key := Rendered[I].AUnit + '|' + Rendered[I].AClass + '|' +
+              Rendered[I].AProcedure;
+            if SeenAddrs.TryAdd(Key + '|' + Rendered[I].Address, True) then
             begin
-              if NameCounts.TryGetValue(Rendered[I].AProcedure, Cnt) then
-                NameCounts[Rendered[I].AProcedure] := Cnt + 1
+              if NameCounts.TryGetValue(Key, Cnt) then
+                NameCounts[Key] := Cnt + 1
               else
-                NameCounts.Add(Rendered[I].AProcedure, 1);
+                NameCounts.Add(Key, 1);
             end;
           end;
         for I := 0 to High(Rendered) do
         begin
           if (Rendered[I].AProcedure = '') or Stack[I].NameTrusted then Continue;
-          if NameCounts[Rendered[I].AProcedure] >= FakeNameThreshold then
+          Key := Rendered[I].AUnit + '|' + Rendered[I].AClass + '|' +
+            Rendered[I].AProcedure;
+          if NameCounts[Key] >= FakeNameThreshold then
           begin
             Rendered[I].Source     := '';
             Rendered[I].AUnit      := '';

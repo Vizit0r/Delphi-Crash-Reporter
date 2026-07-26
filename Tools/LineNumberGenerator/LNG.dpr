@@ -8,6 +8,7 @@ uses
   System.SysUtils,
   Dwarf in 'Source\Dwarf.pas',
   Generator in 'Source\Generator.pas',
+  GolEncoder in 'Source\GolEncoder.pas',
   MachO in 'Source\MachO.pas',
   Crash.LineNumbers in '..\..\Crash.LineNumbers.pas',
   Crash.MacOS.Api in '..\..\Crash.MacOS.Api.pas';

@@ -13,26 +13,19 @@ unit GeneratorElf;
 interface
 
 uses
-  System.Classes;
+  System.Classes,
+  GolEncoder;
 
 type
   TElfLineNumberGenerator = class
   {$REGION 'Internal Declarations'}
   private type
-    TLine = record
-      Address: UInt64;
-      Line: Integer;
-    end;
+    TLine = TGolLine;
   private
     FExePath: String;
     FLineNumPath: String;
   private
-    procedure WriteLines(const AID: TGUID; const ALines: TArray<TLine>);
-  private
-    class procedure AppendByte(const AStream: TStream;
-      const AValue: Byte); static;
-    class procedure AppendVarInt(const AStream: TStream;
-      const AValue: UInt32); inline; static;
+    procedure WriteLines(const AID: TGUID; var ALines: TArray<TLine>);
   {$ENDREGION 'Internal Declarations'}
   public
     constructor Create(const APath: String);
@@ -51,28 +44,6 @@ uses
 
 { TElfLineNumberGenerator }
 
-class procedure TElfLineNumberGenerator.AppendByte(const AStream: TStream;
-  const AValue: Byte);
-begin
-  AStream.WriteBuffer(AValue, 1);
-end;
-
-class procedure TElfLineNumberGenerator.AppendVarInt(const AStream: TStream;
-  const AValue: UInt32);
-var
-  Value: UInt32;
-  B: Byte;
-begin
-  Value := AValue;
-  repeat
-    B := Value and $7F;
-    Value := Value shr 7;
-    if (Value <> 0) then
-      B := B or $80;
-    AStream.WriteBuffer(B, 1);
-  until (Value = 0);
-end;
-
 constructor TElfLineNumberGenerator.Create(const APath: String);
 begin
   inherited Create;
@@ -90,7 +61,7 @@ var
   CU: TDwarfCompilationUnit;
   Lines: TArray<TLine>;
   Line: TDwarfLine;
-  PrevLine, LineCount, I: Integer;
+  PrevLine, LineCount: Integer;
 begin
   if not FileExists(FExePath) then
     raise EFileNotFoundException.CreateFmt('Executable file "%s" not found', [FExePath]);
@@ -149,106 +120,31 @@ begin
     Dwarf.Free;
   end;
 
-  TArray.Sort<TLine>(Lines, TComparer<TLine>.Construct(
-    function(const ALeft, ARight: TLine): Integer
-    begin
-      // Branchy compare: a UInt64 subtraction narrowed to Integer flips sign
-      // for far-apart addresses and breaks the sort order.
-      if ALeft.Address < ARight.Address then Result := -1
-      else if ALeft.Address > ARight.Address then Result := 1
-      else Result := 0;
-    end));
   WriteLines(ExeID, Lines);
 end;
 
 procedure TElfLineNumberGenerator.WriteLines(const AID: TGUID;
-  const ALines: TArray<TLine>);
-{ Identical to Generator.WriteLines (macOS) - the .gol format is platform-
-  independent. If the format changes, change it in both places at once. }
+  var ALines: TArray<TLine>);
+{ Header + file IO around the shared GolEncoder program (one encoder for both
+  the Mach-O and the ELF generator; GolEncodeLines sorts ALines itself). }
 var
   Buffer: TMemoryStream;
   Header: TLineNumberHeader;
   Stream: TFileStream;
-  I, LineDelta, Count, PrevLine: Integer;
-  AddressDelta: Int64;
-  PrevAddress: UInt64;
 begin
-  if (ALines = nil) then
-    raise EInvalidOperation.Create('Line number information not available');
-
-  AddressDelta := ALines[Length(ALines) - 1].Address - ALines[0].Address;
-  if (AddressDelta <= 0) or (AddressDelta > $FFFFFFFF) then
-    raise EInvalidOperation.Create('Line number addresses exceed 4 GB range');
-
   Buffer := TMemoryStream.Create;
   try
+    { Reserve the header slot; every field is written after the encode, when
+      the sorted ALines[0] anchor and the entry count are known. }
+    Header := Default(TLineNumberHeader);
+    Buffer.WriteBuffer(Header, SizeOf(Header));
+
+    Header.Count := GolEncodeLines(ALines, Buffer);
     Header.Signature := LINE_NUMBER_SIGNATURE;
     Header.Version := LINE_NUMBER_VERSION;
-    Header.Size := 0;
-    Header.Count := 0;
     Header.ID := AID;
     Header.StartVMAddress := ALines[0].Address;
     Header.StartLine := ALines[0].Line;
-    Buffer.WriteBuffer(Header, SizeOf(Header));
-
-    Count := 0;
-    PrevAddress := ALines[0].Address;
-    PrevLine := ALines[0].Line;
-    for I := 1 to Length(ALines) - 1 do
-    begin
-      { Deltas are relative to the last WRITTEN entry: the decoder never sees
-        the skipped duplicates below, its state advances only on written
-        records. }
-      AddressDelta := ALines[I].Address - PrevAddress;
-      if (AddressDelta < 0) then
-        raise EInvalidOperation.Create('Invalid line number sequence (addresses should be incrementing)');
-
-      LineDelta := ALines[I].Line - PrevLine;
-      if (AddressDelta = 0) then
-      begin
-        // Skip duplicate-address line entries (silent Continue, see
-        // Generator.pas for the macOS dSYM rationale -- ELF DWARF for
-        // Delphi-generic'd routines ships them too).
-        Continue;
-      end
-      else
-      begin
-        PrevAddress := ALines[I].Address;
-        PrevLine := ALines[I].Line;
-        if (LineDelta >= 1) and (LineDelta <= 4) then
-        begin
-          if (AddressDelta <= 63) then
-          begin
-            AppendByte(Buffer, (LineDelta - 1) + ((AddressDelta - 1) * 4));
-            Inc(Count);
-            Continue;
-          end
-          else if (AddressDelta <= (63 * 2)) then
-          begin
-            AppendByte(Buffer, OP_ADVANCE_ADDR);
-            AppendByte(Buffer, (LineDelta - 1) + ((AddressDelta - 63 - 1) * 4));
-            Inc(Count);
-            Continue;
-          end;
-        end;
-
-        if (LineDelta <= 0) then
-        begin
-          AppendByte(Buffer, OP_ADVANCE_ABS);
-          AppendVarInt(Buffer, AddressDelta - 1);
-          AppendVarInt(Buffer, ALines[I].Line);
-        end
-        else
-        begin
-          AppendByte(Buffer, OP_ADVANCE_REL);
-          AppendVarInt(Buffer, AddressDelta - 1);
-          AppendVarInt(Buffer, LineDelta - 1);
-        end;
-        Inc(Count);
-      end;
-    end;
-
-    Header.Count := Count;
     Header.Size := Buffer.Size;
     Move(Header, Buffer.Memory^, SizeOf(Header));
 
