@@ -141,6 +141,14 @@ type
       Upload (e.g. from the dialog) to mirror the fatal-path "delete on upload
       success" policy. No-op if there is no current file. }
     class procedure DeleteLastCrashFile; static;
+
+    { Init-time verdict: True when Init's Mach thread registration succeeded
+      (vacuously True on targets without a Mach layer). Reflects ONLY the
+      registration made at Init - it does not track the watcher's later
+      lifetime, and it says nothing about other threads' coverage. False =
+      main-thread hardware-fault reports lack the Registers section (their
+      Crash Signal Info section says so too). }
+    class function MainThreadMachCovered: Boolean; static;
   end;
 
 implementation
@@ -206,6 +214,7 @@ type
     FExceptionID: String;       // EL-style BugID of the current report; the .el file-name token (set in HandleReport before WriteToFile)
     FPendingReports: TArray<String>;
     FAppStartTime: TDateTime;   // captured in Init for the Up Time field
+    FMachMainThreadCovered: Boolean; // Init-time Mach registration verdict (main thread only; NOT a live watcher status)
     function EffectiveFileNamePrefix: String;
     function EffectiveScanPrefix: String;
     function EffectiveReportDir: String;
@@ -232,6 +241,7 @@ constructor TCrashReporterImpl.Create;
 begin
   inherited Create;
   FLock := TCriticalSection.Create;
+  FMachMainThreadCovered := True; // no verdict yet - only Init's registration may flip it
   FAppStartTime := Now; // "close enough to process start"
 end;
 
@@ -527,6 +537,17 @@ begin
   except
     // A faulty context provider must not break reporting.
   end;
+  // macOS x86-64 whose Init (main-thread) Mach registration failed: state WHY
+  // the Registers section is absent - but only in MAIN-thread reports; the
+  // stored verdict says nothing about other threads' coverage.
+  if (not FMachMainThreadCovered) and
+     (TThread.CurrentThread.ThreadID = MainThreadID) then
+  begin
+    if Ctx.SignalInfoSection <> '' then
+      Ctx.SignalInfoSection := Ctx.SignalInfoSection + #13#10;
+    Ctx.SignalInfoSection := Ctx.SignalInfoSection +
+      'Mach registration for the Init (main) thread failed - hardware-fault registers are unavailable in this report';
+  end;
   Text := CrashBuildELReportText(AReport, Ctx);
 
   // The .el file name uses the exception's EL-style BugID as its token (see
@@ -813,8 +834,12 @@ begin
   CrashInstallSignalHandlers;
   // macOS: install our thread-level Mach exception port on the MAIN thread (we
   // run on it here). Captures CPU registers for hardware faults, which the RTL's
-  // POSIX-bypassing Mach handler otherwise hides. No-op on non-(macOS x86-64).
-  CrashInstallMacOSMachHandlerForCurrentThread;
+  // POSIX-bypassing Mach handler otherwise hides. True on non-Mach targets
+  // (nothing to cover); False = MAIN-thread faults will report without the
+  // Registers section. Init-time verdict only (see MainThreadMachCovered).
+  GReporter.FMachMainThreadCovered := CrashInstallMacOSMachHandlerForCurrentThread;
+  if not GReporter.FMachMainThreadCovered then
+    GReporter.ConsoleLine('Mach registration for the Init thread failed - main-thread Registers sections will be missing');
   // macOS: build the Pascal-symbol cache from the running Mach-O LC_SYMTAB so the
   // call stack shows real function names (not the nearest dladdr export). No-op
   // elsewhere.
@@ -885,6 +910,11 @@ begin
     Exit;
   Result := CrashUploadCore(GReporter.FConfig.UploadUrl,
     GReporter.FConfig.UploadFieldName, AReportText, AFileName);
+end;
+
+class function TCrashReporter.MainThreadMachCovered: Boolean;
+begin
+  Result := (GReporter = nil) or GReporter.FMachMainThreadCovered;
 end;
 
 class function TCrashReporter.CanRestart: Boolean;

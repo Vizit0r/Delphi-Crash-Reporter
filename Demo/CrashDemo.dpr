@@ -21,6 +21,10 @@ uses
   Crash.Reporter,
   Crash.CallStack;
 
+var
+  { Process start, for the 'fpe' divisor below. }
+  GProcessStart: TDateTime;
+
 function BurnStack(N: Integer): Integer;
 // Unbounded recursion with a fat frame (4 KB) - exhausts an 8 MB stack in ~2000
 // frames. The result feeds back into the caller so nothing gets optimised away.
@@ -66,7 +70,7 @@ type
   TProc0 = procedure; cdecl;
 var
   P:     PInteger;
-  A, B:  Integer;
+  A:     Integer;
   HighP: Pointer;
   W:     TThread;
 begin
@@ -77,8 +81,18 @@ begin
   end
   else if AKind = 'fpe' then
   begin
-    A := 100; B := 0;
-    A := A div B;                   // integer divide by zero
+    // Divide by a RUNTIME zero: the whole-day part of this process's uptime.
+    // It is 0 for a fresh start, yet nothing in the value's provenance lets
+    // the compiler prove that - so the division survives into the binary.
+    // Even so this yields NO Registers section: Delphi emits an unconditional
+    // zero guard (`call System._IntDivByZero` right before the `idiv`, checked
+    // in the disassembly), so the RTL raises in software and the CPU never
+    // faults. A float divide does reach the CPU, but FP exceptions are masked
+    // on the POSIX targets, so it merely yields +Inf. In short: SIGFPE /
+    // EXC_ARITHMETIC cannot be provoked from plain Delphi code - the handlers
+    // for them only ever fire on faults from foreign code.
+    A := 100;
+    A := A div Trunc(Now - GProcessStart);
     Writeln(A);
   end
   else if AKind = 'callbad' then
@@ -149,6 +163,7 @@ var
   I:      Integer;
 begin
   Kind   := '';
+  GProcessStart := Now;
   Filter := '';
   DoWait := False;
   for I := 1 to ParamCount do

@@ -169,7 +169,7 @@ type
   TConcurrentSignal = packed record
     Claimed:    Integer;   // atomic claim: the first extra fault wins this slot
     Captured:   Integer;   // atomic publish flag (set LAST by the writer)
-    Epoch:      Integer;   // capture cycle of the claim (GSnapshotEpoch stamp): a slot published after its cycle was consumed is dropped
+    Epoch:      Integer;   // capture cycle of the claim (epoch read at handler ENTRY, before the CAS): a slot published after its cycle was consumed is dropped
     SignalNum:  Integer;
     SignalCode: Integer;
     FaultAddr:  UInt64;
@@ -365,8 +365,13 @@ procedure CrashSignalHandler(SigNum: Integer; SigInfo: Psiginfo_t;
   Context: Pointer); cdecl;
 var
   Restored: sigaction_t;
+  ClaimEpoch: Integer;
 begin
   TInterlocked.Increment(GSignalSnapshot.InvocationCount);
+  // Read the capture-cycle epoch on ENTRY, before any claim attempt: read
+  // after the CAS it could already belong to the NEXT cycle (TakeSnapshot in
+  // between), and a stale slot would pass that cycle's epoch gate.
+  ClaimEpoch := GSnapshotEpoch;
 
   if TInterlocked.CompareExchange(GSignalSnapshot.Claimed, 1, 0) = 0 then
   begin
@@ -390,7 +395,7 @@ begin
     // that fault's exception got swallowed by the app). Keep its location so
     // the report can NAME the concurrent fault instead of losing it; a full
     // second register set is not worth the extra handler complexity.
-    GConcurrentSignal.Epoch := GSnapshotEpoch;
+    GConcurrentSignal.Epoch := ClaimEpoch;
     GConcurrentSignal.SignalNum := SigNum;
     if SigInfo <> nil then
     begin
@@ -676,11 +681,16 @@ begin
     TInterlocked.Exchange(GConcurrentSignal.Captured, 0);
     TInterlocked.Exchange(GConcurrentSignal.Claimed, 0);
   end;
-  TInterlocked.Increment(GSnapshotEpoch);
   TInterlocked.Exchange(GSignalSnapshot.Captured, 0);
   TInterlocked.Exchange(GSignalSnapshot.InvocationCount, 0);
-  // Reopen the slot LAST - a writer claims only after the copy above is done.
+  // Reopen the slot only after the copy above is done, and advance the epoch
+  // strictly AFTER the reopen: a writer entering between the two steps stamps
+  // the OLD epoch and is conservatively dropped by the next take. Advancing
+  // the epoch first would let a writer stamp the NEW cycle while the primary
+  // slot is still closed - its late-published concurrent slot could then pose
+  // as the NEXT, unrelated fault's companion.
   TInterlocked.Exchange(GSignalSnapshot.Claimed, 0);
+  TInterlocked.Increment(GSnapshotEpoch);
 end;
 
 procedure CrashDiscardPendingSnapshot;
@@ -1009,8 +1019,12 @@ procedure CrashRecordMacOSSnapshot(const ARegs: TCrashMacOSRegs;
   ASignalNum, ASignalCode: Integer; AFaultAddr: UInt64;
   AStackBase: UInt64; AStackBytes: Pointer; AStackLen: Integer;
   AFaultThreadID: UInt64);
+var
+  ClaimEpoch: Integer;
 begin
   TInterlocked.Increment(GSignalSnapshot.InvocationCount);
+  // Entry-time epoch, before any claim attempt (see CrashSignalHandler).
+  ClaimEpoch := GSnapshotEpoch;
   // Capture only the FIRST exception (as the POSIX handler does) - a later
   // secondary fault must not overwrite the primary registers.
   if TInterlocked.CompareExchange(GSignalSnapshot.Claimed, 1, 0) = 0 then
@@ -1048,7 +1062,7 @@ begin
   begin
     // Same policy as the POSIX handler: a SECOND fault while the primary
     // snapshot is pending is recorded location-only, so the report can name it.
-    GConcurrentSignal.Epoch      := GSnapshotEpoch;
+    GConcurrentSignal.Epoch      := ClaimEpoch;
     GConcurrentSignal.SignalNum  := ASignalNum;
     GConcurrentSignal.SignalCode := ASignalCode;
     GConcurrentSignal.FaultAddr  := AFaultAddr;

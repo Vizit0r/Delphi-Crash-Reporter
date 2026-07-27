@@ -45,8 +45,13 @@ interface
 { Install our thread-level Mach exception port on the CURRENT thread. Call once
   per thread to cover, FROM that thread, on a calm path (e.g. startup). The port
   + watcher thread are created on first call (process-wide); later calls just
-  register another thread. No-op on non-(macOS x86-64). }
-procedure CrashInstallMacOSMachHandlerForCurrentThread;
+  register another thread. Returns True when the thread is covered (or there is
+  nothing to cover - non-(macOS x86-64) targets); False when setup or the
+  thread registration failed. A first-call failure is rolled back in full, and
+  a terminal watcher failure tears the setup down and reopens the gate - a
+  later call may retry either way. Calls serialize on an internal lock, and a
+  registration holds the port for the whole kernel call. }
+function CrashInstallMacOSMachHandlerForCurrentThread: Boolean;
 
 implementation
 
@@ -74,6 +79,17 @@ const
 
   // mach_msg receive: the queued message is larger than rcv_size (mach/message.h).
   MACH_RCV_TOO_LARGE = $10004004;
+
+  // msgh_bits value for a send on a port we hold a send right to
+  // (MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0), mach/message.h). Not exposed
+  // by Macapi.Mach, which only declares MACH_MSG_TYPE_MAKE_SEND.
+  MACH_MSG_TYPE_COPY_SEND = 19;
+
+  // Our own wake-up ping: sent to the watcher's port when a rollback clears
+  // the setup, so the watcher leaves its blocking receive and notices that
+  // the token is no longer its own. Kept far from any MIG id range, and
+  // inside positive Integer range (msgh_id is signed).
+  WAKEUP_MSG_ID = $0C0DE001;
 
   // Map Mach exception types to the POSIX signal numbers our snapshot/format
   // code labels (Crash.Signals.SignalNameOf).
@@ -105,11 +121,12 @@ function vm_read_overwrite(target_task: vm_map_t; address: vm_address_t;
 function pthread_from_mach_thread_np(thread: mach_port_t): Pointer; cdecl;
   external libc name _PU + 'pthread_from_mach_thread_np';
 
-// Removes every right the name holds (receive + our inserted send) in one call;
-// a kernel exception send to the dead name then fails fast instead of queueing.
-// Not wrapped by Macapi.Mach.
-function mach_port_destroy(task: mach_port_t; name: mach_port_t): kern_return_t; cdecl;
-  external libc name _PU + 'mach_port_destroy';
+// SDK-recommended right-by-right release (mach_port_destroy is deprecated as
+// "inherently unsafe"): drop the send right we inserted (mach_port_deallocate),
+// then the receive right. Not wrapped by Macapi.Mach.
+function mach_port_mod_refs(task: mach_port_t; name: mach_port_t;
+  right: natural_t; delta: Integer): kern_return_t; cdecl;
+  external libc name _PU + 'mach_port_mod_refs';
 
 type
   NDR_record_t = packed record
@@ -159,8 +176,9 @@ const
     reserved2: 0);
 
 var
-  GExcPort:   mach_port_t = 0;
-  GInstalled: Integer = 0;   // atomic guard for the one-time port/thread setup
+  GLock:   TCriticalSection; // serializes install/rollback/terminal teardown; created at unit init, never freed (the detached watcher may take it at any point of the process lifetime)
+  GToken:  Int64 = 0;        // live-setup token: (generation shl 32) or port; 0 = none. Written only under GLock; watchers read it atomically to detect staleness.
+  GGenSeq: Integer = 0;      // monotonic generation source for tokens
 
 procedure CaptureRequest(const Req: TMachExcRequest);
 var
@@ -224,36 +242,78 @@ var
   Req:   TMachExcRequest;
   Reply: mig_reply_error_t;
   Fails: Integer;
+  Port:  mach_port_t;
+  MyToken: Int64;
+
+  procedure ShutdownSelf;
+  // Release OUR port rights and leave. Once a watcher exists, it is the only
+  // code that ever frees this port - that is what keeps the numeric name
+  // un-recyclable for as long as the watcher lives, so no stale check-to-use
+  // window can make us touch a foreign port. Under GLock, like every other
+  // state transition.
+  begin
+    GLock.Enter;
+    try
+      if GToken = MyToken then
+        TInterlocked.Exchange(GToken, 0); // we were still the live setup
+      mach_port_deallocate(mach_task_self, Port);                          // our inserted send right
+      mach_port_mod_refs(mach_task_self, Port, MACH_PORT_RIGHT_RECEIVE, -1); // then the receive right
+    finally
+      GLock.Leave;
+    end;
+  end;
+
 begin
+  // The owner token ((generation shl 32) or port) arrives by value. The
+  // watcher recognises itself through it: a cleared/replaced token means an
+  // install rolled our setup back and pinged us awake - we then release the
+  // rights ourselves and exit.
+  MyToken := Int64(Param);
+  Port := mach_port_t(MyToken and $FFFFFFFF);
   Fails := 0;
   while True do
   begin
+    // Ownership check at the TOP of the iteration. It needs no lock and no
+    // check-to-use guarantee: nobody else frees our port, so the name we are
+    // about to use is still ours even if the token changes right here.
+    if TInterlocked.Read(GToken) <> MyToken then
+    begin
+      ShutdownSelf;
+      Exit(nil);
+    end;
+
     FillChar(Req, SizeOf(Req), 0);
-    Req.header.msgh_local_port := GExcPort;
+    Req.header.msgh_local_port := Port;
     Req.header.msgh_size := SizeOf(Req);
     R := mach_msg(Req.header, MACH_RCV_MSG or MACH_RCV_LARGE, 0, SizeOf(Req),
-                  GExcPort, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
+                  Port, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
     if R <> MACH_MSG_SUCCESS then
     begin
       // MACH_RCV_LARGE leaves an oversized message QUEUED - purge it (a receive
       // without the flag destroys it), or the failure streak below never clears.
       if R = MACH_RCV_TOO_LARGE then
-        mach_msg(Req.header, MACH_RCV_MSG, 0, SizeOf(Req), GExcPort,
+        mach_msg(Req.header, MACH_RCV_MSG, 0, SizeOf(Req), Port,
                  MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
       // Defensive: never abort. A permanently broken port would busy-spin this
-      // thread, though - back out after a failure streak. Tear the port down
-      // first: registered threads' faults then fall through to the task-level
-      // RTL port instead of hanging on an unserviced queue.
+      // thread, though - back out after a failure streak, tearing our setup
+      // down (registered threads' faults then fall through to the task-level
+      // RTL port instead of hanging on an unserviced queue).
       Inc(Fails);
       if Fails >= 100 then
       begin
-        mach_port_destroy(mach_task_self, GExcPort);
-        GExcPort := 0;
+        // Terminal: clearing the token reopens the gate, so a later install
+        // may retry from scratch.
+        ShutdownSelf;
         Exit(nil);
       end;
       Continue;
     end;
     Fails := 0;
+
+    // Our own wake-up ping (sent by a rollback): nothing to handle, and no
+    // reply is expected - loop round to the ownership check above.
+    if Req.header.msgh_id = WAKEUP_MSG_ID then
+      Continue;
 
     // Snapshot registers for the exceptions we asked for. Anything unexpected -
     // skip the capture and still reply-fail so the kernel falls through.
@@ -289,64 +349,129 @@ begin
   end;
 end;
 
-procedure MachSetupRollback;
-// Roll back a half-done one-time setup: release the port rights and reopen the
-// gate, so a later install call may retry after a transient failure.
+procedure WakeWatcher(const APort: mach_port_t);
+// Ping the watcher out of its blocking receive so it sees the cleared token
+// and releases the port itself. We hold a send right on APort, and the queue
+// is empty (the watcher is its only consumer and cannot be tearing down while
+// we hold GLock), so this never blocks.
+var
+  Msg: mach_msg_header_t;
 begin
-  if GExcPort <> 0 then
-  begin
-    mach_port_destroy(mach_task_self, GExcPort);
-    GExcPort := 0;
-  end;
-  TInterlocked.Exchange(GInstalled, 0);
+  FillChar(Msg, SizeOf(Msg), 0);
+  Msg.msgh_bits        := MACH_MSG_TYPE_COPY_SEND;
+  Msg.msgh_size        := SizeOf(Msg);
+  Msg.msgh_remote_port := APort;
+  Msg.msgh_local_port  := MACH_PORT_NULL;
+  Msg.msgh_id          := WAKEUP_MSG_ID;
+  mach_msg(Msg, MACH_SEND_MSG, SizeOf(Msg), 0, MACH_PORT_NULL,
+           MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
 end;
 
-procedure CrashInstallMacOSMachHandlerForCurrentThread;
+function CrashInstallMacOSMachHandlerForCurrentThread: Boolean;
 var
   Task: mach_port_t;
   KR:   kern_return_t;
   Attr: pthread_attr_t;
   Th:   pthread_t;
   Thr:  thread_act_t;
-begin
-  // One-time: allocate the receive port (+ a send right) and spin the watcher.
-  if TInterlocked.CompareExchange(GInstalled, 1, 0) = 0 then
+  Port: mach_port_t;
+  Token: Int64;
+
+  procedure ReleasePort(const AHasSendRight: Boolean);
   begin
-    Task := mach_task_self;
-    KR := mach_port_allocate(Task, MACH_PORT_RIGHT_RECEIVE, GExcPort);
-    if KR <> KERN_SUCCESS then begin GExcPort := 0; MachSetupRollback; Exit; end;
-    KR := mach_port_insert_right(Task, GExcPort, GExcPort, MACH_MSG_TYPE_MAKE_SEND);
-    if KR <> KERN_SUCCESS then begin MachSetupRollback; Exit; end;
-    if pthread_attr_init(Attr) <> 0 then begin MachSetupRollback; Exit; end;
-    pthread_attr_setdetachstate(Attr, PTHREAD_CREATE_DETACHED);
-    if pthread_create(Th, Attr, @ExcWatcherThread, nil) <> 0 then
-    begin
-      pthread_attr_destroy(Attr);
-      MachSetupRollback;
-      Exit;
-    end;
-    pthread_attr_destroy(Attr);
+    if AHasSendRight then
+      mach_port_deallocate(mach_task_self, Port);
+    mach_port_mod_refs(mach_task_self, Port, MACH_PORT_RIGHT_RECEIVE, -1);
   end;
 
-  if GExcPort = 0 then
-    Exit; // setup failed earlier - stay out of the way of the RTL
+begin
+  Result := False;
+  Port := 0;
+  Token := 0;
+  // ONE lock serializes setup, rollback, thread registration and the
+  // watcher's terminal teardown. Registration thus holds a lease on the port
+  // object for the whole thread_set_exception_ports call: a teardown cannot
+  // release the rights (and the kernel cannot recycle the name) mid-syscall.
+  // The lock never appears on the crash path - the watcher takes it only in
+  // its terminal branch.
+  GLock.Enter;
+  try
+    if GToken = 0 then
+    begin
+      // First setup, or a retry after a rollback / terminal teardown.
+      Task := mach_task_self;
+      KR := mach_port_allocate(Task, MACH_PORT_RIGHT_RECEIVE, Port);
+      if KR <> KERN_SUCCESS then
+        Exit;
+      KR := mach_port_insert_right(Task, Port, Port, MACH_MSG_TYPE_MAKE_SEND);
+      if KR <> KERN_SUCCESS then begin ReleasePort(False); Exit; end;
+      if pthread_attr_init(Attr) <> 0 then begin ReleasePort(True); Exit; end;
+      // Must be detached: nothing joins this thread, and a joinable one would
+      // leak its kernel resources for the process lifetime.
+      if pthread_attr_setdetachstate(Attr, PTHREAD_CREATE_DETACHED) <> 0 then
+      begin
+        pthread_attr_destroy(Attr);
+        ReleasePort(True);
+        Exit;
+      end;
+      // Publish the token BEFORE the watcher is born: the watcher recognises
+      // itself as live (or stale) by comparing GToken with its own token from
+      // its very first receive error on.
+      Token := (Int64(TInterlocked.Increment(GGenSeq)) shl 32) or Int64(Port);
+      TInterlocked.Exchange(GToken, Token);
+      if pthread_create(Th, Attr, @ExcWatcherThread, Pointer(Token)) <> 0 then
+      begin
+        pthread_attr_destroy(Attr);
+        TInterlocked.Exchange(GToken, 0); // no watcher was born - full rollback
+        ReleasePort(True);
+        Exit;
+      end;
+      pthread_attr_destroy(Attr);
+    end
+    else
+      Port := mach_port_t(GToken and $FFFFFFFF); // live setup - register on its port
 
-  // Register THIS thread's exception port (thread-level -> tried before the
-  // task-level RTL port). EXCEPTION_STATE_IDENTITY + MACHINE_THREAD_STATE mirror
-  // the RTL so the kernel hands us the same message shape it gives the RTL.
-  Thr := mach_thread_self;
-  thread_set_exception_ports(Thr,
-    EXC_MASK_BAD_ACCESS or EXC_MASK_ARITHMETIC or EXC_MASK_BAD_INSTRUCTION,
-    GExcPort, EXCEPTION_STATE_IDENTITY, MACHINE_THREAD_STATE);
-  mach_port_deallocate(mach_task_self, Thr); // mach_thread_self returns a +1 send right
+    // Register THIS thread's exception port (thread-level -> tried before the
+    // task-level RTL port). EXCEPTION_STATE_IDENTITY + MACHINE_THREAD_STATE
+    // mirror the RTL so the kernel hands us the same message shape it gives
+    // the RTL.
+    Thr := mach_thread_self;
+    KR := thread_set_exception_ports(Thr,
+      EXC_MASK_BAD_ACCESS or EXC_MASK_ARITHMETIC or EXC_MASK_BAD_INSTRUCTION,
+      Port, EXCEPTION_STATE_IDENTITY, MACHINE_THREAD_STATE);
+    mach_port_deallocate(mach_task_self, Thr); // mach_thread_self returns a +1 send right
+    if KR <> KERN_SUCCESS then
+    begin
+      // The thread stays uncovered - report that instead of pretending. A
+      // setup born in THIS call is rolled back: clear the token and ping the
+      // watcher, which then releases the port ITSELF (never us - that is what
+      // keeps the port name un-recyclable while the watcher is alive). An
+      // established setup keeps serving its covered threads.
+      if Token <> 0 then
+      begin
+        TInterlocked.Exchange(GToken, 0);
+        WakeWatcher(Port);
+      end;
+      Exit;
+    end;
+    Result := True;
+  finally
+    GLock.Leave;
+  end;
 end;
 
 {$ELSE}  // ---- not macOS x86-64: no-op stub ----
 
-procedure CrashInstallMacOSMachHandlerForCurrentThread;
+function CrashInstallMacOSMachHandlerForCurrentThread: Boolean;
 begin
+  Result := True; // nothing to cover on this target
 end;
 
+{$ENDIF}
+
+{$IF Defined(MACOS) and Defined(CPUX64)}
+initialization
+  GLock := TCriticalSection.Create; // process-lifetime (see its declaration)
 {$ENDIF}
 
 end.
