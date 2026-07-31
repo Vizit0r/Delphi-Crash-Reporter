@@ -71,7 +71,9 @@ type
 var
   P:     PInteger;
   A:     Integer;
+  {$IF Defined(LINUX)}
   HighP: Pointer;
+  {$ENDIF}
   W:     TThread;
 begin
   if AKind = 'segv' then
