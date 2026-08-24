@@ -55,6 +55,8 @@ uses
   System.SysUtils,
   System.Classes,
   System.IOUtils,
+  Androidapi.AssetManager,
+  Androidapi.NativeActivity,
   Posix.Dlfcn,
   Posix.Stdlib;
 
@@ -187,6 +189,61 @@ begin
     APath := String(Info.dli_fname);
 end;
 
+{ ---- side-file bytes: the APK asset is the source of truth ---- }
+
+{ The deployed asset is read straight out of the APK, NOT the copy that
+  System.StartUpCopy extracts to the documents dir: that copy is written only
+  when the destination does not exist yet ("do not overwrite files" in the RTL),
+  so after an app update it still belongs to the previous build and its build-id
+  no longer matches the running .so - which is exactly when symbols are wanted.
+  The extracted copy stays as a fallback for hosts that ship the side-file
+  without packaging it as an asset; both paths go through the same build-id
+  check, so a stale one can never produce wrong names. }
+function ReadDeployedSideFile(const AAssetName, AFallbackPath: String): TBytes;
+var
+  Mgr: PAAssetManager;
+  Asset: PAAsset;
+  Len, Total: Int64;
+  Got: Integer;
+  M: TMarshaller;
+begin
+  Result := nil;
+  if System.DelphiActivity <> nil then
+  begin
+    Mgr := ANativeActivity(System.DelphiActivity^).assetManager;
+    if Mgr <> nil then
+    begin
+      Asset := AAssetManager_open(Mgr, M.AsUtf8(AAssetName).ToPointer,
+        AASSET_MODE_STREAMING);
+      if Asset <> nil then
+      try
+        Len := Int64(AAsset_getLength(Asset));
+        if (Len > 0) and (Len < High(Integer)) then
+        begin
+          SetLength(Result, Integer(Len));
+          Total := 0;
+          repeat
+            Got := AAsset_read(Asset, @Result[Total], Len - Total);
+            if Got <= 0 then
+              Break;
+            Inc(Total, Got);
+          until Total >= Len;
+          if Total <> Len then
+            Result := nil; // short read - let the fallback have a go
+        end;
+      finally
+        AAsset_close(Asset);
+      end;
+    end;
+  end;
+  if (Result = nil) and TFile.Exists(AFallbackPath) then
+    try
+      Result := TFile.ReadAllBytes(AFallbackPath);
+    except
+      Result := nil;
+    end;
+end;
+
 { ---- .gol (GOLN) line-number decode (same format as Crash.LineNumbers) ---- }
 
 function ReadGolVarInt(const ABytes: TBytes; var APos: Integer; const AEnd: Integer;
@@ -211,21 +268,14 @@ begin
   GGolRelAddrs := nil; GGolLines := nil;
 end;
 
-procedure LoadGol(const APath: String; const AId: TBuildId);
+procedure LoadGol(const B: TBytes; const AId: TBuildId);
 var
-  B: TBytes;
   Sig, Ver, Sz: UInt32;
   Count, I, Pos, EndPos, J: Integer;
   RelAddr, A1, A2: UInt32;
   Line: Integer;
   Op, Op2: Byte;
 begin
-  if not TFile.Exists(APath) then Exit;
-  try
-    B := TFile.ReadAllBytes(APath);
-  except
-    Exit;
-  end;
   if Length(B) < GOLN_HDR_SIZE then Exit;
   Sig := PUInt32(@B[0])^;
   Ver := PUInt32(@B[4])^;
@@ -312,7 +362,7 @@ end;
 
 procedure CrashInitAndroidSymbols;
 var
-  SoPath, GosymPath: String;
+  SoPath, SoName: String;
   ImgId: TBuildId;
   HdrSig, HdrVer, HdrSize, HdrCount: UInt32;
   HdrStrTabOff, HdrStrTabSize, HdrFileTabOff, HdrFileTabSize: UInt32;
@@ -328,23 +378,16 @@ begin
   if not ReadElfBuildId(SoPath, ImgId) then
     Exit; // no build-id in the running .so -> can't trust a side-file match
 
+  // Both side-files are deployed into the APK as assets\internal\<so-base>.<ext>;
+  // an asset name is the path relative to assets\.
+  SoName := ExtractFileName(SoPath);
+
   // Line numbers (.gol) - independent of the name map below; best-effort.
-  LoadGol(TPath.Combine(TPath.GetDocumentsPath,
-    ExtractFileName(SoPath) + '.gol'), ImgId);
+  LoadGol(ReadDeployedSideFile('internal/' + SoName + '.gol',
+    TPath.Combine(TPath.GetDocumentsPath, SoName + '.gol')), ImgId);
 
-  // The .gosym ships next to the app's data (deployed to assets\internal -> the
-  // app documents dir), named "<so-basename>.gosym".
-  GosymPath := TPath.Combine(TPath.GetDocumentsPath,
-    ExtractFileName(SoPath) + '.gosym');
-  if not TFile.Exists(GosymPath) then
-    Exit;
-
-  try
-    GData := TFile.ReadAllBytes(GosymPath);
-  except
-    GData := nil;
-    Exit;
-  end;
+  GData := ReadDeployedSideFile('internal/' + SoName + '.gosym',
+    TPath.Combine(TPath.GetDocumentsPath, SoName + '.gosym'));
   if Length(GData) < HEADER_SIZE then begin GData := nil; Exit; end;
 
   HdrSig         := PUInt32(@GData[0])^;

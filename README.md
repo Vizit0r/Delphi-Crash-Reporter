@@ -174,8 +174,8 @@ APK asset on Android — the mobile deploy is shared with `.gosym`, see *Functio
 - **Android**: the same `LNG_ELF` reads DWARF from the **unstripped** `.so`. Link with
   `--build-id=sha1` so the reader can match the `.gol` to the stripped, on-device `.so`
   (which keeps the build-id note but drops DWARF). Lines resolve identically to Linux;
-  what differs is only where the file is found at runtime (the app documents dir, not
-  next to the binary).
+  what differs is only where the file is found at runtime (the APK asset, not next to
+  the binary).
 
 All emit the same `.gol` byte format that `Crash.LineNumbers` reads at runtime.
 
@@ -291,9 +291,14 @@ Both files are produced together and shipped together:
 2. From the just-linked **unstripped** `.so`, run `LNG_ELF` → `<so>.gol` and
    `gen-android-symfile.ps1` → `<so>.gosym`. Regenerate every build (a fresh link gives a
    new build-id; a stale side-file is rejected, not mis-read).
-3. Ship both inside the APK as assets with RemoteDir `assets\internal\`, which lands them
-   in the app's documents dir — where `Crash.Android.Symbols` / `Crash.LineNumbers` look
-   for `<so-name>.gosym` / `<so-name>.gol`.
+3. Ship both inside the APK as assets with RemoteDir `assets\internal\`.
+   `Crash.Android.Symbols` reads them **from the APK asset** (`internal/<so-name>.gosym`
+   / `.gol`) via the `AAssetManager`, falling back to a copy in the app documents dir.
+   Do not rely on that copy: Delphi's `System.StartUpCopy` extracts an asset only when
+   the destination does not exist yet (`if not FileExists(DestFileName) then //do not
+   overwrite files`), so after an app update the extracted side-file still belongs to the
+   previous build and is rejected on the build-id check — silently costing you names and
+   lines on exactly the reports you care about.
 4. **Archive the unstripped `.so` per release** so any leftover `module + offset` report
    (a no-DWARF frame, or an old report whose side-files were lost) can still be symbolized
    offline against it.
