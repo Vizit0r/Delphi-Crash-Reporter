@@ -115,6 +115,11 @@ type
     FreezeDetection: Boolean;
     { No-heartbeat threshold before a freeze report is captured. Default 30000. }
     FreezeTimeoutMS: Integer;
+    { Restart the process after a freeze report (hard restart + notification
+      on the next boot). Default False. NOT IMPLEMENTED YET - reserved so host
+      configs stay stable: the restart stage arrives once the report-only
+      detector has proven itself; until then the flag is accepted and ignored. }
+    RestartOnFreeze: Boolean;
     { Fired (on the WATCHDOG thread) after a freeze report is handled - lets
       the host log/notify. Keep it cheap and thread-safe. }
     OnFreezeReport: TCrashFreezeReportProc;
@@ -163,10 +168,10 @@ type
       Crash Signal Info section says so too). }
     class function MainThreadMachCovered: Boolean; static;
 
-    { Enable the freeze detector after Init (e.g. from a CLI switch parsed
-      later in startup). Equivalent to Init with FreezeDetection=True; no-op
-      when the reporter is not installed. Must be called on the watched
-      (main) thread - it is the capture target. }
+    { Enable the freeze detector after Init (late opt-in, e.g. from a host
+      setting evaluated after startup). Equivalent to Init with
+      FreezeDetection=True; no-op when the reporter is not installed. Must be
+      called on the watched (main) thread - it is the capture target. }
     class procedure EnableFreezeDetection(const ATimeoutMS: Integer); static;
   end;
 
@@ -206,6 +211,7 @@ begin
   Result.AllowRestart := True;
   Result.FreezeDetection := False; // opt in - see the field comment
   Result.FreezeTimeoutMS := 30000;
+  Result.RestartOnFreeze := False; // reserved - see the field comment
 end;
 
 function GetExeBaseName: String; inline;

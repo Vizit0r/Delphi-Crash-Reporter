@@ -32,9 +32,16 @@ unit Crash.Freeze;
       reporter mute it while an exception report/dialog is in flight.
 
   Scope:
-    - Linux x86-64 (active).
-    - Everything else - the API compiles to no-op stubs (Windows is EurekaLog
-      territory; macOS/Android arrive in later stages). }
+    - Linux x86-64.
+    - macOS x86-64 (Intel) + ARM64 (Apple Silicon): same watchdog; the
+      capture signal is SIGUSR2 (no realtime signals on macOS) and the
+      in-handler walk is libSystem backtrace.
+    - Android ARM64: same realtime-signal path as Linux (bionic exports the
+      same libc probes); the in-handler walk is libunwind, as the exception
+      path uses. Note the OS's own ANR machinery only helps with device
+      access - this detector is what makes field hangs reportable.
+    - Everything else (Windows, iOS, 32-bit ARM) - no-op stubs (Windows is
+      EurekaLog territory). }
 
 interface
 
@@ -103,8 +110,17 @@ type
 
 implementation
 
-{$IF Defined(LINUX) and Defined(CPUX64)}
+{$IF (Defined(LINUX) and Defined(CPUX64)) or
+     (Defined(ANDROID) and Defined(CPUARM64)) or
+     (Defined(MACOS) and not Defined(IOS) and (Defined(CPUX64) or Defined(CPUARM64)))}
   {$DEFINE CRASH_FREEZECAP}
+{$ENDIF}
+
+// bionic shares glibc's realtime-signal probes and sigaction union layout -
+// the platform branches below select on this combined symbol (macOS keeps
+// its own branches). Mirrors CRASH_LINUXLIKE in Crash.Signals.
+{$IF Defined(LINUX) or Defined(ANDROID)}
+  {$DEFINE CRASH_FREEZE_LINUXLIKE}
 {$ENDIF}
 
 {$IF Defined(CRASH_FREEZECAP)}
@@ -126,13 +142,21 @@ const
   MIN_TIMEOUT_MS       = 1000;
   MAX_EPISODES_PER_RUN = 5;    // report-noise cap; later episodes are detected but silent
 
-{ _Unwind_Backtrace over libgcc - same choice as Crash.CallStack (glibc's
-  backtrace() emits garbage IPs for deep FMX/RTL stacks; libgcc walks
-  .eh_frame directly). Declarations duplicated here because they are
-  implementation-local there and this handler needs a NO-ALLOCATION variant
-  writing into a pre-allocated slot. }
+{ In-handler stack walk, per platform - same choices as Crash.CallStack
+  (glibc's backtrace() emits garbage IPs for deep stacks, so Linux goes over
+  libgcc; Android64 links the NDK libunwind; macOS backtrace is fine).
+  Declarations duplicated here because they are implementation-local there
+  and this handler needs a NO-ALLOCATION variant writing into a
+  pre-allocated slot. }
+{$IF Defined(MACOS)}
+
 const
-  libgccs = 'libgcc_s.so.1';
+  libSystem = '/usr/lib/libSystem.dylib';
+
+function backtrace(buffer: PPointer; size: Integer): Integer; cdecl;
+  external libSystem name 'backtrace';
+
+{$ELSE} // Linux x64 / Android64: _Unwind_Backtrace
 
 type
   _PUnwind_Context = Pointer;
@@ -142,21 +166,31 @@ type
 const
   _URC_NO_REASON    = 0;
   _URC_END_OF_STACK = 5;
+  {$IF Defined(LINUX)}
+  LIB_UNWIND = 'libgcc_s.so.1';
+  {$ELSE}
+  LIB_UNWIND = 'libunwind.a';
+  {$ENDIF}
 
 type
   _Unwind_Trace_Fn = function(context: _PUnwind_Context; userdata: Pointer): _Unwind_Reason_code; cdecl;
 
 procedure _Unwind_Backtrace(fn: _Unwind_Trace_Fn; userdata: Pointer); cdecl;
-  external libgccs name '_Unwind_Backtrace';
+  external LIB_UNWIND name '_Unwind_Backtrace';
 function _Unwind_GetIP(context: _PUnwind_Context): _Unwind_Ptr; cdecl;
-  external libgccs name '_Unwind_GetIP';
+  external LIB_UNWIND name '_Unwind_GetIP';
 
-{ glibc reserves the first few kernel RT signals for NPTL; the usable range
-  starts at __libc_current_sigrtmin. Raw SIGRTMIN constants would collide. }
+{$ENDIF}
+
+{$IF Defined(CRASH_FREEZE_LINUXLIKE)}
+{ glibc/bionic reserve the first few kernel RT signals for the runtime; the
+  usable range starts at __libc_current_sigrtmin. Raw SIGRTMIN constants
+  would collide. }
 function __libc_current_sigrtmin: Integer; cdecl;
   external libc name _PU + '__libc_current_sigrtmin';
 function __libc_current_sigrtmax: Integer; cdecl;
   external libc name _PU + '__libc_current_sigrtmax';
+{$ENDIF}
 
 type
   { Capture slot, pre-allocated. Claimed/Captured follow the same atomic
@@ -180,6 +214,7 @@ var
   GInstalled:     Boolean = False;
   GWatchdog:      TThread = nil;
 
+{$IF not Defined(MACOS)}
 function FreezeUnwindCallback(AContext: _PUnwind_Context; AUserData: Pointer): _Unwind_Reason_code; cdecl;
 begin
   if GTrace.Count >= FREEZE_MAX_FRAMES then
@@ -188,21 +223,29 @@ begin
   Inc(GTrace.Count);
   Result := _URC_NO_REASON;
 end;
+{$ENDIF}
 
 procedure CrashFreezeSignalHandler(SigNum: Integer; SigInfo: Psiginfo_t;
   Context: Pointer); cdecl;
 // Runs ON the frozen thread, on its normal stack. Async-signal-safety: atomic
-// flag writes, a ucontext read and _Unwind_Backtrace into a pre-allocated
-// slot - no allocations, no formatting. _Unwind_Backtrace is the same walk
-// the Pascal RTL exception path performs in (post-)signal context on this
-// target; it crosses the kernel signal frame via its CFI, so the trace
-// continues into the interrupted (frozen) chain.
+// flag writes, a ucontext read and a stack walk into a pre-allocated slot -
+// no allocations, no formatting. The walk is the same one the exception path
+// performs in (post-)signal context on each target; it crosses the kernel
+// signal frame via its unwind info, so the trace continues into the
+// interrupted (frozen) chain - and if it does not, the watchdog still has
+// the exact interrupted IP from the ucontext (see BuildAddressList).
 begin
   if TInterlocked.CompareExchange(GTrace.Claimed, 1, 0) <> 0 then
     Exit;
   GTrace.InterruptedIP := CrashContextInstructionPointer(Context);
+  {$IF Defined(MACOS)}
+  GTrace.Count := backtrace(PPointer(@GTrace.Addrs[0]), FREEZE_MAX_FRAMES);
+  if GTrace.Count < 0 then
+    GTrace.Count := 0;
+  {$ELSE}
   GTrace.Count := 0;
   _Unwind_Backtrace(FreezeUnwindCallback, @GTrace);
+  {$ENDIF}
   TInterlocked.Exchange(GTrace.Captured, 1);
 end;
 
@@ -378,18 +421,27 @@ end;
 class procedure TCrashFreeze.Install(const ATimeoutMS: Integer);
 var
   Act: sigaction_t;
+  {$IF Defined(CRASH_FREEZE_LINUXLIKE)}
   RtMin, RtMax: Integer;
+  {$ENDIF}
 begin
   if GInstalled then
   begin
     GTimeoutMS := Max(Int64(MIN_TIMEOUT_MS), Int64(ATimeoutMS));
     Exit;
   end;
+  {$IF Defined(CRASH_FREEZE_LINUXLIKE)}
   RtMin := __libc_current_sigrtmin;
   RtMax := __libc_current_sigrtmax;
-  GFreezeSignal := RtMin + 5; // clear of NPTL (below RtMin) and of common RT users at RtMin+0..1
+  GFreezeSignal := RtMin + 5; // clear of the runtime-reserved range (below RtMin) and of common RT users at RtMin+0..1
   if (RtMin <= 0) or (GFreezeSignal > RtMax) then
     Exit; // no usable realtime signal - the detector stays inactive
+  {$ELSE}
+  // macOS has no realtime signals; SIGUSR2 is free here (hardware faults go
+  // through Mach exception ports, not this signal, and nothing else in the
+  // process claims it).
+  GFreezeSignal := SIGUSR2;
+  {$ENDIF}
 
   GWatchedThread := pthread_self; // Install runs on the thread to be watched
   GTimeoutMS := Max(Int64(MIN_TIMEOUT_MS), Int64(ATimeoutMS));
@@ -397,7 +449,12 @@ begin
   FillChar(GTrace, SizeOf(GTrace), 0);
 
   FillChar(Act, SizeOf(Act), 0);
+  // The handler union field has different names on Linux-like vs macOS.
+  {$IF Defined(CRASH_FREEZE_LINUXLIKE)}
   Act._u.sa_sigaction := CrashFreezeSignalHandler;
+  {$ELSE}
+  Act.__sigaction_handler.sa_sigaction := CrashFreezeSignalHandler;
+  {$ENDIF}
   // SA_RESTART: see the unit header. No SA_ONSTACK: not a stack-overflow
   // scenario, and the process-wide alternate stack belongs to the crash
   // handlers (Crash.Signals).
