@@ -51,9 +51,13 @@ function CrashBuildELReportText(
   Passed down to CrashTakeAndFormatSnapshots so the pending CPU snapshot is
   correlated with THIS exception before being attributed to it (a foreign-thread
   or stale snapshot is demoted into the Crash Signal Info section instead of
-  masquerading as this exception's Registers). 0 = unknown, skips the check. }
+  masquerading as this exception's Registers). 0 = unknown, skips the check.
+  ATakeSnapshot=False builds the context WITHOUT consuming the pending
+  hardware snapshot - for reports that are not exceptions (the freeze
+  detector): the snapshot belongs to the exception flow and must stay armed. }
 function CrashDefaultELContext(const AStartTime: TDateTime = 0;
-  const AExceptAddr: UIntPtr = 0): TCrashELContext;
+  const AExceptAddr: UIntPtr = 0;
+  const ATakeSnapshot: Boolean = True): TCrashELContext;
 
 { EurekaLog-style BugID for AReport (CRC-32 over the relocation-independent
   identities of the exception location + same-module call-stack frames). The same
@@ -553,7 +557,12 @@ begin
     end;
     AppendField(SB, '2.3 Module Name',    ACtx.AppName, 18);
     AppendField(SB, '2.4 Module Version', ACtx.AppVersion, 18);
-    AppendField(SB, '2.5 Type',           'Exception', 18);
+    // Real class name when the capture knows it (EL emits the class here too);
+    // 'Exception' only as the legacy fallback for class-less reports.
+    if AReport.ExceptionClassName <> '' then
+      AppendField(SB, '2.5 Type',         AReport.ExceptionClassName, 18)
+    else
+      AppendField(SB, '2.5 Type',         'Exception', 18);
     AppendField(SB, '2.6 Message',        AReport.ExceptionMessage, 18);
     AppendField(SB, '2.7 ID',             CrashGenerateExceptionID(AReport), 18);
     AppendField(SB, '2.8 Count',          '1', 18);
@@ -841,7 +850,7 @@ end;
 {$ENDIF}
 
 function CrashDefaultELContext(const AStartTime: TDateTime;
-  const AExceptAddr: UIntPtr): TCrashELContext;
+  const AExceptAddr: UIntPtr; const ATakeSnapshot: Boolean): TCrashELContext;
 var
   I: Integer;
   Params: TStringList;
@@ -869,7 +878,8 @@ begin
   // Take both sections in one call (the snapshot is reset, a second call can't
   // give the same data). If the handler didn't fire - both empty. AExceptAddr
   // lets the take correlate the snapshot with the exception being reported.
-  CrashTakeAndFormatSnapshots(AExceptAddr, Result.CpuSnapshot, Result.SignalInfoSection);
+  if ATakeSnapshot then
+    CrashTakeAndFormatSnapshots(AExceptAddr, Result.CpuSnapshot, Result.SignalInfoSection);
   // macOS-only note: on macOS the Pascal RTL catches signals via Mach exception
   // ports (task_set_exception_ports), bypassing the POSIX sigaction layer - our
   // handler is NOT called, so Registers is always absent. We explain this in the

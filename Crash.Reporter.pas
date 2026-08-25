@@ -31,7 +31,8 @@ unit Crash.Reporter;
 interface
 
 uses
-  Crash.CallStack; // TCrashConfig, TCrashReport, TCrashReportSection(s)
+  Crash.CallStack, // TCrashConfig, TCrashReport, TCrashReportSection(s)
+  Crash.Freeze;    // TCrashFreezeInfo / TCrashFreezeReportProc (freeze detector)
 
 type
   { Shows a modal dialog with the full report text for non-fatal exceptions.
@@ -105,6 +106,18 @@ type
       to users); the executable's own directory on Linux/Windows. Trailing path
       delimiter optional. }
     ReportDir: String;
+    { Freeze (hang) detection - see Crash.Freeze. Default False (opt in): keep
+      it off until the detector has proven itself on the target app. Active
+      only on targets with capture support (currently Linux x86-64); elsewhere
+      the flag is accepted and ignored. Report-only: the frozen thread is
+      never aborted. The host must call TCrashFreeze.Ping from the watched
+      (main) loop, otherwise detection stays dormant. }
+    FreezeDetection: Boolean;
+    { No-heartbeat threshold before a freeze report is captured. Default 30000. }
+    FreezeTimeoutMS: Integer;
+    { Fired (on the WATCHDOG thread) after a freeze report is handled - lets
+      the host log/notify. Keep it cheap and thread-safe. }
+    OnFreezeReport: TCrashFreezeReportProc;
   end;
 
 { A config pre-filled with sensible defaults. Override the fields you need. }
@@ -149,6 +162,12 @@ type
       main-thread hardware-fault reports lack the Registers section (their
       Crash Signal Info section says so too). }
     class function MainThreadMachCovered: Boolean; static;
+
+    { Enable the freeze detector after Init (e.g. from a CLI switch parsed
+      later in startup). Equivalent to Init with FreezeDetection=True; no-op
+      when the reporter is not installed. Must be called on the watched
+      (main) thread - it is the capture target. }
+    class procedure EnableFreezeDetection(const ATimeoutMS: Integer); static;
   end;
 
 implementation
@@ -185,6 +204,8 @@ begin
   Result.UploadFieldName := 'el_upload_file_0';
   Result.UploadPendingOnStartup := False;
   Result.AllowRestart := True;
+  Result.FreezeDetection := False; // opt in - see the field comment
+  Result.FreezeTimeoutMS := 30000;
 end;
 
 function GetExeBaseName: String; inline;
@@ -223,9 +244,14 @@ type
       const ATerminating: Boolean);
     procedure ConsoleLine(const S: String);
     procedure WriteToFile(const AText: String);
+    function WriteReportTextToUniqueFile(const AText: String;
+      var APath: String): Boolean;
     procedure ResetAlreadyReported;
     procedure HandleReport(const AReport: TCrashReport);
     procedure DoHandleReport(const AReport: TCrashReport);
+    procedure InstallFreezeDetector;
+    procedure HandleFreezeCapture(const AReport: TCrashReport;
+      const AFrozenForMS: Int64);
     procedure ScanPendingCrashReports;
   public
     constructor Create;
@@ -247,6 +273,11 @@ end;
 
 destructor TCrashReporterImpl.Destroy;
 begin
+  // Stop the freeze watchdog BEFORE the singleton goes away: its capture and
+  // suppress hooks are closures over Self.
+  TCrashFreeze.Shutdown;
+  TCrashFreeze.OnCapture := nil;
+  TCrashFreeze.OnExternalSuppress := nil;
   TCrashCapture.OnReport := nil;
   FreeAndNil(FLock);
   inherited;
@@ -382,41 +413,50 @@ begin
   end;
 end;
 
-procedure TCrashReporterImpl.WriteToFile(const AText: String);
+function TCrashReporterImpl.WriteReportTextToUniqueFile(const AText: String;
+  var APath: String): Boolean;
+// Shared write core (exception path via WriteToFile, freeze path directly).
+// Never clobbers an existing report - appends a numeric suffix instead.
+// APath is emptied on failure so "saved to ..." messaging stays honest.
 var
   Base, Ext, Cand: String;
   N: Integer;
 begin
-  if FCrashFilePath = '' then
-    FCrashFilePath := BuildCrashFilePath;
-  // Safety net: the file name is stamped per-second (yyyymmddhhnnss), so two
-  // distinct reports in the same second (two threads crashing, or a phantom that
-  // slipped past the skip above) would collide. Never clobber an existing report -
-  // append a numeric suffix instead. The root case (the content-less phantom) is
-  // already dropped in HandleReport; this just guarantees no real report is ever
-  // overwritten by another.
-  if TFile.Exists(FCrashFilePath) then
+  if TFile.Exists(APath) then
   begin
-    Ext  := ExtractFileExt(FCrashFilePath);
-    Base := ChangeFileExt(FCrashFilePath, '');
+    Ext  := ExtractFileExt(APath);
+    Base := ChangeFileExt(APath, '');
     N := 2;
     repeat
       Cand := Base + '_' + IntToStr(N) + Ext;
       Inc(N);
     until not TFile.Exists(Cand);
-    FCrashFilePath := Cand;
+    APath := Cand;
   end;
   try
     // A custom ReportDir may not exist yet; the platform defaults always do.
-    ForceDirectories(ExtractFilePath(FCrashFilePath));
+    ForceDirectories(ExtractFilePath(APath));
     // UTF-16LE + BOM - same encoding as a Windows EL build, so the Viewer
     // accepts it.
-    TFile.WriteAllText(FCrashFilePath, AText, TEncoding.Unicode);
+    TFile.WriteAllText(APath, AText, TEncoding.Unicode);
+    Result := True;
   except
-    // Crashing inside a crash handler is the worst outcome. Stay silent, but
-    // drop the path so the "saved to ..." messaging stays honest.
-    FCrashFilePath := '';
+    // Crashing inside a crash handler is the worst outcome. Stay silent.
+    APath := '';
+    Result := False;
   end;
+end;
+
+procedure TCrashReporterImpl.WriteToFile(const AText: String);
+begin
+  if FCrashFilePath = '' then
+    FCrashFilePath := BuildCrashFilePath;
+  // Safety net: the file name is stamped per-second (yyyymmddhhnnss), so two
+  // distinct reports in the same second (two threads crashing, or a phantom that
+  // slipped past the skip above) would collide. The unique-suffix logic in the
+  // write core guarantees no real report is ever overwritten by another (the
+  // root case - the content-less phantom - is already dropped in HandleReport).
+  WriteReportTextToUniqueFile(AText, FCrashFilePath);
 end;
 
 procedure TCrashReporterImpl.ResetAlreadyReported;
@@ -672,9 +712,110 @@ begin
   // by the host where Application exists (the FMX .dpr).
   TCrashCapture.OnReport := HandleReport;
 
+  if FConfig.FreezeDetection then
+    InstallFreezeDetector;
+
   // Boot-recovery: pick up crash files from previous runs. Done after wiring the
   // handler so any exception during the scan lands in our handler too.
   ScanPendingCrashReports;
+end;
+
+procedure TCrashReporterImpl.InstallFreezeDetector;
+begin
+  // OnExternalSuppress mutes detection while an exception report is in
+  // flight: FAlreadyReported spans capture -> write/upload -> dialog close -
+  // exactly the window where the main loop may legitimately stall on our own
+  // machinery. Unlocked read: advisory polling, a stale value only shifts
+  // detection by one watchdog quantum.
+  TCrashFreeze.OnExternalSuppress :=
+    function: Boolean
+    begin
+      Result := FAlreadyReported;
+    end;
+  TCrashFreeze.OnCapture := HandleFreezeCapture;
+  TCrashFreeze.Install(FConfig.FreezeTimeoutMS);
+end;
+
+procedure TCrashReporterImpl.HandleFreezeCapture(const AReport: TCrashReport;
+  const AFrozenForMS: Int64);
+// Freeze path - runs on the WATCHDOG thread while the watched (main) thread
+// is frozen. Deliberately touches NONE of the exception-path bookkeeping
+// (FAlreadyReported / FCrashFilePath / FExceptionID): a freeze report must
+// not steal a concurrent crash's file name or anti-cascade state.
+var
+  Ctx: TCrashELContext;
+  Text, Path, FreezeNote: String;
+  Info: TCrashFreezeInfo;
+begin
+  Info := Default(TCrashFreezeInfo);
+  Info.FrozenForMS := AFrozenForMS;
+  Info.StackCaptured := Length(AReport.CallStack) > 0;
+
+  // ATakeSnapshot=False: a pending hardware snapshot belongs to the exception
+  // flow - the freeze report must not consume (or wear) it.
+  Ctx := CrashDefaultELContext(FAppStartTime, 0, False);
+  if FConfig.AppName <> '' then Ctx.AppName := FConfig.AppName;
+  Ctx.AppVersion := FConfig.AppVersion;
+  Ctx.CompileTime := FConfig.CompilationTime;
+  Ctx.DisabledSections := FConfig.DisabledSections;
+  // The report describes the frozen MAIN thread, not the watchdog.
+  Ctx.ThreadID := Cardinal(MainThreadID);
+  Ctx.ThreadName := 'MAIN';
+  FreezeNote :=
+    'Freeze Info:' + #13#10 +
+    '-------------' + #13#10 +
+    Format('  Detected   : no heartbeat from the watched (main) thread for %d ms',
+      [AFrozenForMS]) + #13#10 +
+    '  Captured by: freeze watchdog (Crash.Freeze); the call stack above is' + #13#10 +
+    '               the FROZEN thread''s, captured in place via signal.' + #13#10;
+  if not Info.StackCaptured then
+    FreezeNote := FreezeNote +
+      '  Note       : stack capture FAILED (the frozen thread never ran the' + #13#10 +
+      '               capture handler - e.g. parked in uninterruptible I/O);' + #13#10 +
+      '               only the freeze fact and duration are reported.' + #13#10;
+  if Ctx.SignalInfoSection <> '' then
+    Ctx.SignalInfoSection := FreezeNote + #13#10 + Ctx.SignalInfoSection
+  else
+    Ctx.SignalInfoSection := FreezeNote;
+
+  Text := CrashBuildELReportText(AReport, Ctx);
+  Info.BugID := CrashGenerateExceptionID(AReport);
+
+  Path := '';
+  if FConfig.SaveToFile then
+  begin
+    Path := EffectiveReportDir + EffectiveFileNamePrefix + Info.BugID + '.el';
+    WriteReportTextToUniqueFile(Text, Path);
+  end;
+  Info.ReportFile := Path;
+
+  if Path <> '' then
+    ConsoleLine(Format('*** freeze detected (%d ms) - report saved to %s ***',
+      [AFrozenForMS, Path]))
+  else
+    ConsoleLine(Format('*** freeze detected (%d ms) ***', [AFrozenForMS]));
+
+  // Same policy as the non-fatal exception path: try to send, delete the
+  // local file on success, otherwise leave it for boot recovery.
+  try
+    if TCrashReporter.Upload(Text, ExtractFileName(Path)) then
+    begin
+      Info.Uploaded := True;
+      if Path <> '' then
+        try TFile.Delete(Path); except end;
+      Info.ReportFile := '';
+      ConsoleLine('Upload: OK (freeze report sent, local file removed)');
+    end;
+  except
+    // Network failure keeps the file on disk; nothing else to do.
+  end;
+
+  if Assigned(FConfig.OnFreezeReport) then
+  try
+    FConfig.OnFreezeReport(Info);
+  except
+    // A host notification failure must not kill the watchdog.
+  end;
 end;
 
 function CrashUploadCore(const AUrl, AFieldName, AReportText,
@@ -915,6 +1056,16 @@ end;
 class function TCrashReporter.MainThreadMachCovered: Boolean;
 begin
   Result := (GReporter = nil) or GReporter.FMachMainThreadCovered;
+end;
+
+class procedure TCrashReporter.EnableFreezeDetection(const ATimeoutMS: Integer);
+begin
+  if (GReporter = nil) or (not GReporter.FInstalled) then
+    Exit;
+  GReporter.FConfig.FreezeDetection := True;
+  if ATimeoutMS > 0 then
+    GReporter.FConfig.FreezeTimeoutMS := ATimeoutMS;
+  GReporter.InstallFreezeDetector;
 end;
 
 class function TCrashReporter.CanRestart: Boolean;

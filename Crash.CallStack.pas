@@ -211,6 +211,24 @@ type
 
       Set to 0 to disable call stacks altogether. }
     class property MaxCallStackDepth: Integer read GetMaxCallStackDepth write SetMaxCallStackDepth;
+
+    { Support for the freeze detector (Crash.Freeze): the watchdog thread
+      builds a report for ANOTHER (frozen) thread. }
+
+    { Cross-thread report gate - the same single-flight flag the exception
+      path uses (FReportingException). The freeze watchdog holds it while
+      symbolizing/formatting so it never races a crashing thread's resolver
+      state (module readers, line-number caches). While held, a concurrent
+      exception loses its call stack (GetExceptionStackInfo bails out) - rare
+      and acceptable; the crash itself is still reported. False when the
+      singleton does not exist (Windows) or the gate is busy. }
+    class function TryEnterReportGate: Boolean; static;
+    class procedure LeaveReportGate; static;
+
+    { Symbolize a raw address list into a TCrashStack (dladdr + demangle +
+      line numbers) - the same pipeline the exception path applies to its
+      backtrace. nil when call stacks are unsupported on this target. }
+    class function SymbolizeAddressList(const AAddrs: array of UIntPtr): TCrashStack; static;
   end;
 
 implementation
@@ -1092,6 +1110,43 @@ begin
   if (FLineNumberInfo = nil) then
     FLineNumberInfo := TLineNumberInfo.Create;
   Result := FLineNumberInfo;
+end;
+{$ENDIF}
+
+class function TCrashCapture.TryEnterReportGate: Boolean;
+begin
+  Result := (FInstance <> nil) and
+    (TInterlocked.CompareExchange(FInstance.FReportingException, 1, 0) = 0);
+end;
+
+class procedure TCrashCapture.LeaveReportGate;
+begin
+  if FInstance <> nil then
+    TInterlocked.Exchange(FInstance.FReportingException, 0);
+end;
+
+class function TCrashCapture.SymbolizeAddressList(
+  const AAddrs: array of UIntPtr): TCrashStack;
+{$IF Defined(MACOS) or Defined(ANDROID) or Defined(LINUX)}
+var
+  I: Integer;
+begin
+  Result := nil;
+  if (FInstance = nil) or (Length(AAddrs) = 0) then
+    Exit;
+  SetLength(Result, Length(AAddrs));
+  for I := 0 to High(AAddrs) do
+  begin
+    Result[I].Clear;
+    Result[I].CodeAddress := AAddrs[I];
+    GetCallStackEntry(Result[I]);
+    if Result[I].ModuleAddress = FInstance.FModuleAddress then
+      Result[I].RoutineName := CppSymbolToPascal(Result[I].RoutineName);
+  end;
+end;
+{$ELSE}
+begin
+  Result := nil;
 end;
 {$ENDIF}
 

@@ -109,6 +109,12 @@ procedure CrashRecordMacOSSnapshot(const ARegs: TCrashMacOSRegs;
   AStackBase: UInt64; AStackBytes: Pointer; AStackLen: Integer;
   AFaultThreadID: UInt64 = 0);
 
+// RIP/PC of the interrupted context handed to a POSIX signal handler (the
+// third sigaction argument). 0 when unavailable. Exposed for Crash.Freeze:
+// its capture handler stamps the frozen thread's exact instruction with the
+// same ucontext read the crash handler uses. Async-signal-safe.
+function CrashContextInstructionPointer(AContext: Pointer): UInt64;
+
 implementation
 
 {$IF (Defined(LINUX) and Defined(CPUX64)) or
@@ -259,6 +265,11 @@ begin
   {$ELSEIF Defined(ANDROID) and Defined(CPUARM64)}
   Result := UInt64(Pucontext_t(Ctx).uc_mcontext.arm_pc);
   {$ENDIF}
+end;
+
+function CrashContextInstructionPointer(AContext: Pointer): UInt64;
+begin
+  Result := ExtractIPFromContext(AContext);
 end;
 
 procedure CaptureFromUContext(Ctx: Pointer);
@@ -1089,6 +1100,7 @@ procedure CrashRecordMacOSSnapshot(const ARegs: TCrashMacOSRegs;
   ASignalNum, ASignalCode: Integer; AFaultAddr: UInt64;
   AStackBase: UInt64; AStackBytes: Pointer; AStackLen: Integer;
   AFaultThreadID: UInt64); begin end;
+function CrashContextInstructionPointer(AContext: Pointer): UInt64; begin Result := 0; end;
 
 {$ENDIF}
 
