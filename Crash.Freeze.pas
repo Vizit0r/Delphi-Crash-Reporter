@@ -22,14 +22,18 @@ unit Crash.Freeze;
       thread (a healthy thread: no async-signal-safety constraints there).
     - Report-only: the frozen thread is never aborted and no exception is
       injected into it (EurekaLog's Windows-only trick; unreliable on POSIX).
+      Replacing the whole process instead is the reporting side's call
+      (TCrashConfig.RestartOnFreeze in Crash.Reporter, after the report).
       One report per freeze episode; the detector re-arms when pings resume.
       Episodes are capped per process run to bound report noise.
     - SA_RESTART on the capture signal: the frozen thread usually sits in a
       blocking syscall (futex/read); without it the probe would inject EINTR
       into merely-slow code and create bugs of its own.
     - Suppression: BeginLongOperation/EndLongOperation (nestable) mute
-      detection across known-legitimate stalls; OnExternalSuppress lets the
-      reporter mute it while an exception report/dialog is in flight.
+      detection across known-legitimate stalls; SetSuspended (a flag) covers
+      the mobile background, where the host cannot ping at all; and
+      OnExternalSuppress lets the reporter mute it while an exception
+      report/dialog is in flight.
 
   Scope:
     - Linux x86-64.
@@ -58,6 +62,7 @@ type
     ReportFile: String;     // .el path left on disk ('' = not saved, or uploaded-and-removed)
     Uploaded: Boolean;      // True = delivered to the endpoint (local file removed)
     StackCaptured: Boolean; // False = the frozen thread never ran the capture handler
+    Restarting: Boolean;    // True = the reporter replaces the process right after this notification (RestartOnFreeze)
   end;
 
   { Host notification after a freeze report is handled. See TCrashFreezeInfo. }
@@ -95,6 +100,17 @@ type
       from any thread. }
     class procedure BeginLongOperation; static;
     class procedure EndLongOperation; static;
+
+    { Mute detection while the host is not expected to ping at all - the
+      mobile background case. Android/iOS freeze a backgrounded process
+      (cgroup freezer / suspended runloop): the heartbeat stops but the
+      monotonic clock does not, so on return the whole background span would
+      read as one long freeze. Unlike BeginLongOperation this is a FLAG, not
+      a counter: lifecycle events arrive unpaired or repeated, and a counter
+      would leak suppression and silence the detector for good. Clearing it
+      also re-stamps the heartbeat, so the watchdog cannot fire on the gap
+      between the wake-up and the ping timer's first tick. }
+    class procedure SetSuspended(const AValue: Boolean); static;
 
     { True after a successful Install (False on stub targets). }
     class function Active: Boolean; static;
@@ -210,6 +226,7 @@ var
   GTimeoutMS:     Int64 = 0;
   GLastPingMS:    Int64 = 0;   // TThread.GetTickCount64 (CLOCK_MONOTONIC: excludes system suspend)
   GSuppress:      Integer = 0;
+  GSuspended:     Integer = 0; // host-suspended flag (see SetSuspended); separate from the nestable GSuppress
   GFreezeSignal:  Integer = -1;
   GInstalled:     Boolean = False;
   GWatchdog:      TThread = nil;
@@ -370,7 +387,8 @@ begin
       Continue; // dormant until the first ping (cold start is not a freeze)
     Now64 := Int64(TThread.GetTickCount64);
 
-    Suppressed := TInterlocked.CompareExchange(GSuppress, 0, 0) > 0;
+    Suppressed := (TInterlocked.CompareExchange(GSuppress, 0, 0) > 0) or
+                  (TInterlocked.CompareExchange(GSuspended, 0, 0) <> 0);
     if not Suppressed then
     begin
       ExternalProbe := TCrashFreeze.OnExternalSuppress;
@@ -500,6 +518,23 @@ begin
     TInterlocked.Exchange(GSuppress, 0); // unmatched End: clamp, never go negative
 end;
 
+class procedure TCrashFreeze.SetSuspended(const AValue: Boolean);
+begin
+  if AValue then
+    TInterlocked.Exchange(GSuspended, 1)
+  else
+  begin
+    // Re-stamp BEFORE clearing the flag: the watchdog keeps the grace mark
+    // fresh only while it sees the flag, and the process may have been frozen
+    // solid (watchdog included) right up to this call. Order matters - clearing
+    // first would leave a window where a stale heartbeat is fair game.
+    // Untouched when still dormant (no ping yet): arming is the host's call.
+    if TInterlocked.Read(GLastPingMS) <> 0 then
+      TInterlocked.Exchange(GLastPingMS, Int64(TThread.GetTickCount64));
+    TInterlocked.Exchange(GSuspended, 0);
+  end;
+end;
+
 class function TCrashFreeze.Active: Boolean;
 begin
   Result := GInstalled;
@@ -531,6 +566,10 @@ begin
 end;
 
 class procedure TCrashFreeze.EndLongOperation;
+begin
+end;
+
+class procedure TCrashFreeze.SetSuspended(const AValue: Boolean);
 begin
 end;
 

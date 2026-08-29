@@ -115,10 +115,16 @@ type
     FreezeDetection: Boolean;
     { No-heartbeat threshold before a freeze report is captured. Default 30000. }
     FreezeTimeoutMS: Integer;
-    { Restart the process after a freeze report (hard restart + notification
-      on the next boot). Default False. NOT IMPLEMENTED YET - reserved so host
-      configs stay stable: the restart stage arrives once the report-only
-      detector has proven itself; until then the flag is accepted and ignored. }
+    { Restart the process after a freeze report: a fresh instance is spawned
+      with the same command line and the frozen one is terminated WITHOUT unit
+      finalization (it is not runnable enough for one). A notice file is left
+      in the report dir; the next boot reads it (see TakeRestartNotice) so the
+      host can tell the user, and that boot also uploads leftover .el files -
+      delivering the report is what the restart is for. Loop guard: a run that
+      was itself freeze-restarted stays report-only until it has been up for
+      FREEZE_RESTART_MIN_UPTIME_MS, so a systematic freeze-on-startup cannot
+      restart in a loop. Gated by CanRestart (AllowRestart + platform; no-op
+      in the iOS/Android sandbox). Default False. }
     RestartOnFreeze: Boolean;
     { Fired (on the WATCHDOG thread) after a freeze report is handled - lets
       the host log/notify. Keep it cheap and thread-safe. }
@@ -127,6 +133,30 @@ type
 
 { A config pre-filled with sensible defaults. Override the fields you need. }
 function DefaultCrashConfig: TCrashConfig;
+
+type
+  { What a previous run left behind when RestartOnFreeze replaced a frozen
+    instance. Read (and consumed) from the notice file at Init; the host
+    surfaces it via TCrashReporter.TakeRestartNotice - a dialog, a journal
+    line, a log entry. }
+  TCrashRestartNotice = record
+    Found: Boolean;         // False = the previous run did not freeze-restart
+    RestartedAt: TDateTime; // when the frozen instance replaced itself
+    FrozenForMS: Int64;     // no-heartbeat span of that freeze
+    BugID: String;          // EL-style id of the freeze report
+    ReportFile: String;     // .el left on disk ('' = uploaded-and-removed, or not saved)
+    Uploaded: Boolean;      // True = the report reached the endpoint before the restart
+  end;
+
+{ Serialize / parse a freeze-restart notice file - the on-disk contract between
+  the frozen instance and its next boot. Public so hosts and tests can inspect
+  the file without an actual process restart. Read returns False when the file
+  is missing or does not carry the notice signature; neither routine touches
+  reporter state, and neither deletes the file. }
+procedure CrashWriteRestartNoticeFile(const APath: String;
+  const ANotice: TCrashRestartNotice);
+function CrashReadRestartNoticeFile(const APath: String;
+  out ANotice: TCrashRestartNotice): Boolean;
 
 type
   { Public façade. All methods are class (static) methods backed by a singleton. }
@@ -147,10 +177,23 @@ type
     class function Upload(const AReportText: String;
       const AFileName: String = ''): Boolean; static;
 
-    { Restart the process with the same parameters, then Halt. CanRestart is
-      False on sandboxed platforms (iOS/Android) or when AllowRestart=False. }
+    { Restart the process with the same parameters, then quit. CanRestart is
+      False on sandboxed platforms (iOS/Android) or when AllowRestart=False.
+      AHardExit=True quits via _exit/TerminateProcess, skipping unit
+      finalization - the freeze path needs that: finalization on the watchdog
+      thread would join the watchdog itself and can deadlock on locks the
+      frozen main thread still holds. }
     class function CanRestart: Boolean; static;
-    class procedure Restart; static;
+    class procedure Restart(const AHardExit: Boolean = False); static;
+
+    { Notice left by a previous run that freeze-restarted itself (see
+      TCrashConfig.RestartOnFreeze). Found=False when there is none. Empties
+      the stored notice (single consumer); the file itself was already
+      consumed at Init. }
+    class function TakeRestartNotice: TCrashRestartNotice; static;
+    { Full path of the freeze-restart notice file for the current config
+      (diagnostics / tests; '' before Init). }
+    class function RestartNoticeFilePath: String; static;
 
     { Basename of the last written .el (so an upload uses the same name). }
     class function LastCrashFileName: String; static;
@@ -181,6 +224,7 @@ uses
   System.Classes,
   System.SyncObjs,
   System.IOUtils,
+  System.DateUtils,
   System.Generics.Collections,
   System.Net.HttpClient,
   System.Net.Mime,
@@ -211,7 +255,7 @@ begin
   Result.AllowRestart := True;
   Result.FreezeDetection := False; // opt in - see the field comment
   Result.FreezeTimeoutMS := 30000;
-  Result.RestartOnFreeze := False; // reserved - see the field comment
+  Result.RestartOnFreeze := False; // opt in - see the field comment
 end;
 
 function GetExeBaseName: String; inline;
@@ -230,6 +274,81 @@ begin
   {$ENDIF}
 end;
 
+const
+  { First line of a freeze-restart notice file; the version tag lets a future
+    format change fail closed (an unknown notice reads as not-found). }
+  CRASH_RESTART_NOTICE_SIGNATURE = 'CrashRestartNotice v1';
+
+procedure CrashWriteRestartNoticeFile(const APath: String;
+  const ANotice: TCrashRestartNotice);
+var
+  Text: String;
+const
+  BoolChar: array [Boolean] of Char = ('0', '1');
+begin
+  // key=value lines; the timestamp is ISO 8601 so the parse never depends on
+  // the locale of either run. UTF-8: ReportFile may carry non-ASCII paths.
+  Text :=
+    CRASH_RESTART_NOTICE_SIGNATURE + #13#10 +
+    'restarted_at=' + DateToISO8601(ANotice.RestartedAt, False) + #13#10 +
+    'frozen_ms=' + IntToStr(ANotice.FrozenForMS) + #13#10 +
+    'bugid=' + ANotice.BugID + #13#10 +
+    'report_file=' + ANotice.ReportFile + #13#10 +
+    'uploaded=' + BoolChar[ANotice.Uploaded] + #13#10;
+  ForceDirectories(ExtractFilePath(APath));
+  TFile.WriteAllText(APath, Text, TEncoding.UTF8);
+end;
+
+function CrashReadRestartNoticeFile(const APath: String;
+  out ANotice: TCrashRestartNotice): Boolean;
+var
+  Lines: TArray<String>;
+  L, Key, Val: String;
+  EqPos: Integer;
+  DT: TDateTime;
+  MS: Int64;
+begin
+  ANotice := Default(TCrashRestartNotice);
+  Result := False;
+  if (APath = '') or (not TFile.Exists(APath)) then
+    Exit;
+  try
+    Lines := TFile.ReadAllLines(APath, TEncoding.UTF8);
+  except
+    Exit; // unreadable = no notice
+  end;
+  if (Length(Lines) = 0) or (Lines[0].Trim <> CRASH_RESTART_NOTICE_SIGNATURE) then
+    Exit;
+  // Fields are best-effort: a missing/garbled value keeps its default, the
+  // notice itself (signature matched) still counts.
+  for L in Lines do
+  begin
+    EqPos := Pos('=', L);
+    if EqPos <= 1 then
+      Continue;
+    Key := Copy(L, 1, EqPos - 1);
+    Val := Copy(L, EqPos + 1, MaxInt);
+    if Key = 'restarted_at' then
+    begin
+      if TryISO8601ToDate(Val, DT, False) then
+        ANotice.RestartedAt := DT;
+    end
+    else if Key = 'frozen_ms' then
+    begin
+      if TryStrToInt64(Val, MS) then
+        ANotice.FrozenForMS := MS;
+    end
+    else if Key = 'bugid' then
+      ANotice.BugID := Val
+    else if Key = 'report_file' then
+      ANotice.ReportFile := Val
+    else if Key = 'uploaded' then
+      ANotice.Uploaded := Val = '1';
+  end;
+  ANotice.Found := True;
+  Result := True;
+end;
+
 type
   TCrashReporterImpl = class
   private
@@ -241,11 +360,16 @@ type
     FExceptionID: String;       // EL-style BugID of the current report; the .el file-name token (set in HandleReport before WriteToFile)
     FPendingReports: TArray<String>;
     FAppStartTime: TDateTime;   // captured in Init for the Up Time field
+    FAppStartTick: UInt64;      // monotonic start mark for the freeze-restart loop guard
+    FRestartNotice: TCrashRestartNotice; // what the previous run's RestartOnFreeze left behind (consumed via TakeRestartNotice)
+    FWasFreezeRestarted: Boolean; // loop-guard flag: this run WAS spawned by RestartOnFreeze (survives TakeRestartNotice)
     FMachMainThreadCovered: Boolean; // Init-time Mach registration verdict (main thread only; NOT a live watcher status)
     function EffectiveFileNamePrefix: String;
     function EffectiveScanPrefix: String;
     function EffectiveReportDir: String;
     function BuildCrashFilePath: String;
+    function RestartNoticeFilePath: String;
+    procedure ReadRestartNoticeAtBoot;
     procedure WriteCrashBriefToConsole(const AReport: TCrashReport;
       const ATerminating: Boolean);
     procedure ConsoleLine(const S: String);
@@ -275,6 +399,7 @@ begin
   FLock := TCriticalSection.Create;
   FMachMainThreadCovered := True; // no verdict yet - only Init's registration may flip it
   FAppStartTime := Now; // "close enough to process start"
+  FAppStartTick := TThread.GetTickCount64;
 end;
 
 destructor TCrashReporterImpl.Destroy;
@@ -364,6 +489,25 @@ begin
   else
     Tail := FormatDateTime('yyyymmddhhnnss', Now);
   Result := IncludeTrailingPathDelimiter(Dir) + EffectiveFileNamePrefix + Tail + '.el';
+end;
+
+function TCrashReporterImpl.RestartNoticeFilePath: String;
+begin
+  // Scan-prefixed like the .el files (several targets may share one report
+  // dir); the '.notice' extension keeps it clear of the '*.el' boot scan.
+  Result := EffectiveReportDir + EffectiveScanPrefix + 'freeze_restart.notice';
+end;
+
+procedure TCrashReporterImpl.ReadRestartNoticeAtBoot;
+var
+  Path: String;
+begin
+  Path := RestartNoticeFilePath;
+  if CrashReadRestartNoticeFile(Path, FRestartNotice) then
+  begin
+    FWasFreezeRestarted := True; // loop-guard flag; NOT cleared by TakeRestartNotice
+    try TFile.Delete(Path); except end; // single delivery
+  end;
 end;
 
 procedure TCrashReporterImpl.ConsoleLine(const S: String);
@@ -718,6 +862,12 @@ begin
   // by the host where Application exists (the FMX .dpr).
   TCrashCapture.OnReport := HandleReport;
 
+  // Did the previous run's RestartOnFreeze spawn us? Read (and consume) the
+  // notice BEFORE the watchdog exists (its loop guard reads the flag) and
+  // BEFORE the pending scan (a freeze-restart boot uploads leftovers
+  // regardless of UploadPendingOnStartup - see ScanPendingCrashReports).
+  ReadRestartNoticeAtBoot;
+
   if FConfig.FreezeDetection then
     InstallFreezeDetector;
 
@@ -742,6 +892,13 @@ begin
   TCrashFreeze.Install(FConfig.FreezeTimeoutMS);
 end;
 
+const
+  { Loop guard for RestartOnFreeze: a run that was itself freeze-restarted must
+    stay up this long before it may restart again. Breaks a systematic
+    freeze->restart->freeze loop at one extra instance per interval; the guarded
+    episode is still fully reported. }
+  FREEZE_RESTART_MIN_UPTIME_MS = 10 * 60 * 1000;
+
 procedure TCrashReporterImpl.HandleFreezeCapture(const AReport: TCrashReport;
   const AFrozenForMS: Int64);
 // Freeze path - runs on the WATCHDOG thread while the watched (main) thread
@@ -752,6 +909,8 @@ var
   Ctx: TCrashELContext;
   Text, Path, FreezeNote: String;
   Info: TCrashFreezeInfo;
+  Notice: TCrashRestartNotice;
+  WillRestart: Boolean;
 begin
   Info := Default(TCrashFreezeInfo);
   Info.FrozenForMS := AFrozenForMS;
@@ -816,11 +975,39 @@ begin
     // Network failure keeps the file on disk; nothing else to do.
   end;
 
+  // RestartOnFreeze: replace the frozen instance with a fresh one, now that
+  // the report is on disk / uploaded. Decided BEFORE the host notification so
+  // Info.Restarting tells the host what happens next.
+  WillRestart := FConfig.RestartOnFreeze and TCrashReporter.CanRestart and
+    ((not FWasFreezeRestarted) or
+     (TThread.GetTickCount64 - FAppStartTick >= FREEZE_RESTART_MIN_UPTIME_MS));
+  Info.Restarting := WillRestart;
+
   if Assigned(FConfig.OnFreezeReport) then
   try
     FConfig.OnFreezeReport(Info);
   except
     // A host notification failure must not kill the watchdog.
+  end;
+
+  if WillRestart then
+  begin
+    Notice := Default(TCrashRestartNotice);
+    Notice.RestartedAt := Now;
+    Notice.FrozenForMS := AFrozenForMS;
+    Notice.BugID := Info.BugID;
+    Notice.ReportFile := Info.ReportFile;
+    Notice.Uploaded := Info.Uploaded;
+    try
+      CrashWriteRestartNoticeFile(RestartNoticeFilePath, Notice);
+    except
+      // A missing notice is not a reason to stay frozen.
+    end;
+    ConsoleLine('*** replacing the frozen application with a fresh instance (RestartOnFreeze) ***');
+    // Hard exit: no unit finalization - it runs on THIS watchdog thread (it
+    // would join itself in TCrashFreeze.Shutdown) and can deadlock on locks
+    // the frozen main thread still holds. Does not return.
+    TCrashReporter.Restart(True);
   end;
 end;
 
@@ -910,7 +1097,11 @@ begin
   if Files = nil then
     Exit;
 
-  if FConfig.UploadEnabled and FConfig.UploadPendingOnStartup then
+  // A boot spawned by RestartOnFreeze always retries leftovers: delivering
+  // the freeze report is what the restart was for (the frozen instance's own
+  // upload may have failed, or host policy defers uploads to the next boot).
+  if FConfig.UploadEnabled and
+     (FConfig.UploadPendingOnStartup or FWasFreezeRestarted) then
   begin
     // Upload OFF the startup path: a slow or offline endpoint must not block
     // launch (up to 10s connect + 30s response PER FILE adds up to an ANR on
@@ -1092,7 +1283,7 @@ function execv(path: MarshaledAString; argv: PMarshaledAString): Integer; cdecl;
   external libc name _PU + 'execv';
 {$ENDIF}
 
-class procedure TCrashReporter.Restart;
+class procedure TCrashReporter.Restart(const AHardExit: Boolean);
 {$IF Defined(MSWINDOWS)}
 var
   SI: TStartupInfo;
@@ -1106,10 +1297,24 @@ var
   ExePath: TBytes;
   I: Integer;
 {$ENDIF}
+
+  procedure QuitSelf;
+  // AHardExit skips unit finalization (see the declaration comment); the
+  // fallthrough Halt only ever runs in the soft mode.
+  begin
+    if AHardExit then
+    {$IF Defined(MSWINDOWS)}
+      TerminateProcess(GetCurrentProcess, 0);
+    {$ELSE}
+      Posix.Unistd._exit(0);
+    {$ENDIF}
+    Halt(0);
+  end;
+
 begin
   if not CanRestart then
   begin
-    Halt(0);
+    QuitSelf;
     Exit;
   end;
 
@@ -1122,7 +1327,7 @@ begin
     CloseHandle(PI.hProcess);
     CloseHandle(PI.hThread);
   end;
-  Halt(0);
+  QuitSelf;
   {$ELSEIF Defined(LINUX) or Defined(MACOS)}
   // Marshal argv BEFORE fork: in the child of a multithreaded process only
   // async-signal-safe calls are allowed until execv - a heap allocation there
@@ -1148,10 +1353,25 @@ begin
     Posix.Unistd._exit(127);
   end;
   // Parent (or fork failed - ChildPid=-1) - exit.
-  Halt(0);
+  QuitSelf;
   {$ELSE}
-  Halt(0);
+  QuitSelf;
   {$ENDIF}
+end;
+
+class function TCrashReporter.TakeRestartNotice: TCrashRestartNotice;
+begin
+  if GReporter = nil then
+    Exit(Default(TCrashRestartNotice));
+  Result := GReporter.FRestartNotice;
+  GReporter.FRestartNotice := Default(TCrashRestartNotice);
+  // FWasFreezeRestarted stays: the loop guard outlives the notification.
+end;
+
+class function TCrashReporter.RestartNoticeFilePath: String;
+begin
+  if GReporter = nil then Result := ''
+  else                    Result := GReporter.RestartNoticeFilePath;
 end;
 
 class procedure TCrashReporter.SurfacePendingToStderr;

@@ -32,6 +32,7 @@ Derived from [grijjy/JustAddCode](https://github.com/grijjy/JustAddCode)
 | Modules section | ✅ | ✅ | ✅ | — | — |
 | EL-compatible `.el` output | ✅ | ✅ | ✅ | ✅ | — |
 | Save / upload / dialog / restart | ✅ | ✅ | ✅ (no restart) | ✅ (no restart) | — |
+| Freeze (hang) watchdog + restart-on-freeze | ✅ (x64) | ✅ | ✅ (report-only) | — | — |
 
 **iOS is not runtime-tested.** The units compile for iOS and its paths mirror the macOS
 Mach-O ones (so the call stack *should* resolve via `LC_SYMTAB`), but nothing in the iOS
@@ -100,6 +101,10 @@ vary is a field — there are no compile-time constants baked into the library.
 | `OnFilterReport` | `nil` | Last-step veto: `function(const AReport): Boolean`; return `False` to drop the report |
 | `DisabledSections` | `[]` (full report) | Report sections to omit entirely (header + body); Application, Exception and Call Stack are mandatory and not omittable |
 | `ReportDir` | `''` (platform default) | Directory for `.el` files (write + boot-recovery scan). Empty → next to the `.app` on macOS (not inside the bundle), the exe's own dir on Linux/Windows |
+| `FreezeDetection` | `False` | Watch the host-pinged (main) thread for hangs; a freeze yields an `EFrozenApplication` `.el` with the frozen thread's stack (see *Freeze detection*) |
+| `FreezeTimeoutMS` | `30000` | No-heartbeat threshold before a freeze is reported |
+| `RestartOnFreeze` | `False` | After the freeze report, replace the frozen process with a fresh instance; the next boot surfaces the notice and re-uploads the report (see *Freeze detection*) |
+| `OnFreezeReport` | `nil` | Per-episode host notification (fires on the watchdog thread) |
 
 Set the env var `CRASH_NO_UPLOAD=1` to skip uploads and keep the file on disk
 (useful for local testing).
@@ -397,6 +402,54 @@ says so).
 Scope: Linux x86-64, macOS x86-64 + ARM64, and Android ARM64 (aarch64). Other
 targets compile to no-ops.
 
+## Freeze (hang) detection
+
+`Crash.Freeze` is the EurekaLog "anti-freeze" analogue for POSIX targets. A
+watchdog thread watches heartbeats from the thread the host wants covered
+(normally the main/UI loop, which calls `TCrashFreeze.Ping` from its loop); when
+they stop for `FreezeTimeoutMS`, the watchdog captures the frozen thread's stack
+**in place** (a realtime signal + in-handler unwind; SIGUSR2 + libSystem
+backtrace on macOS) and writes a regular `.el` with exception class
+`EFrozenApplication` and a `Freeze Info` section. Detection arms only after the
+first ping — a slow cold start is never a freeze — episodes are one report each
+and capped per run, and `BeginLongOperation` / `EndLongOperation` (nestable)
+mute known-legitimate stalls. Report-only by default: the frozen thread is never
+aborted and no exception is injected into it.
+
+**Mobile hosts must mute the detector while backgrounded.** Android (and iOS)
+freeze a backgrounded process outright: the heartbeat stops, the monotonic
+clock does not, so every return from background reads as a freeze lasting the
+whole background span — measured live on a phone as 20–23 s "freezes" while it
+sat idle. Call `TCrashFreeze.SetSuspended(True)` when the app leaves the
+foreground and `(False)` when it returns (in FMX: the `EnteredBackground` /
+`BecameActive` application events). It is a flag, not a counter — repeated or
+unpaired lifecycle events cannot leak suppression — and clearing it re-stamps
+the heartbeat, so the gap between wake-up and the ping timer's first tick
+cannot fire either.
+
+Scope: Linux x86-64, macOS x86-64 + ARM64, Android ARM64; elsewhere the unit
+compiles to no-op stubs (Windows is EurekaLog territory).
+
+### RestartOnFreeze
+
+With `RestartOnFreeze := True` the reporter, after writing/uploading the freeze
+`.el`, **replaces the frozen process**: a fresh instance is spawned with the
+same command line (fork/execv; CreateProcess on Windows) and the frozen one
+exits *without* unit finalization — it is not runnable enough for one. A notice
+file (`<ScanPrefix>freeze_restart.notice`, next to the `.el`s) is left behind;
+the next boot consumes it, the host surfaces it via
+`TCrashReporter.TakeRestartNotice` (dialog, journal, log line — host's choice),
+and that boot also re-uploads leftover `.el` files even with
+`UploadPendingOnStartup = False`: delivering the report is what the restart is
+for.
+
+Loop guard: an instance that was itself freeze-restarted stays report-only for
+its first 10 minutes, so a systematic freeze-on-startup cannot restart in a
+loop. `OnFreezeReport` fires on every episode (on the watchdog thread) with the
+outcome, including `Restarting` — whether the process is about to be replaced.
+The restart is gated by `CanRestart` (`AllowRestart` + platform); in the
+iOS/Android sandbox the flag is accepted and ignored.
+
 On **Android** register capture is on by default, like the other POSIX targets. The
 handler reads the bionic aarch64 `ucontext` (`X0..X30`, `SP`, `PC`, `PSTATE`) and emits
 a `Registers:` + `Stack:` / `Memory Dump` block just like the x86/x64 path. One
@@ -446,6 +499,11 @@ CRASH_NO_UPLOAD=1 ./CrashDemo --crash=stale    # swallowed fault, then soft rais
                                                # thread -> no Registers, "STALE snapshot" note
 CRASH_NO_UPLOAD=1 ./CrashDemo --crash=foreign  # worker's fault swallowed, main thread raises ->
                                                # no Registers, "captured on ANOTHER thread" note
+# freeze watchdog + RestartOnFreeze end-to-end:
+CRASH_NO_UPLOAD=1 ./CrashDemo --freeze         # run 1 blocks its watched thread, is reported and
+                                               # REPLACED by a fresh instance; that instance (same
+                                               # argv) prints the restart notice, freezes again and
+                                               # stays report-only (loop guard), then exits
 ```
 
 With no `--crash` argument it just prints `Reporter Active = True`. The reporter

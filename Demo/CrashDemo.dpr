@@ -8,6 +8,11 @@
 
   Build:  Linux64 (Release) via CrashDemo.dproj.
   Run:    ./CrashDemo --crash=segv|fpe|callbad|callhigh|stackoverflow|raise|stale|foreign
+          ./CrashDemo --freeze   (freeze detector + RestartOnFreeze end-to-end:
+              run 1 blocks its watched thread, gets reported and REPLACED by a
+              fresh instance; that instance - same argv - prints the restart
+              notice, freezes again and stays report-only thanks to the loop
+              guard, then exits after the block)
           CRASH_NO_UPLOAD=1 keeps the .el on disk and skips any network. }
 
 {$APPTYPE CONSOLE}
@@ -19,6 +24,7 @@ uses
   Posix.SysMman,
   {$ENDIF}
   Crash.Reporter,
+  Crash.Freeze,
   Crash.CallStack;
 
 var
@@ -157,17 +163,21 @@ begin
 end;
 
 var
-  Cfg:    TCrashConfig;
-  Kind:   String;
-  Filter: String;
-  DoWait: Boolean;
-  Arg:    String;
-  I:      Integer;
+  Cfg:      TCrashConfig;
+  Kind:     String;
+  Filter:   String;
+  DoWait:   Boolean;
+  DoFreeze: Boolean;
+  Arg:      String;
+  I:        Integer;
+  Notice:   TCrashRestartNotice;
+  Deadline: UInt64;
 begin
   Kind   := '';
   GProcessStart := Now;
   Filter := '';
   DoWait := False;
+  DoFreeze := False;
   for I := 1 to ParamCount do
   begin
     Arg := ParamStr(I);
@@ -178,7 +188,9 @@ begin
     else if Arg.StartsWith('--filter=') then
       Filter := Copy(Arg, Length('--filter=') + 1, MaxInt)
     else if Arg = '--wait' then
-      DoWait := True;
+      DoWait := True
+    else if Arg = '--freeze' then
+      DoFreeze := True;
   end;
 
   Cfg := DefaultCrashConfig;
@@ -187,6 +199,27 @@ begin
   Cfg.CompilationTime := FormatDateTime('dd.mm.yyyy hh:nn:ss', Now);
   Cfg.SaveToFile      := True;
   Cfg.UploadEnabled   := False;     // pure local test; never phones home
+
+  if DoFreeze then
+  begin
+    Cfg.FreezeDetection := True;
+    Cfg.FreezeTimeoutMS := 2000;
+    Cfg.RestartOnFreeze := True;
+    Cfg.OnFreezeReport :=
+      procedure(const AInfo: TCrashFreezeInfo)
+      var
+        FileStr: String;
+      begin
+        if AInfo.ReportFile <> '' then
+          FileStr := AInfo.ReportFile
+        else
+          FileStr := '(none on disk)';
+        Writeln(ErrOutput, Format(
+          'CrashDemo: freeze reported - frozen for %d ms, BugID %s, report %s, restarting=%s',
+          [AInfo.FrozenForMS, AInfo.BugID, FileStr, BoolToStr(AInfo.Restarting, True)]));
+        Flush(ErrOutput);
+      end;
+  end;
 
   // Demonstrate the host veto (TCrashConfig.OnFilterReport):
   //   --filter=drop    -> drop every report
@@ -209,7 +242,41 @@ begin
   TCrashReporter.Init(Cfg);
   TCrashReporter.SurfacePendingToStderr;
 
-  if Kind <> '' then
+  // Restart notice from a previous freeze-restarted run (any mode: the child
+  // of a --freeze run comes back with the same argv).
+  Notice := TCrashReporter.TakeRestartNotice;
+  if Notice.Found then
+  begin
+    Writeln(ErrOutput, Format(
+      'CrashDemo: previous run froze and restarted itself at %s (frozen %d ms, BugID %s, report %s)',
+      [FormatDateTime('yyyy-mm-dd hh:nn:ss', Notice.RestartedAt),
+       Notice.FrozenForMS, Notice.BugID, Notice.ReportFile]));
+    Flush(ErrOutput);
+  end;
+
+  if DoFreeze then
+  begin
+    Writeln(ErrOutput, 'CrashDemo: freeze demo - pinging for 2 s, then blocking the watched thread for 8 s (timeout 2 s)');
+    if Notice.Found then
+      Writeln(ErrOutput, 'CrashDemo: this instance was freeze-restarted - the loop guard keeps it report-only');
+    Flush(ErrOutput);
+    Deadline := TThread.GetTickCount64 + 2000;
+    while TThread.GetTickCount64 < Deadline do
+    begin
+      TCrashFreeze.Ping;
+      Sleep(100);
+    end;
+    // The "freeze": no pings, busy block - a hung main loop in miniature. In
+    // restart mode the watchdog replaces the process mid-block, so the final
+    // line below only ever prints in report-only mode (fresh run with
+    // RestartOnFreeze off, or the loop-guarded restarted instance).
+    Deadline := TThread.GetTickCount64 + 8000;
+    while TThread.GetTickCount64 < Deadline do
+      ;
+    Writeln(ErrOutput, 'CrashDemo: block finished, the process was NOT restarted (report-only), exiting');
+    Flush(ErrOutput);
+  end
+  else if Kind <> '' then
   begin
     Writeln(ErrOutput, 'CrashDemo: triggering --crash=', Kind, ' ...');
     Flush(ErrOutput);
@@ -226,7 +293,7 @@ begin
   begin
     Writeln('CrashDemo - Crash Reporter standalone smoke test.');
     Writeln('Usage: CrashDemo [--crash=segv|fpe|callbad|callhigh|stackoverflow|raise|stale|foreign]');
-    Writeln('                 [--filter=drop|byclass] [--wait]');
+    Writeln('                 [--filter=drop|byclass] [--wait] [--freeze]');
     Writeln('Reporter Active = ', BoolToStr(TCrashReporter.Active, True));
   end;
 end.
