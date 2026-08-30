@@ -36,10 +36,13 @@ unit Crash.Freeze;
       report/dialog is in flight.
 
   Scope:
-    - Linux x86-64.
+    - Linux x86-64. The capture signal is the FIRST FREE realtime signal in
+      rtmin+5..rtmax (a disposition already claimed by the host is never
+      stolen; no free signal = the detector stays inactive).
     - macOS x86-64 (Intel) + ARM64 (Apple Silicon): same watchdog; the
-      capture signal is SIGUSR2 (no realtime signals on macOS) and the
-      in-handler walk is libSystem backtrace.
+      capture signal is SIGUSR2 (no realtime signals on macOS) - if the host
+      already owns SIGUSR2, Install refuses and the detector stays inactive.
+      The in-handler walk is libSystem backtrace.
     - Android ARM64: same realtime-signal path as Linux (bionic exports the
       same libc probes); the in-handler walk is libunwind, as the exception
       path uses. Note the OS's own ANR machinery only helps with device
@@ -456,11 +459,27 @@ end;
 
 { TCrashFreeze }
 
+function FreezeSignalIsFree(const ASig: Integer): Boolean;
+// Takeable = the current disposition is SIG_DFL. SIG_IGN counts as OWNED:
+// someone set it deliberately, and stealing the number would re-enable
+// delivery behind their back.
+var
+  Cur: sigaction_t;
+begin
+  if sigaction(ASig, nil, @Cur) <> 0 then
+    Exit(False);
+  {$IF Defined(CRASH_FREEZE_LINUXLIKE)}
+  Result := not Assigned(Cur._u.sa_handler);
+  {$ELSE}
+  Result := not Assigned(Cur.__sigaction_handler.sa_handler);
+  {$ENDIF}
+end;
+
 class procedure TCrashFreeze.Install(const ATimeoutMS: Integer);
 var
   Act: sigaction_t;
   {$IF Defined(CRASH_FREEZE_LINUXLIKE)}
-  RtMin, RtMax: Integer;
+  RtMin, RtMax, Sig: Integer;
   {$ENDIF}
 begin
   if GInstalled then
@@ -468,16 +487,29 @@ begin
     GTimeoutMS := Max(Int64(MIN_TIMEOUT_MS), Int64(ATimeoutMS));
     Exit;
   end;
+  // A process-wide signal already claimed by the host is never stolen - a
+  // detector that silently disables someone's handler for its whole lifetime
+  // is worse than a detector that stays off.
   {$IF Defined(CRASH_FREEZE_LINUXLIKE)}
+  // Start at rtmin+5: clear of the runtime-reserved range (below RtMin) and
+  // of common RT users at RtMin+0..1; walk up to the first free signal.
+  GFreezeSignal := -1;
   RtMin := __libc_current_sigrtmin;
   RtMax := __libc_current_sigrtmax;
-  GFreezeSignal := RtMin + 5; // clear of the runtime-reserved range (below RtMin) and of common RT users at RtMin+0..1
-  if (RtMin <= 0) or (GFreezeSignal > RtMax) then
-    Exit; // no usable realtime signal - the detector stays inactive
+  if RtMin > 0 then
+    for Sig := RtMin + 5 to RtMax do
+      if FreezeSignalIsFree(Sig) then
+      begin
+        GFreezeSignal := Sig;
+        Break;
+      end;
+  if GFreezeSignal < 0 then
+    Exit; // no free realtime signal - the detector stays inactive
   {$ELSE}
-  // macOS has no realtime signals; SIGUSR2 is free here (hardware faults go
-  // through Mach exception ports, not this signal, and nothing else in the
-  // process claims it).
+  // macOS has no realtime signals and hardware faults go through Mach
+  // exception ports - SIGUSR2 is the only candidate. Host owns it = stay off.
+  if not FreezeSignalIsFree(SIGUSR2) then
+    Exit;
   GFreezeSignal := SIGUSR2;
   {$ENDIF}
 
