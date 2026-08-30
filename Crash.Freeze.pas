@@ -88,8 +88,9 @@ type
       the first ping arrives. Safe to call again - only the timeout updates. }
     class procedure Install(const ATimeoutMS: Integer); static;
 
-    { Stop the watchdog thread (joins it). The signal handler stays installed
-      - harmless, nothing sends the signal once the watchdog is gone. }
+    { Stop the watchdog thread (joins it) and give the capture signal back:
+      the pre-Install disposition is restored, unless the host re-claimed the
+      signal after Install (then its ownership is left alone). }
     class procedure Shutdown; static;
 
     { Heartbeat. Call from the watched thread's loop; cheap (one atomic
@@ -230,6 +231,8 @@ var
   GFreezeSignal:  Integer = -1;
   GInstalled:     Boolean = False;
   GWatchdog:      TThread = nil;
+  GPrevAction:    sigaction_t;     // disposition before Install; Shutdown restores it (see below)
+  GHavePrevAction: Boolean = False;
 
 {$IF not Defined(MACOS)}
 function FreezeUnwindCallback(AContext: _PUnwind_Context; AUserData: Pointer): _Unwind_Reason_code; cdecl;
@@ -271,7 +274,7 @@ type
   private
     FEpisodes: Integer;
     function BuildAddressList(out AInterruptedIP: UIntPtr): TArray<UIntPtr>;
-    procedure CaptureAndReport(const AFrozenForMS: Int64);
+    function CaptureAndReport(const AFrozenForMS: Int64): Boolean;
   protected
     procedure Execute; override;
   end;
@@ -317,7 +320,9 @@ begin
   end;
 end;
 
-procedure TFreezeWatchdog.CaptureAndReport(const AFrozenForMS: Int64);
+function TFreezeWatchdog.CaptureAndReport(const AFrozenForMS: Int64): Boolean;
+// False = the report gate is busy (an exception report is in flight) - the
+// caller retries on the next quantum without starting an episode.
 var
   Addrs: TArray<UIntPtr>;
   IP: UIntPtr;
@@ -325,39 +330,52 @@ var
   LocList: TCrashStack;
   Deadline: UInt64;
 begin
-  // Re-open the slot (this thread is the sole consumer).
-  TInterlocked.Exchange(GTrace.Captured, 0);
-  TInterlocked.Exchange(GTrace.Claimed, 0);
-  Addrs := nil;
-  IP := 0;
-  if pthread_kill(GWatchedThread, GFreezeSignal) = 0 then
-  begin
-    // Bounded wait: a thread parked in uninterruptible (D) state never runs
-    // the handler - report without a stack rather than hang the watchdog.
-    Deadline := TThread.GetTickCount64 + CAPTURE_WAIT_MS;
-    while (TInterlocked.CompareExchange(GTrace.Captured, 0, 0) <> 1) and
-          (TThread.GetTickCount64 < Deadline) do
-      TThread.Sleep(5);
-    if TInterlocked.CompareExchange(GTrace.Captured, 0, 0) = 1 then
-      Addrs := BuildAddressList(IP);
-  end;
+  // Cross-thread report gate (the exception path's single-flight flag): never
+  // race a crashing thread's resolver state (module readers, line caches).
+  // Held ONLY across the probe + symbolization: OnCapture formats/writes/
+  // uploads an already-symbolized report and needs no resolver - and holding
+  // the gate through a network upload (up to 40 s of timeouts) would make a
+  // real concurrent crash drop its report entirely.
+  Result := TCrashCapture.TryEnterReportGate;
+  if not Result then
+    Exit;
+  try
+    // Re-open the slot (this thread is the sole consumer).
+    TInterlocked.Exchange(GTrace.Captured, 0);
+    TInterlocked.Exchange(GTrace.Claimed, 0);
+    Addrs := nil;
+    IP := 0;
+    if pthread_kill(GWatchedThread, GFreezeSignal) = 0 then
+    begin
+      // Bounded wait: a thread parked in uninterruptible (D) state never runs
+      // the handler - report without a stack rather than hang the watchdog.
+      Deadline := TThread.GetTickCount64 + CAPTURE_WAIT_MS;
+      while (TInterlocked.CompareExchange(GTrace.Captured, 0, 0) <> 1) and
+            (TThread.GetTickCount64 < Deadline) do
+        TThread.Sleep(5);
+      if TInterlocked.CompareExchange(GTrace.Captured, 0, 0) = 1 then
+        Addrs := BuildAddressList(IP);
+    end;
 
-  Report := Default(TCrashReport);
-  Report.ExceptionClassName := 'EFrozenApplication';
-  Report.ExceptionMessage := Format(
-    'The application seems to be frozen: no heartbeat from the watched (main) thread for %d ms (timeout: %d ms)',
-    [AFrozenForMS, GTimeoutMS]);
-  Report.Source := csAcquired; // the process stays alive (report-only detector)
-  Report.CallStack := TCrashCapture.SymbolizeAddressList(Addrs);
-  Report.ExceptionLocation.Clear;
-  if IP <> 0 then
-  begin
-    LocList := TCrashCapture.SymbolizeAddressList([IP]);
-    if Length(LocList) > 0 then
-      Report.ExceptionLocation := LocList[0];
-  end
-  else if Length(Report.CallStack) > 0 then
-    Report.ExceptionLocation := Report.CallStack[0];
+    Report := Default(TCrashReport);
+    Report.ExceptionClassName := 'EFrozenApplication';
+    Report.ExceptionMessage := Format(
+      'The application seems to be frozen: no heartbeat from the watched (main) thread for %d ms (timeout: %d ms)',
+      [AFrozenForMS, GTimeoutMS]);
+    Report.Source := csAcquired; // the process stays alive (report-only detector)
+    Report.CallStack := TCrashCapture.SymbolizeAddressList(Addrs);
+    Report.ExceptionLocation.Clear;
+    if IP <> 0 then
+    begin
+      LocList := TCrashCapture.SymbolizeAddressList([IP]);
+      if Length(LocList) > 0 then
+        Report.ExceptionLocation := LocList[0];
+    end
+    else if Length(Report.CallStack) > 0 then
+      Report.ExceptionLocation := Report.CallStack[0];
+  finally
+    TCrashCapture.LeaveReportGate;
+  end;
 
   if Assigned(TCrashFreeze.OnCapture) then
   try
@@ -417,20 +435,21 @@ begin
     if (Now64 - LastAlive) < GTimeoutMS then
       Continue;
 
-    // Cross-thread report gate (the exception path's single-flight flag):
-    // never race a crashing thread's resolver/formatter state. Busy gate =
-    // retry on the next quantum, the freeze is not going anywhere.
-    if not TCrashCapture.TryEnterReportGate then
+    // Over the noise cap: the episode is still tracked (one per freeze), just
+    // no longer reported.
+    if FEpisodes >= MAX_EPISODES_PER_RUN then
+    begin
+      InEpisode := True;
+      EpisodeStart := Now64;
+      Continue;
+    end;
+    // Busy report gate (an exception report is in flight) = retry on the next
+    // quantum, the freeze is not going anywhere.
+    if not CaptureAndReport(Now64 - LastPing) then
       Continue;
     InEpisode := True;
     EpisodeStart := Now64;
     Inc(FEpisodes);
-    try
-      if FEpisodes <= MAX_EPISODES_PER_RUN then
-        CaptureAndReport(Now64 - LastPing);
-    finally
-      TCrashCapture.LeaveReportGate;
-    end;
   end;
 end;
 
@@ -478,8 +497,10 @@ begin
   // handlers (Crash.Signals).
   Act.sa_flags := SA_SIGINFO or SA_RESTART;
   sigemptyset(Act.sa_mask);
-  if sigaction(GFreezeSignal, @Act, nil) <> 0 then
+  FillChar(GPrevAction, SizeOf(GPrevAction), 0);
+  if sigaction(GFreezeSignal, @Act, @GPrevAction) <> 0 then
     Exit;
+  GHavePrevAction := True;
 
   GWatchdog := TFreezeWatchdog.Create(False);
   GInstalled := True;
@@ -488,6 +509,7 @@ end;
 class procedure TCrashFreeze.Shutdown;
 var
   W: TThread;
+  Cur: sigaction_t;
 begin
   W := GWatchdog;
   GWatchdog := nil;
@@ -497,6 +519,20 @@ begin
     W.Terminate;
     W.WaitFor; // returns within one CHECK_QUANTUM_MS (plus a pending capture wait)
     W.Free;
+  end;
+  // Give the process-wide signal back: restore the pre-Install disposition -
+  // but only while the current handler is still ours; a host that re-claimed
+  // the signal after Install keeps its ownership.
+  if GHavePrevAction then
+  begin
+    GHavePrevAction := False;
+    if (sigaction(GFreezeSignal, nil, @Cur) = 0) and
+       {$IF Defined(CRASH_FREEZE_LINUXLIKE)}
+       (@Cur._u.sa_sigaction = @CrashFreezeSignalHandler)
+       {$ELSE}
+       (@Cur.__sigaction_handler.sa_sigaction = @CrashFreezeSignalHandler)
+       {$ENDIF} then
+      sigaction(GFreezeSignal, @GPrevAction, nil);
   end;
 end;
 
