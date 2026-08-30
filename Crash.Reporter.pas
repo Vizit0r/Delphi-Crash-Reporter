@@ -179,17 +179,34 @@ function CrashConsumeFreezeRestartEnvMark: Boolean;
 {$IF not Defined(MSWINDOWS)}
 { Spawn AExePath with AArgv (argv[0] included) detached, confirming through a
   CLOEXEC pipe that execv actually started it (a successful exec closes the
-  write end - EOF; a failed one writes a byte first). Fail-closed: no
-  confirmation channel (pipe/fcntl failure, e.g. fd exhaustion) = no fork at
-  all, False. The child marks EVERY inherited fd >= 3 close-on-exec between
-  fork and execv, so the replacement starts with only stdio - none of the
-  frozen instance's sockets, locks or pipes leak into it (they would outlive
-  the old process inside a graph that knows nothing about them). False =
-  nothing runs; the CALLER is alive either way, and a failed child is reaped.
-  The building block of Restart, exposed so spawn-failure handling stays
-  testable. }
+  write end - EOF; a failure writes a marker byte first, retried across
+  EINTR). Fail-closed at every stage: no confirmation channel (pipe/fcntl
+  failure, e.g. fd exhaustion) = no fork at all; a broken read on the channel
+  = the child is killed and False (exec state unknown - the caller must keep
+  living); an EOF whose child is already a zombie with one of our failure
+  exit codes (126 sweep / 127 execv) = False, so a lost marker byte cannot
+  masquerade as success. The child marks EVERY inherited fd >= 3
+  close-on-exec between fork and execv (close_range, then a raw /proc/self/fd
+  walk, then a bounded fcntl sweep - see the fallbacks below), so the
+  replacement starts with only stdio - none of the frozen instance's sockets,
+  locks or pipes leak into it; a sweep that cannot vouch for the whole table
+  aborts the spawn (126) instead of exec'ing with an unknown fd set. False =
+  nothing survives the call; the CALLER is alive either way, and a failed
+  child is reaped. The building block of Restart, exposed so spawn-failure
+  handling stays testable. }
 function CrashSpawnDetachedVerified(const AExePath: String;
   const AArgv: TArray<String>): Boolean;
+
+{ Fallback levels of the child fd sweep, exposed for tests (safe to run in a
+  live process: CLOEXEC only affects future execs). ViaProcFS walks the
+  ACTUALLY open descriptors through /proc/self/fd with raw syscalls (no
+  range bound); BySweep marks fd 3..AFdLimit-1 via fcntl. Both retry EINTR,
+  ignore EBADF and return False when any live descriptor could not be
+  marked. }
+{$IF Defined(LINUX)}
+function CrashMarkFDsCloseOnExecViaProcFS: Boolean;
+{$ENDIF}
+function CrashMarkFDsCloseOnExecBySweep(const AFdLimit: Integer): Boolean;
 {$ENDIF}
 
 type
@@ -281,6 +298,7 @@ uses
   Posix.Base,
   Posix.Fcntl,   // FD_CLOEXEC on the exec-confirmation pipe + the child fd sweep
   Posix.SysWait, // waitpid() for the failed-exec child
+  Posix.Signal,  // kill(SIGKILL) when the confirmation channel breaks
   Posix.Errno,
   {$ENDIF}
   System.SysUtils;
@@ -1403,25 +1421,118 @@ const
 function getrlimit(resource: Integer; var rlp: TCrashRLimit): Integer; cdecl;
   external libc name _PU + 'getrlimit';
 
-procedure CrashChildMarkFDsCloseOnExec(const AFdLimit: Integer);
-// Runs IN THE CHILD between fork and execv: mark every fd >= 3 close-on-exec
-// so the exec'd replacement starts with only stdio (see the interface
-// comment). Everything here is async-signal-safe (raw syscall / fcntl); the
-// fd limit is read by the PARENT before fork and passed in. The confirmation
-// pipe's write end is caught by the sweep too - it is already CLOEXEC, and a
-// failed execv can still write into it (CLOEXEC only acts on a successful
-// exec).
+function CrashSetCloseOnExec(const AFd: Integer): Boolean;
+// One sweep step. EINTR = retry; EBADF = a hole in the table, fine; any
+// other error on a live descriptor means the sweep cannot vouch for it.
+var
+  RC: Integer;
+begin
+  repeat
+    RC := fcntl(AFd, F_SETFD, FD_CLOEXEC);
+  until (RC = 0) or (errno <> EINTR);
+  Result := (RC = 0) or (errno = EBADF);
+end;
+
+function CrashMarkFDsCloseOnExecBySweep(const AFdLimit: Integer): Boolean;
 var
   Fd: Integer;
+begin
+  Result := True;
+  for Fd := 3 to AFdLimit - 1 do
+    if not CrashSetCloseOnExec(Fd) then
+      Result := False; // keep sweeping - mark as much as possible - but report
+end;
+
+{$IF Defined(LINUX)}
+const
+  SYS_getdents64     = 217;    // x86-64
+  CRASH_O_DIRECTORY  = $10000; // Linux x86-64 O_DIRECTORY
+  CRASH_O_CLOEXEC    = $80000; // Linux O_CLOEXEC
+
+function CrashMarkFDsCloseOnExecViaProcFS: Boolean;
+// Walk the ACTUALLY open descriptors via /proc/self/fd - raw syscalls only
+// (open/getdents64/close; libc readdir allocates and is not
+// async-signal-safe). No range bound: any fd number is reached.
+var
+  DirFd: Integer;
+  Buf: array [0..1023] of Byte;
+  NRead, Off: IntPtr;
+  Name: PAnsiChar;
+  Fd: Integer;
+  Ok: Boolean;
+
+  function ParseFdName(P: PAnsiChar; out AFd: Integer): Boolean;
+  var
+    V: Integer;
+  begin
+    Result := False;
+    if P^ = #0 then
+      Exit;
+    V := 0;
+    while P^ <> #0 do
+    begin
+      if (P^ < '0') or (P^ > '9') then
+        Exit; // '.', '..'
+      V := V * 10 + (Ord(P^) - Ord('0'));
+      Inc(P);
+    end;
+    AFd := V;
+    Result := True;
+  end;
+
+begin
+  Result := False;
+  repeat
+    DirFd := Posix.Fcntl.open('/proc/self/fd',
+      O_RDONLY or CRASH_O_DIRECTORY or CRASH_O_CLOEXEC);
+  until (DirFd >= 0) or (errno <> EINTR);
+  if DirFd < 0 then
+    Exit;
+  Ok := True;
+  repeat
+    NRead := syscall(SYS_getdents64, IntPtr(DirFd), IntPtr(@Buf[0]),
+      IntPtr(SizeOf(Buf)));
+    if NRead < 0 then
+    begin
+      if errno = EINTR then
+        Continue;
+      Ok := False;
+      Break;
+    end;
+    Off := 0;
+    while Off < NRead do
+    begin
+      // struct linux_dirent64: u64 d_ino; s64 d_off; u16 d_reclen;
+      // u8 d_type; char d_name[]
+      Name := PAnsiChar(@Buf[Off + 19]);
+      if ParseFdName(Name, Fd) and (Fd >= 3) and (Fd <> DirFd) then
+        if not CrashSetCloseOnExec(Fd) then
+          Ok := False;
+      Inc(Off, PWord(@Buf[Off + 16])^);
+    end;
+  until NRead = 0;
+  __close(DirFd);
+  Result := Ok;
+end;
+{$ENDIF}
+
+function CrashChildMarkFDsCloseOnExec(const AFdLimit: Integer): Boolean;
+// Runs IN THE CHILD between fork and execv: mark every fd >= 3 close-on-exec
+// so the exec'd replacement starts with only stdio (see the interface
+// comment). Everything here is async-signal-safe; the sweep limit is read by
+// the PARENT before fork and passed in. The confirmation pipe's write end is
+// caught too - it is already CLOEXEC, and a failed execv can still write
+// into it (CLOEXEC only acts on a successful exec). False = the fd table
+// cannot be vouched for; the caller must NOT exec.
 begin
   {$IF Defined(LINUX)}
   if syscall(SYS_close_range, IntPtr(3), IntPtr(High(Cardinal)),
        IntPtr(CLOSE_RANGE_CLOEXEC)) = 0 then
-    Exit;
+    Exit(True);
+  if CrashMarkFDsCloseOnExecViaProcFS then
+    Exit(True);
   {$ENDIF}
-  // Fallback (macOS, pre-5.11 kernels): bounded fcntl sweep.
-  for Fd := 3 to AFdLimit - 1 do
-    fcntl(Fd, F_SETFD, FD_CLOEXEC);
+  Result := CrashMarkFDsCloseOnExecBySweep(AFdLimit);
 end;
 
 function CrashSpawnDetachedVerified(const AExePath: String;
@@ -1431,7 +1542,7 @@ var
   ArgBytes: array of TBytes;
   Argv: array of MarshaledAString;
   ExePath: TBytes;
-  I, FdLimit: Integer;
+  I, FdLimit, WStatus: Integer;
   RLim: TCrashRLimit;
   Fds: TPipeDescriptors;
   Confirm: Byte;
@@ -1453,16 +1564,21 @@ begin
   end;
   Argv[Length(AArgv)] := nil;
 
-  // The fd sweep bound for the child, read in the parent (getrlimit is not on
-  // the async-signal-safe list; the child gets a ready number).
-  FdLimit := 4096;
-  if getrlimit(CRASH_RLIMIT_NOFILE, RLim) = 0 then
-  begin
-    if RLim.rlim_cur > 65536 then
-      FdLimit := 65536
-    else if RLim.rlim_cur > 3 then
-      FdLimit := Integer(RLim.rlim_cur);
-  end;
+  // Bound for the LAST-RESORT bounded sweep (Linux normally takes close_range
+  // or the /proc walk - neither needs a bound; macOS has no unbounded
+  // primitive). rlim_cur is the honest limit: no fd above it can exist. Only
+  // RLIM_INFINITY or a broken getrlimit is capped - macOS at its
+  // kern.maxfilesperproc default, Linux at 1M (a sub-second worst-case
+  // sweep). Read in the parent: getrlimit is not on the async-signal-safe
+  // list, the child gets a ready number.
+  {$IF Defined(MACOS)}
+  FdLimit := 10240;
+  {$ELSE}
+  FdLimit := 1048576;
+  {$ENDIF}
+  if (getrlimit(CRASH_RLIMIT_NOFILE, RLim) = 0) and
+     (RLim.rlim_cur > 3) and (RLim.rlim_cur < UInt64(FdLimit)) then
+    FdLimit := Integer(RLim.rlim_cur);
 
   // Exec-confirmation channel (see the interface comment). Fail-closed: a
   // spawn we cannot confirm is a spawn we do not attempt - the caller keeps
@@ -1480,14 +1596,25 @@ begin
   if ChildPid = 0 then
   begin
     // Child: detach from the parent's fd table before exec - only stdio and
-    // the (CLOEXEC) confirmation pipe may cross into the replacement.
-    CrashChildMarkFDsCloseOnExec(FdLimit);
-    // If execv returns, it failed - report through the pipe, then _exit, not
-    // Halt: unit finalization is not fork-safe either. (write and _exit are
-    // async-signal-safe.)
+    // the (CLOEXEC) confirmation pipe may cross into the replacement. A table
+    // the sweep cannot vouch for aborts the spawn: marker + _exit(126).
+    if not CrashChildMarkFDsCloseOnExec(FdLimit) then
+    begin
+      Confirm := 2;
+      repeat
+        N := __write(Fds.WriteDes, @Confirm, 1);
+      until (N = 1) or ((N < 0) and (errno <> EINTR));
+      Posix.Unistd._exit(126);
+    end;
+    // If execv returns, it failed - report through the pipe (the write
+    // retried across EINTR: a lost marker byte would read as success), then
+    // _exit, not Halt: unit finalization is not fork-safe either. (write and
+    // _exit are async-signal-safe.)
     execv(MarshaledAString(@ExePath[0]), @Argv[0]);
     Confirm := 1;
-    __write(Fds.WriteDes, @Confirm, 1);
+    repeat
+      N := __write(Fds.WriteDes, @Confirm, 1);
+    until (N = 1) or ((N < 0) and (errno <> EINTR));
     Posix.Unistd._exit(127);
   end;
   if ChildPid = -1 then
@@ -1502,13 +1629,32 @@ begin
     N := __read(Fds.ReadDes, @Confirm, 1);
   until (N >= 0) or (errno <> EINTR);
   __close(Fds.ReadDes);
-  if N > 0 then
+  if N < 0 then
   begin
-    // execv never started the replacement; reap the _exit(127) child.
+    // The channel broke: exec state UNKNOWN. Fail-closed - this process must
+    // keep living, so make the outcome deterministic by taking the child
+    // down (it is either a not-yet-exec'd twin or a milliseconds-old
+    // replacement that has not touched anything durable yet).
+    kill(ChildPid, SIGKILL);
     waitpid(ChildPid, nil, 0);
     Exit;
   end;
-  Result := True; // EOF: the pipe died with a successful exec
+  if N > 0 then
+  begin
+    // Failure marker delivered (sweep=2 / execv=1); reap the child.
+    waitpid(ChildPid, nil, 0);
+    Exit;
+  end;
+  // EOF: normally a successful exec closed the CLOEXEC write end. Guard the
+  // lost-marker corner - a child that died without managing to deliver its
+  // byte also produces an EOF, but by then it is a zombie carrying one of
+  // OUR failure exit codes; a live (or differently-exited) child is a real
+  // replacement.
+  if (waitpid(ChildPid, @WStatus, WNOHANG) = ChildPid) and
+     WIFEXITED(WStatus) and
+     ((WEXITSTATUS(WStatus) = 126) or (WEXITSTATUS(WStatus) = 127)) then
+    Exit;
+  Result := True;
 end;
 {$ENDIF}
 
