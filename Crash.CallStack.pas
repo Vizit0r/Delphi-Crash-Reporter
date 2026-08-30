@@ -233,6 +233,13 @@ type
       line numbers) - the same pipeline the exception path applies to its
       backtrace. nil when call stacks are unsupported on this target. }
     class function SymbolizeAddressList(const AAddrs: array of UIntPtr): TCrashStack; static;
+
+    { Base address of the module that carries the application code (dladdr on
+      our own method at Init) - the identity of "our frame" for grouping.
+      Matching by ADDRESS, not by executable name: on Android the app code
+      lives in the app's .so and ParamStr(0) is empty, so a name probe cannot
+      work there. 0 before Init / on unsupported targets. }
+    class function MainModuleAddress: UIntPtr; static;
   end;
 
 implementation
@@ -294,6 +301,14 @@ begin
     Result := FInstance.FMaxCallStackDepth
   else
     Result := 20;
+end;
+
+class function TCrashCapture.MainModuleAddress: UIntPtr;
+begin
+  if Assigned(FInstance) then
+    Result := FInstance.FModuleAddress
+  else
+    Result := 0;
 end;
 
 class procedure TCrashCapture.GlobalCleanUpStackInfo(Info: Pointer);

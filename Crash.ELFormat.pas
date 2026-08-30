@@ -474,15 +474,24 @@ function CrashGenerateFreezeID(const AReport: TCrashReport): String;
 var
   ExeName, Source: String;
   I, AnchorIdx: Integer;
+  MainModule: UIntPtr;
   E: TCrashStackEntry;
 
   function IsAppFrame(const AEntry: TCrashStackEntry): Boolean;
   begin
-    Result := (AEntry.ModuleName <> '') and
-      SameFileName(ExtractFileName(AEntry.ModuleName), ExeName);
+    // By module ADDRESS when the capture layer knows it: on Android the app
+    // code lives in a libXxx.so and ParamStr(0) is EMPTY (SysInit passes
+    // Argc=0), so an executable-name probe never matches there. The name
+    // comparison stays only as the pre-Init fallback.
+    if MainModule <> 0 then
+      Result := AEntry.ModuleAddress = MainModule
+    else
+      Result := (AEntry.ModuleName <> '') and (ExeName <> '') and
+        SameFileName(ExtractFileName(AEntry.ModuleName), ExeName);
   end;
 
 begin
+  MainModule := TCrashCapture.MainModuleAddress;
   ExeName := ExtractFileName(ParamStr(0));
   Source := '';
 
