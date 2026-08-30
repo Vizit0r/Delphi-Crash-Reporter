@@ -102,6 +102,10 @@ type
     ExceptionLocation: TCrashStackEntry;
     CallStack: TCrashStack;
     Source: TCrashSource;
+    { Freeze-watchdog report (Crash.Freeze): the stack is a SAMPLE of a running
+      thread, not a raise point - BugID generation uses the freeze
+      normalization (see CrashGenerateExceptionID). }
+    IsFreeze: Boolean;
   end;
 
 const

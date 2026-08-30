@@ -62,7 +62,9 @@ function CrashDefaultELContext(const AStartTime: TDateTime = 0;
 { EurekaLog-style BugID for AReport (CRC-32 over the relocation-independent
   identities of the exception location + same-module call-stack frames). The same
   logical crash yields the same 8-hex-digit id across runs, machines and rebuilds.
-  Exposed so the reporter can use it as the .el file-name token. }
+  Exposed so the reporter can use it as the .el file-name token. Freeze reports
+  (AReport.IsFreeze) route through their own normalization - see
+  CrashGenerateFreezeID in the implementation. }
 function CrashGenerateExceptionID(const AReport: TCrashReport): String;
 
 implementation
@@ -433,6 +435,98 @@ begin
                IntToHex(AEntry.CodeAddress - AEntry.ModuleAddress, 1) + #10;
 end;
 
+{ RTL leaf probe for the freeze normalization: routine names come in the dotted
+  symbol form ('Classes.TThread.GetTickCount64', 'System.Move'). Covers the
+  units a busy/blocked top-of-stack actually lands in (tick reads, waits,
+  syscall wrappers); a miss only anchors the id one frame higher - a slightly
+  different grouping, never a lost report. }
+function CrashIsRtlRoutine(const ARoutineName: String): Boolean;
+var
+  N: String;
+begin
+  N := LowerCase(ARoutineName);
+  Result := N.StartsWith('system.') or N.StartsWith('classes.') or
+            N.StartsWith('sysutils.') or N.StartsWith('syncobjs.') or
+            N.StartsWith('generics.') or N.StartsWith('math.') or
+            N.StartsWith('ioutils.') or N.StartsWith('dateutils.') or
+            N.StartsWith('posix.');
+end;
+
+{ Freeze-specific BugID (AReport.IsFreeze). A freeze stack is a SAMPLE of a
+  running thread, not a raise point: the same logical hang stops at varying
+  offsets inside the top routine, sometimes one call deeper (vDSO/libc, or an
+  RTL leaf like GetTickCount64) - so keying on the sampled location, or on the
+  module it happens to land in, splits one hang across many ids (and when the
+  sample lands in libc, the exception path's "faulting module" filter would
+  even drop the app frames). Instead:
+    - only frames of the MAIN executable count (foreign so/dylib and vDSO/libc
+      sampling frames are noise);
+    - leading RTL leaf frames are skipped: the anchor is the topmost frame of
+      OUR code (all-RTL stacks fall back to the topmost app frame);
+    - the anchor contributes its routine NAME only - its in-routine offset is
+      where the sample happened to stop;
+    - frames below the anchor are stable return addresses (the call path) and
+      contribute name+offset as usual (AppendBugIDFrame).
+  Degenerate stacks fall into shared buckets: no app frames -> keyed by the
+  top foreign frame's name (offsets vary by library build); no stack at all ->
+  one fixed bucket. }
+function CrashGenerateFreezeID(const AReport: TCrashReport): String;
+var
+  ExeName, Source: String;
+  I, AnchorIdx: Integer;
+  E: TCrashStackEntry;
+
+  function IsAppFrame(const AEntry: TCrashStackEntry): Boolean;
+  begin
+    Result := (AEntry.ModuleName <> '') and
+      SameFileName(ExtractFileName(AEntry.ModuleName), ExeName);
+  end;
+
+begin
+  ExeName := ExtractFileName(ParamStr(0));
+  Source := '';
+
+  AnchorIdx := -1;
+  for I := 0 to High(AReport.CallStack) do
+    if IsAppFrame(AReport.CallStack[I]) and
+       (not CrashIsRtlRoutine(AReport.CallStack[I].RoutineName)) then
+    begin
+      AnchorIdx := I;
+      Break;
+    end;
+  if AnchorIdx < 0 then
+    for I := 0 to High(AReport.CallStack) do
+      if IsAppFrame(AReport.CallStack[I]) then
+      begin
+        AnchorIdx := I;
+        Break;
+      end;
+
+  if AnchorIdx >= 0 then
+  begin
+    E := AReport.CallStack[AnchorIdx];
+    if E.RoutineName <> '' then
+      Source := E.RoutineName + #10
+    else
+      Source := ExtractFileName(E.ModuleName) + #10;
+    for I := AnchorIdx + 1 to High(AReport.CallStack) do
+      if IsAppFrame(AReport.CallStack[I]) then
+        AppendBugIDFrame(Source, AReport.CallStack[I]);
+  end
+  else if Length(AReport.CallStack) > 0 then
+  begin
+    E := AReport.CallStack[0];
+    if E.RoutineName <> '' then
+      Source := 'foreign:' + E.RoutineName + #10
+    else
+      Source := 'foreign:' + ExtractFileName(E.ModuleName) + #10;
+  end
+  else
+    Source := 'freeze-no-stack';
+
+  Result := IntToHex(CrashCRC32(TEncoding.UTF8.GetBytes(LowerCase(Source))), 8);
+end;
+
 { EurekaLog-style BugID: a CRC-32 over the exception location + the call-stack
   frames that belong to OUR module (EL's bugIDUseExceptionModuleCallStack), each
   reduced to a relocation-independent key (see AppendBugIDFrame). Effect: the
@@ -446,6 +540,8 @@ var
   ExeModule: UIntPtr;
   I: Integer;
 begin
+  if AReport.IsFreeze then
+    Exit(CrashGenerateFreezeID(AReport));
   Source := '';
   AppendBugIDFrame(Source, AReport.ExceptionLocation);
   // Keep only frames in the faulting module: libc/ld/RTL frames vary by OS and

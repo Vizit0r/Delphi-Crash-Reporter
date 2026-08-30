@@ -358,6 +358,7 @@ begin
     end;
 
     Report := Default(TCrashReport);
+    Report.IsFreeze := True;
     Report.ExceptionClassName := 'EFrozenApplication';
     Report.ExceptionMessage := Format(
       'The application seems to be frozen: no heartbeat from the watched (main) thread for %d ms (timeout: %d ms)',
