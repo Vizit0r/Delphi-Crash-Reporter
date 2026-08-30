@@ -229,7 +229,7 @@ begin
   if TCrashReporter.Upload(FReportText, TCrashReporter.LastCrashFileName) then
     TCrashReporter.DeleteLastCrashFile;
   ModalResult := mrOk;
-  TCrashReporter.Restart; // does not return (Halt in the child flow or after exec)
+  TCrashReporter.Restart; // returns only if the replacement failed to spawn - then the app just stays up
 end;
 
 procedure TCrashReportForm.KeyDown(var Key: Word; var KeyChar: WideChar;

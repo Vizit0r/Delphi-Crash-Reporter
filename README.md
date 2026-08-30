@@ -435,9 +435,12 @@ compiles to no-op stubs (Windows is EurekaLog territory).
 With `RestartOnFreeze := True` the reporter, after writing/uploading the freeze
 `.el`, **replaces the frozen process**: a fresh instance is spawned with the
 same command line (fork/execv; CreateProcess on Windows) and the frozen one
-exits *without* unit finalization — it is not runnable enough for one. A notice
-file (`<ScanPrefix>freeze_restart.notice`, next to the `.el`s) is left behind;
-the next boot consumes it, the host surfaces it via
+exits *without* unit finalization — it is not runnable enough for one. The exit
+happens only once the spawn is **confirmed** (the CreateProcess result on
+Windows; a CLOEXEC exec-confirmation pipe on POSIX): a failed spawn leaves the
+frozen instance alive in report-only mode instead of killing it with no
+replacement. A notice file (`<ScanPrefix>freeze_restart.notice`, next to the
+`.el`s) is left behind; the next boot consumes it, the host surfaces it via
 `TCrashReporter.TakeRestartNotice` (dialog, journal, log line — host's choice),
 and that boot also re-uploads leftover `.el` files even with
 `UploadPendingOnStartup = False`: delivering the report is what the restart is
@@ -445,10 +448,13 @@ for.
 
 Loop guard: an instance that was itself freeze-restarted stays report-only for
 its first 10 minutes, so a systematic freeze-on-startup cannot restart in a
-loop. `OnFreezeReport` fires on every episode (on the watchdog thread) with the
-outcome, including `Restarting` — whether the process is about to be replaced.
-The restart is gated by `CanRestart` (`AllowRestart` + platform); in the
-iOS/Android sandbox the flag is accepted and ignored.
+loop. The guard flag travels as an **environment mark** inherited by the
+replacement (`CRASH_FREEZE_RESTARTED`, consumed at boot), so it survives a
+report dir that cannot be written — the notice file is only the UI/info
+payload. `OnFreezeReport` fires on every episode (on the watchdog thread) with
+the outcome, including `Restarting` — whether the process is about to be
+replaced. The restart is gated by `CanRestart` (`AllowRestart` + platform); in
+the iOS/Android sandbox the flag is accepted and ignored.
 
 On **Android** register capture is on by default, like the other POSIX targets. The
 handler reads the bionic aarch64 `ucontext` (`X0..X30`, `SP`, `PC`, `PSTATE`) and emits

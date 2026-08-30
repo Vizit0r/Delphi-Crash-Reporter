@@ -117,14 +117,20 @@ type
     FreezeTimeoutMS: Integer;
     { Restart the process after a freeze report: a fresh instance is spawned
       with the same command line and the frozen one is terminated WITHOUT unit
-      finalization (it is not runnable enough for one). A notice file is left
+      finalization (it is not runnable enough for one) - but ONLY once the
+      spawn is confirmed (CreateProcess result / exec-confirmation pipe): a
+      failed spawn leaves the frozen instance alive in report-only mode
+      rather than killing it with no replacement. A notice file is left
       in the report dir; the next boot reads it (see TakeRestartNotice) so the
       host can tell the user, and that boot also uploads leftover .el files -
       delivering the report is what the restart is for. Loop guard: a run that
       was itself freeze-restarted stays report-only until it has been up for
       FREEZE_RESTART_MIN_UPTIME_MS, so a systematic freeze-on-startup cannot
-      restart in a loop. Gated by CanRestart (AllowRestart + platform; no-op
-      in the iOS/Android sandbox). Default False. }
+      restart in a loop. The guard flag travels as an environment mark
+      (inherited by the replacement even when the report dir is unwritable
+      and no notice could be left); the notice file is the UI/info payload
+      only. Gated by CanRestart (AllowRestart + platform; no-op in the
+      iOS/Android sandbox). Default False. }
     RestartOnFreeze: Boolean;
     { Fired (on the WATCHDOG thread) after a freeze report is handled - lets
       the host log/notify. Keep it cheap and thread-safe. }
@@ -158,6 +164,26 @@ procedure CrashWriteRestartNoticeFile(const APath: String;
 function CrashReadRestartNoticeFile(const APath: String;
   out ANotice: TCrashRestartNotice): Boolean;
 
+{ Freeze-restart loop-guard mark in the process ENVIRONMENT - the disk-free
+  twin of the notice file. The guard must survive a report dir that cannot be
+  written (read-only, full disk, missing), so it rides process inheritance:
+  CreateProcess/execv hand the environment to the replacement unconditionally.
+  Consume = read + remove, so later host-spawned children never inherit a
+  stale mark. Exposed for tests. }
+procedure CrashSetFreezeRestartEnvMark;
+function CrashConsumeFreezeRestartEnvMark: Boolean;
+
+{$IF not Defined(MSWINDOWS)}
+{ Spawn AExePath with AArgv (argv[0] included) detached, confirming through a
+  CLOEXEC pipe that execv actually started it (a successful exec closes the
+  write end - EOF; a failed one writes a byte first). False = nothing runs
+  (fork or execv failed); the CALLER is alive either way, and the failed
+  child is reaped. The building block of Restart, exposed so spawn-failure
+  handling stays testable. }
+function CrashSpawnDetachedVerified(const AExePath: String;
+  const AArgv: TArray<String>): Boolean;
+{$ENDIF}
+
 type
   { Public façade. All methods are class (static) methods backed by a singleton. }
   TCrashReporter = class
@@ -182,9 +208,12 @@ type
       AHardExit=True quits via _exit/TerminateProcess, skipping unit
       finalization - the freeze path needs that: finalization on the watchdog
       thread would join the watchdog itself and can deadlock on locks the
-      frozen main thread still holds. }
+      frozen main thread still holds. Returns ONLY on spawn failure (False:
+      CreateProcess failed / fork or execv did not start the replacement) -
+      the caller decides what a live-but-unreplaced process does next. On
+      success the call never returns. }
     class function CanRestart: Boolean; static;
-    class procedure Restart(const AHardExit: Boolean = False); static;
+    class function Restart(const AHardExit: Boolean = False): Boolean; static;
 
     { Notice left by a previous run that freeze-restarted itself (see
       TCrashConfig.RestartOnFreeze). Found=False when there is none. Empties
@@ -238,10 +267,13 @@ uses
   Winapi.Windows,
   {$ENDIF}
   {$IF not Defined(MSWINDOWS)}
-  Posix.Unistd, // getpid(), fork(), execv()
+  Posix.Unistd, // getpid(), fork(), execv(), pipe()
   Posix.Stdlib,
   Posix.SysTypes,
   Posix.Base,
+  Posix.Fcntl,   // FD_CLOEXEC on the exec-confirmation pipe
+  Posix.SysWait, // waitpid() for the failed-exec child
+  Posix.Errno,
   {$ENDIF}
   System.SysUtils;
 
@@ -347,6 +379,30 @@ begin
   end;
   ANotice.Found := True;
   Result := True;
+end;
+
+const
+  CRASH_FREEZE_RESTART_ENV = 'CRASH_FREEZE_RESTARTED';
+
+procedure CrashSetFreezeRestartEnvMark;
+begin
+  {$IF Defined(MSWINDOWS)}
+  SetEnvironmentVariable(CRASH_FREEZE_RESTART_ENV, '1');
+  {$ELSE}
+  setenv(CRASH_FREEZE_RESTART_ENV, '1', 1);
+  {$ENDIF}
+end;
+
+function CrashConsumeFreezeRestartEnvMark: Boolean;
+begin
+  Result := GetEnvironmentVariable(CRASH_FREEZE_RESTART_ENV) = '1';
+  if not Result then
+    Exit;
+  {$IF Defined(MSWINDOWS)}
+  SetEnvironmentVariable(CRASH_FREEZE_RESTART_ENV, nil);
+  {$ELSE}
+  unsetenv(CRASH_FREEZE_RESTART_ENV);
+  {$ENDIF}
 end;
 
 type
@@ -502,6 +558,11 @@ procedure TCrashReporterImpl.ReadRestartNoticeAtBoot;
 var
   Path: String;
 begin
+  // The env mark is the authoritative loop-guard channel: it reaches this run
+  // even when the restarting instance could not write the notice (read-only /
+  // full report dir). The notice file adds the UI payload when it exists.
+  if CrashConsumeFreezeRestartEnvMark then
+    FWasFreezeRestarted := True;
   Path := RestartNoticeFilePath;
   if CrashReadRestartNoticeFile(Path, FRestartNotice) then
   begin
@@ -1001,13 +1062,22 @@ begin
     try
       CrashWriteRestartNoticeFile(RestartNoticeFilePath, Notice);
     except
-      // A missing notice is not a reason to stay frozen.
+      // A lost notice only loses the next-boot user notification; the loop
+      // guard itself rides the env mark below.
     end;
+    CrashSetFreezeRestartEnvMark;
     ConsoleLine('*** replacing the frozen application with a fresh instance (RestartOnFreeze) ***');
     // Hard exit: no unit finalization - it runs on THIS watchdog thread (it
     // would join itself in TCrashFreeze.Shutdown) and can deadlock on locks
-    // the frozen main thread still holds. Does not return.
-    TCrashReporter.Restart(True);
+    // the frozen main thread still holds. Returns only on spawn failure -
+    // then killing ourselves would leave the user with nothing: undo the
+    // restart markers and stay alive in report-only mode.
+    if not TCrashReporter.Restart(True) then
+    begin
+      CrashConsumeFreezeRestartEnvMark;
+      try TFile.Delete(RestartNoticeFilePath); except end;
+      ConsoleLine('*** restart failed - the frozen instance stays alive (report-only) ***');
+    end;
   end;
 end;
 
@@ -1281,9 +1351,82 @@ end;
 function fork: pid_t; cdecl; external libc name _PU + 'fork';
 function execv(path: MarshaledAString; argv: PMarshaledAString): Integer; cdecl;
   external libc name _PU + 'execv';
+
+function CrashSpawnDetachedVerified(const AExePath: String;
+  const AArgv: TArray<String>): Boolean;
+var
+  ChildPid: pid_t;
+  ArgBytes: array of TBytes;
+  Argv: array of MarshaledAString;
+  ExePath: TBytes;
+  I: Integer;
+  Fds: TPipeDescriptors;
+  HavePipe: Boolean;
+  Confirm: Byte;
+  N: ssize_t;
+begin
+  Result := False;
+  // Marshal argv BEFORE fork: in the child of a multithreaded process only
+  // async-signal-safe calls are allowed until execv - a heap allocation there
+  // can deadlock on a lock another thread held at fork time.
+  ExePath := TEncoding.UTF8.GetBytes(AExePath);
+  SetLength(ExePath, Length(ExePath) + 1); // null-terminate
+  SetLength(ArgBytes, Length(AArgv));
+  SetLength(Argv, Length(AArgv) + 1); // +1 for the NULL terminator
+  for I := 0 to High(AArgv) do
+  begin
+    ArgBytes[I] := TEncoding.UTF8.GetBytes(AArgv[I]);
+    SetLength(ArgBytes[I], Length(ArgBytes[I]) + 1); // null-terminate
+    Argv[I] := MarshaledAString(@ArgBytes[I][0]);
+  end;
+  Argv[Length(AArgv)] := nil;
+
+  // Exec-confirmation channel (see the interface comment). No pipe (fd
+  // exhaustion) = degrade to the old unverified spawn rather than refuse.
+  HavePipe := pipe(Fds) = 0;
+  if HavePipe then
+    fcntl(Fds.WriteDes, F_SETFD, FD_CLOEXEC);
+
+  ChildPid := fork;
+  if ChildPid = 0 then
+  begin
+    // Child: if execv returns, it failed - report through the pipe, then
+    // _exit, not Halt: unit finalization is not fork-safe either. (write and
+    // _exit are async-signal-safe.)
+    execv(MarshaledAString(@ExePath[0]), @Argv[0]);
+    Confirm := 1;
+    if HavePipe then
+      __write(Fds.WriteDes, @Confirm, 1);
+    Posix.Unistd._exit(127);
+  end;
+  if ChildPid = -1 then
+  begin
+    // fork failed - nothing was spawned.
+    if HavePipe then
+    begin
+      __close(Fds.ReadDes);
+      __close(Fds.WriteDes);
+    end;
+    Exit;
+  end;
+  if not HavePipe then
+    Exit(True); // no confirmation channel - assume the exec went through
+  __close(Fds.WriteDes);
+  repeat
+    N := __read(Fds.ReadDes, @Confirm, 1);
+  until (N >= 0) or (errno <> EINTR);
+  __close(Fds.ReadDes);
+  if N > 0 then
+  begin
+    // execv never started the replacement; reap the _exit(127) child.
+    waitpid(ChildPid, nil, 0);
+    Exit;
+  end;
+  Result := True; // EOF: the pipe died with a successful exec
+end;
 {$ENDIF}
 
-class procedure TCrashReporter.Restart(const AHardExit: Boolean);
+class function TCrashReporter.Restart(const AHardExit: Boolean): Boolean;
 {$IF Defined(MSWINDOWS)}
 var
   SI: TStartupInfo;
@@ -1291,10 +1434,7 @@ var
   CmdLine: String;
 {$ELSEIF Defined(LINUX) or Defined(MACOS)}
 var
-  ChildPid: pid_t;
-  ArgList: array of TBytes;
-  Argv: array of MarshaledAString;
-  ExePath: TBytes;
+  Args: TArray<String>;
   I: Integer;
 {$ENDIF}
 
@@ -1312,47 +1452,30 @@ var
   end;
 
 begin
+  Result := False;
   if not CanRestart then
   begin
+    // Restart is disallowed here (not a spawn failure): quit as requested.
     QuitSelf;
     Exit;
   end;
 
   {$IF Defined(MSWINDOWS)}
+  // GetCommandLine, not a ParamStr rebuild: the original quoting survives.
   CmdLine := GetCommandLine;
   FillChar(SI, SizeOf(SI), 0);
   SI.cb := SizeOf(SI);
-  if CreateProcess(nil, PChar(CmdLine), nil, nil, False, 0, nil, nil, SI, PI) then
-  begin
-    CloseHandle(PI.hProcess);
-    CloseHandle(PI.hThread);
-  end;
+  if not CreateProcess(nil, PChar(CmdLine), nil, nil, False, 0, nil, nil, SI, PI) then
+    Exit; // spawn failed - the caller keeps this process alive
+  CloseHandle(PI.hProcess);
+  CloseHandle(PI.hThread);
   QuitSelf;
   {$ELSEIF Defined(LINUX) or Defined(MACOS)}
-  // Marshal argv BEFORE fork: in the child of a multithreaded process only
-  // async-signal-safe calls are allowed until execv - a heap allocation there
-  // can deadlock on a lock another thread held at fork time.
-  SetLength(ArgList, ParamCount + 1);
-  SetLength(Argv, ParamCount + 2); // +1 for the NULL terminator
+  SetLength(Args, ParamCount + 1);
   for I := 0 to ParamCount do
-  begin
-    ArgList[I] := TEncoding.UTF8.GetBytes(ParamStr(I));
-    SetLength(ArgList[I], Length(ArgList[I]) + 1); // null-terminate
-    Argv[I] := MarshaledAString(@ArgList[I][0]);
-  end;
-  Argv[ParamCount + 1] := nil;
-  ExePath := TEncoding.UTF8.GetBytes(ParamStr(0));
-  SetLength(ExePath, Length(ExePath) + 1);
-
-  ChildPid := fork;
-  if ChildPid = 0 then
-  begin
-    // Child: execv ourselves with the same argv. If execv returns, it failed;
-    // _exit, not Halt - unit finalization is not fork-safe either.
-    execv(MarshaledAString(@ExePath[0]), @Argv[0]);
-    Posix.Unistd._exit(127);
-  end;
-  // Parent (or fork failed - ChildPid=-1) - exit.
+    Args[I] := ParamStr(I);
+  if not CrashSpawnDetachedVerified(ParamStr(0), Args) then
+    Exit; // spawn failed - the caller keeps this process alive
   QuitSelf;
   {$ELSE}
   QuitSelf;
