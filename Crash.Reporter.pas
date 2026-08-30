@@ -207,6 +207,12 @@ function CrashSpawnDetachedVerified(const AExePath: String;
 function CrashMarkFDsCloseOnExecViaProcFS: Boolean;
 {$ENDIF}
 function CrashMarkFDsCloseOnExecBySweep(const AFdLimit: Integer): Boolean;
+{$IF Defined(AUTOTESTS)}
+{ Exact finite RLIMIT_NOFILE -> bounded-sweep limit. -1 means the limit cannot
+  be represented safely, so an unbounded primitive must succeed or spawn must
+  fail closed. Exposed only to regression tests. }
+function CrashFdSweepLimitFromRLimit(const ARlimCur: UInt64): Integer;
+{$ENDIF}
 {$ENDIF}
 
 type
@@ -1443,6 +1449,14 @@ begin
       Result := False; // keep sweeping - mark as much as possible - but report
 end;
 
+function CrashFdSweepLimitFromRLimit(const ARlimCur: UInt64): Integer;
+begin
+  if ARlimCur <= UInt64(High(Integer)) then
+    Result := Integer(ARlimCur)
+  else
+    Result := -1;
+end;
+
 {$IF Defined(LINUX)}
 const
   SYS_getdents64     = 217;    // x86-64
@@ -1532,6 +1546,8 @@ begin
   if CrashMarkFDsCloseOnExecViaProcFS then
     Exit(True);
   {$ENDIF}
+  if AFdLimit < 0 then
+    Exit(False); // no exact bound: never run a knowingly incomplete sweep
   Result := CrashMarkFDsCloseOnExecBySweep(AFdLimit);
 end;
 
@@ -1564,21 +1580,17 @@ begin
   end;
   Argv[Length(AArgv)] := nil;
 
-  // Bound for the LAST-RESORT bounded sweep (Linux normally takes close_range
-  // or the /proc walk - neither needs a bound; macOS has no unbounded
-  // primitive). rlim_cur is the honest limit: no fd above it can exist. Only
-  // RLIM_INFINITY or a broken getrlimit is capped - macOS at its
-  // kern.maxfilesperproc default, Linux at 1M (a sub-second worst-case
-  // sweep). Read in the parent: getrlimit is not on the async-signal-safe
-  // list, the child gets a ready number.
-  {$IF Defined(MACOS)}
-  FdLimit := 10240;
-  {$ELSE}
-  FdLimit := 1048576;
-  {$ENDIF}
-  if (getrlimit(CRASH_RLIMIT_NOFILE, RLim) = 0) and
-     (RLim.rlim_cur > 3) and (RLim.rlim_cur < UInt64(FdLimit)) then
-    FdLimit := Integer(RLim.rlim_cur);
+  // Exact bound for the LAST-RESORT bounded sweep (Linux normally takes
+  // close_range or the /proc walk - neither needs one; macOS has no unbounded
+  // primitive). A finite representable rlim_cur is the honest limit: no fd at
+  // or above it can exist. A failed getrlimit, RLIM_INFINITY or a value beyond
+  // Integer cannot be swept completely by this loop, so keep the -1 sentinel:
+  // Linux may still succeed through an unbounded level; otherwise the child
+  // aborts before execv. Read in the parent because getrlimit is not on the
+  // async-signal-safe list.
+  FdLimit := -1;
+  if getrlimit(CRASH_RLIMIT_NOFILE, RLim) = 0 then
+    FdLimit := CrashFdSweepLimitFromRLimit(RLim.rlim_cur);
 
   // Exec-confirmation channel (see the interface comment). Fail-closed: a
   // spawn we cannot confirm is a spawn we do not attempt - the caller keeps
