@@ -168,18 +168,26 @@ function CrashReadRestartNoticeFile(const APath: String;
   twin of the notice file. The guard must survive a report dir that cannot be
   written (read-only, full disk, missing), so it rides process inheritance:
   CreateProcess/execv hand the environment to the replacement unconditionally.
+  Set returns True only when the mark is verifiably in place (the value is
+  read back after the API call) - a False from BOTH channels means the
+  restart loop guard cannot be armed at all, and the caller must not restart.
   Consume = read + remove, so later host-spawned children never inherit a
   stale mark. Exposed for tests. }
-procedure CrashSetFreezeRestartEnvMark;
+function CrashSetFreezeRestartEnvMark: Boolean;
 function CrashConsumeFreezeRestartEnvMark: Boolean;
 
 {$IF not Defined(MSWINDOWS)}
 { Spawn AExePath with AArgv (argv[0] included) detached, confirming through a
   CLOEXEC pipe that execv actually started it (a successful exec closes the
-  write end - EOF; a failed one writes a byte first). False = nothing runs
-  (fork or execv failed); the CALLER is alive either way, and the failed
-  child is reaped. The building block of Restart, exposed so spawn-failure
-  handling stays testable. }
+  write end - EOF; a failed one writes a byte first). Fail-closed: no
+  confirmation channel (pipe/fcntl failure, e.g. fd exhaustion) = no fork at
+  all, False. The child marks EVERY inherited fd >= 3 close-on-exec between
+  fork and execv, so the replacement starts with only stdio - none of the
+  frozen instance's sockets, locks or pipes leak into it (they would outlive
+  the old process inside a graph that knows nothing about them). False =
+  nothing runs; the CALLER is alive either way, and a failed child is reaped.
+  The building block of Restart, exposed so spawn-failure handling stays
+  testable. }
 function CrashSpawnDetachedVerified(const AExePath: String;
   const AArgv: TArray<String>): Boolean;
 {$ENDIF}
@@ -271,7 +279,7 @@ uses
   Posix.Stdlib,
   Posix.SysTypes,
   Posix.Base,
-  Posix.Fcntl,   // FD_CLOEXEC on the exec-confirmation pipe
+  Posix.Fcntl,   // FD_CLOEXEC on the exec-confirmation pipe + the child fd sweep
   Posix.SysWait, // waitpid() for the failed-exec child
   Posix.Errno,
   {$ENDIF}
@@ -384,13 +392,16 @@ end;
 const
   CRASH_FREEZE_RESTART_ENV = 'CRASH_FREEZE_RESTARTED';
 
-procedure CrashSetFreezeRestartEnvMark;
+function CrashSetFreezeRestartEnvMark: Boolean;
 begin
   {$IF Defined(MSWINDOWS)}
   SetEnvironmentVariable(CRASH_FREEZE_RESTART_ENV, '1');
   {$ELSE}
-  setenv(CRASH_FREEZE_RESTART_ENV, '1', 1);
+  setenv(CRASH_FREEZE_RESTART_ENV, '1', 1); // can fail (ENOMEM)
   {$ENDIF}
+  // Read-back instead of trusting the API result: True = the mark is
+  // verifiably in place for inheritance.
+  Result := GetEnvironmentVariable(CRASH_FREEZE_RESTART_ENV) = '1';
 end;
 
 function CrashConsumeFreezeRestartEnvMark: Boolean;
@@ -971,7 +982,7 @@ var
   Text, Path, FreezeNote: String;
   Info: TCrashFreezeInfo;
   Notice: TCrashRestartNotice;
-  WillRestart: Boolean;
+  WillRestart, WroteNotice, EnvMarked: Boolean;
 begin
   Info := Default(TCrashFreezeInfo);
   Info.FrozenForMS := AFrozenForMS;
@@ -1037,11 +1048,36 @@ begin
   end;
 
   // RestartOnFreeze: replace the frozen instance with a fresh one, now that
-  // the report is on disk / uploaded. Decided BEFORE the host notification so
-  // Info.Restarting tells the host what happens next.
+  // the report is on disk / uploaded. The loop-guard channels are armed FIRST:
+  // a restart that cannot leave a guard behind would re-create the very
+  // restart loop the guard exists to break, so "no channel armed" demotes the
+  // episode to report-only. All of it is decided BEFORE the host
+  // notification, so Info.Restarting tells the host what actually happens.
   WillRestart := FConfig.RestartOnFreeze and TCrashReporter.CanRestart and
     ((not FWasFreezeRestarted) or
      (TThread.GetTickCount64 - FAppStartTick >= FREEZE_RESTART_MIN_UPTIME_MS));
+  WroteNotice := False;
+  if WillRestart then
+  begin
+    Notice := Default(TCrashRestartNotice);
+    Notice.RestartedAt := Now;
+    Notice.FrozenForMS := AFrozenForMS;
+    Notice.BugID := Info.BugID;
+    Notice.ReportFile := Info.ReportFile;
+    Notice.Uploaded := Info.Uploaded;
+    try
+      CrashWriteRestartNoticeFile(RestartNoticeFilePath, Notice);
+      WroteNotice := True;
+    except
+      // Unwritable report dir: the env mark can still carry the guard.
+    end;
+    EnvMarked := CrashSetFreezeRestartEnvMark;
+    if not (WroteNotice or EnvMarked) then
+    begin
+      WillRestart := False;
+      ConsoleLine('*** freeze restart skipped: no loop-guard channel could be armed (report-only) ***');
+    end;
+  end;
   Info.Restarting := WillRestart;
 
   if Assigned(FConfig.OnFreezeReport) then
@@ -1053,19 +1089,6 @@ begin
 
   if WillRestart then
   begin
-    Notice := Default(TCrashRestartNotice);
-    Notice.RestartedAt := Now;
-    Notice.FrozenForMS := AFrozenForMS;
-    Notice.BugID := Info.BugID;
-    Notice.ReportFile := Info.ReportFile;
-    Notice.Uploaded := Info.Uploaded;
-    try
-      CrashWriteRestartNoticeFile(RestartNoticeFilePath, Notice);
-    except
-      // A lost notice only loses the next-boot user notification; the loop
-      // guard itself rides the env mark below.
-    end;
-    CrashSetFreezeRestartEnvMark;
     ConsoleLine('*** replacing the frozen application with a fresh instance (RestartOnFreeze) ***');
     // Hard exit: no unit finalization - it runs on THIS watchdog thread (it
     // would join itself in TCrashFreeze.Shutdown) and can deadlock on locks
@@ -1075,7 +1098,8 @@ begin
     if not TCrashReporter.Restart(True) then
     begin
       CrashConsumeFreezeRestartEnvMark;
-      try TFile.Delete(RestartNoticeFilePath); except end;
+      if WroteNotice then
+        try TFile.Delete(RestartNoticeFilePath); except end;
       ConsoleLine('*** restart failed - the frozen instance stays alive (report-only) ***');
     end;
   end;
@@ -1352,6 +1376,54 @@ function fork: pid_t; cdecl; external libc name _PU + 'fork';
 function execv(path: MarshaledAString; argv: PMarshaledAString): Integer; cdecl;
   external libc name _PU + 'execv';
 
+{$IF Defined(LINUX)}
+// close_range(2) via the raw syscall: the libc wrapper only exists in
+// glibc 2.34+, and an unresolved import would stop the binary from LOADING on
+// older distros - syscall() resolves everywhere, an old kernel just returns
+// ENOSYS and the caller falls back to the fcntl loop.
+function syscall(ANumber: IntPtr): IntPtr; cdecl; varargs;
+  external libc name _PU + 'syscall';
+
+const
+  SYS_close_range      = 436; // x86-64
+  CLOSE_RANGE_CLOEXEC  = 4;   // mark instead of close
+{$ENDIF}
+
+type
+  // struct rlimit; rlim_t is 64-bit on every target built here. The RTL has
+  // no Posix.SysResource unit, hence the local declaration.
+  TCrashRLimit = record
+    rlim_cur: UInt64;
+    rlim_max: UInt64;
+  end;
+
+const
+  CRASH_RLIMIT_NOFILE = {$IF Defined(MACOS)} 8 {$ELSE} 7 {$ENDIF};
+
+function getrlimit(resource: Integer; var rlp: TCrashRLimit): Integer; cdecl;
+  external libc name _PU + 'getrlimit';
+
+procedure CrashChildMarkFDsCloseOnExec(const AFdLimit: Integer);
+// Runs IN THE CHILD between fork and execv: mark every fd >= 3 close-on-exec
+// so the exec'd replacement starts with only stdio (see the interface
+// comment). Everything here is async-signal-safe (raw syscall / fcntl); the
+// fd limit is read by the PARENT before fork and passed in. The confirmation
+// pipe's write end is caught by the sweep too - it is already CLOEXEC, and a
+// failed execv can still write into it (CLOEXEC only acts on a successful
+// exec).
+var
+  Fd: Integer;
+begin
+  {$IF Defined(LINUX)}
+  if syscall(SYS_close_range, IntPtr(3), IntPtr(High(Cardinal)),
+       IntPtr(CLOSE_RANGE_CLOEXEC)) = 0 then
+    Exit;
+  {$ENDIF}
+  // Fallback (macOS, pre-5.11 kernels): bounded fcntl sweep.
+  for Fd := 3 to AFdLimit - 1 do
+    fcntl(Fd, F_SETFD, FD_CLOEXEC);
+end;
+
 function CrashSpawnDetachedVerified(const AExePath: String;
   const AArgv: TArray<String>): Boolean;
 var
@@ -1359,9 +1431,9 @@ var
   ArgBytes: array of TBytes;
   Argv: array of MarshaledAString;
   ExePath: TBytes;
-  I: Integer;
+  I, FdLimit: Integer;
+  RLim: TCrashRLimit;
   Fds: TPipeDescriptors;
-  HavePipe: Boolean;
   Confirm: Byte;
   N: ssize_t;
 begin
@@ -1381,36 +1453,50 @@ begin
   end;
   Argv[Length(AArgv)] := nil;
 
-  // Exec-confirmation channel (see the interface comment). No pipe (fd
-  // exhaustion) = degrade to the old unverified spawn rather than refuse.
-  HavePipe := pipe(Fds) = 0;
-  if HavePipe then
-    fcntl(Fds.WriteDes, F_SETFD, FD_CLOEXEC);
+  // The fd sweep bound for the child, read in the parent (getrlimit is not on
+  // the async-signal-safe list; the child gets a ready number).
+  FdLimit := 4096;
+  if getrlimit(CRASH_RLIMIT_NOFILE, RLim) = 0 then
+  begin
+    if RLim.rlim_cur > 65536 then
+      FdLimit := 65536
+    else if RLim.rlim_cur > 3 then
+      FdLimit := Integer(RLim.rlim_cur);
+  end;
+
+  // Exec-confirmation channel (see the interface comment). Fail-closed: a
+  // spawn we cannot confirm is a spawn we do not attempt - the caller keeps
+  // the process alive instead of exiting on a guess.
+  if pipe(Fds) <> 0 then
+    Exit;
+  if fcntl(Fds.WriteDes, F_SETFD, FD_CLOEXEC) <> 0 then
+  begin
+    __close(Fds.ReadDes);
+    __close(Fds.WriteDes);
+    Exit;
+  end;
 
   ChildPid := fork;
   if ChildPid = 0 then
   begin
-    // Child: if execv returns, it failed - report through the pipe, then
-    // _exit, not Halt: unit finalization is not fork-safe either. (write and
-    // _exit are async-signal-safe.)
+    // Child: detach from the parent's fd table before exec - only stdio and
+    // the (CLOEXEC) confirmation pipe may cross into the replacement.
+    CrashChildMarkFDsCloseOnExec(FdLimit);
+    // If execv returns, it failed - report through the pipe, then _exit, not
+    // Halt: unit finalization is not fork-safe either. (write and _exit are
+    // async-signal-safe.)
     execv(MarshaledAString(@ExePath[0]), @Argv[0]);
     Confirm := 1;
-    if HavePipe then
-      __write(Fds.WriteDes, @Confirm, 1);
+    __write(Fds.WriteDes, @Confirm, 1);
     Posix.Unistd._exit(127);
   end;
   if ChildPid = -1 then
   begin
     // fork failed - nothing was spawned.
-    if HavePipe then
-    begin
-      __close(Fds.ReadDes);
-      __close(Fds.WriteDes);
-    end;
+    __close(Fds.ReadDes);
+    __close(Fds.WriteDes);
     Exit;
   end;
-  if not HavePipe then
-    Exit(True); // no confirmation channel - assume the exec went through
   __close(Fds.WriteDes);
   repeat
     N := __read(Fds.ReadDes, @Confirm, 1);
