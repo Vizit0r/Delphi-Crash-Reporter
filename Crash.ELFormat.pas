@@ -32,6 +32,7 @@ type
     StartTime: TDateTime;
     CompileTime: String;       // host-supplied literal, no reparsing
     ExceptionTime: TDateTime;
+    ModulesText: String;       // pre-formatted Modules table body; '' = no table
     CpuSnapshot: String;       // pre-formatted "Registers:" section body (regs + stack hex). '' = empty section.
     SignalInfoSection: String; // separate "Crash Signal Info:" section (outside the EL format), '' = omit.
     UserName: String;
@@ -46,6 +47,11 @@ type
 function CrashBuildELReportText(
   const AReport: TCrashReport;
   const ACtx: TCrashELContext): String;
+
+{ Populate ModulesText only when the host configuration enables the section.
+  Kept separate from CrashBuildELReportText so formatting is deterministic and
+  never reads process state. }
+procedure CrashCollectELModules(var ACtx: TCrashELContext);
 
 { AExceptAddr = the reported exception's address (ExceptionLocation.CodeAddress).
   Passed down to CrashTakeAndFormatSnapshots so the pending CPU snapshot is
@@ -632,7 +638,7 @@ begin
     AppendField(SB, '1.5 Compilation Date', ACtx.CompileTime, 22);
     if ACtx.StartTime <> 0 then
     begin
-      UpSecs := SecondsBetween(Now, ACtx.StartTime);
+      UpSecs := SecondsBetween(ACtx.ExceptionTime, ACtx.StartTime);
       AppendField(SB, '1.6 Up Time', FormatUpTime(UpSecs), 22);
     end;
     SB.Append(CRLF);
@@ -873,15 +879,13 @@ begin
     // tab (no '|' rows => no data), and Generate_CPU then finds the registers.
     var RegsPresent := (not (crsRegisters in ACtx.DisabledSections)) and
                        (ACtx.CpuSnapshot <> '');
-    var ModulesText := '';
-    if not (crsModules in ACtx.DisabledSections) then
-      ModulesText := CrashFormatModulesTable(CrashEnumerateModules);
-    if ModulesText <> '' then
+    if (not (crsModules in ACtx.DisabledSections)) and
+       (ACtx.ModulesText <> '') then
     begin
       // Full "Modules Information:" header; the table brings its own dashes lines,
       // so we don't call AppendSectionHeader.
       SB.Append('Modules Information'); SB.Append(EHeaderSuffix); SB.Append(CRLF);
-      SB.Append(ModulesText);
+      SB.Append(ACtx.ModulesText);
       SB.Append(CRLF);
     end
     else if RegsPresent then
@@ -912,6 +916,13 @@ begin
   finally
     SB.Free;
   end;
+end;
+
+procedure CrashCollectELModules(var ACtx: TCrashELContext);
+begin
+  ACtx.ModulesText := '';
+  if not (crsModules in ACtx.DisabledSections) then
+    ACtx.ModulesText := CrashFormatModulesTable(CrashEnumerateModules);
 end;
 
 {$IF Defined(LINUX)}

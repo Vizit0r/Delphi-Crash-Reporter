@@ -41,6 +41,15 @@ type
     dying, only a brief stderr line is printed. }
   TCrashShowDialogProc = reference to procedure(const AReportText: String);
 
+  { Completion callback for a background upload. It is queued to the main
+    thread; the transport worker never calls host/UI code directly. }
+  TCrashUploadCompleteProc = reference to procedure(const ASuccess: Boolean);
+
+  {$IFDEF AUTOTESTS}
+  TCrashAutoTestUploadProc = reference to function(const AUrl, AFieldName,
+    AReportText, AFileName: String): Boolean;
+  {$ENDIF}
+
   { Optional: returns extra free-form text appended to the report as a trailing
     section (e.g. "what the app was doing"). Called at report time. }
   TCrashCollectContextProc = reference to function: String;
@@ -62,7 +71,9 @@ type
     AppVersion: String;
     { "1.5 Compilation Date" field. Host-supplied free-form string. }
     CompilationTime: String;
-    { Persist the .el to disk next to the exe. Default True. }
+    { Persist the .el as a normal local report. Default True. When False, an
+      upload-authorized fatal/headless path may still create a delivery artifact;
+      it is removed after confirmed upload and retained only on failure. }
     SaveToFile: Boolean;
     { File name prefix; the timestamp + ".el" are appended. Empty ->
       "<ExeBaseName>_<PLATFORM>_". }
@@ -79,8 +90,9 @@ type
     { Multipart field name for the file part. Default 'el_upload_file_0'
       (EurekaLog-compatible). }
     UploadFieldName: String;
-    { On Init, also (re)upload leftover .el files from previous runs. Requires
-      UploadEnabled. Default False. }
+    { On Init, also (re)upload every leftover .el from previous runs. Requires
+      UploadEnabled. Default False. Even when False, reports carrying their own
+      sibling .pending authorization are retried; unmarked leftovers are surfaced. }
     UploadPendingOnStartup: Boolean;
     { Allow the Restart action (platform-gated at runtime). Default True. }
     AllowRestart: Boolean;
@@ -176,6 +188,18 @@ function CrashReadRestartNoticeFile(const APath: String;
 function CrashSetFreezeRestartEnvMark: Boolean;
 function CrashConsumeFreezeRestartEnvMark: Boolean;
 
+{$IFDEF AUTOTESTS}
+{ Queue the same transport worker with an injected transport. This avoids a
+  live endpoint in state tests while exercising delete/keep and non-blocking
+  behavior. }
+function CrashAutoTestQueueUpload(const AReportText, AReportPath: String;
+  const ATransport: TCrashAutoTestUploadProc;
+  const AOnComplete: TCrashUploadCompleteProc = nil): Boolean;
+{ The exact anti-cascade transition used by HandleReport, exposed so state
+  tests can prove that a second capture is not allowed to create a file. }
+function CrashAutoTestTryClaimReport(var AAlreadyReported: Boolean): Boolean;
+{$ENDIF}
+
 {$IF not Defined(MSWINDOWS)}
 { Spawn AExePath with AArgv (argv[0] included) detached, confirming through a
   CLOEXEC pipe that execv actually started it (a successful exec closes the
@@ -223,16 +247,25 @@ type
     class procedure Init(const AConfig: TCrashConfig); static;
     class function Active: Boolean; static;
 
-    { Pending reports from previous runs (boot recovery). Empties the buffer. }
+    { Unmarked/not-upload-authorized reports from previous runs (boot recovery).
+      Empties the buffer. Marked reports are handled by the background worker. }
     class function TakePending: TArray<String>; static;
     { Convenience: dumps pending reports to ErrOutput when IsConsole. Idempotent. }
     class procedure SurfacePendingToStderr; static;
 
-    { Upload a report. AFileName = the on-disk basename (server uses the same
-      name). Returns True on HTTP 2xx. Honours the env var CRASH_NO_UPLOAD=1
-      (skips the POST, keeps the file) for local testing. }
+    { Explicit synchronous upload API. Internal fatal/freeze/UI paths use the
+      durable asynchronous API below. AFileName = the on-disk basename (server
+      uses the same name). Returns True on HTTP 2xx. Honours CRASH_NO_UPLOAD=1. }
     class function Upload(const AReportText: String;
       const AFileName: String = ''): Boolean; static;
+    { True when the configured transport can accept reports. }
+    class function CanUpload: Boolean; static;
+    { Persist + mark the current report before starting a background upload.
+      Success removes the .el first and its sibling .pending second; failure
+      leaves both for startup recovery. Returns False when delivery could not
+      be durably armed, or when upload is disabled. }
+    class function UploadLastReportAsync(const AReportText: String;
+      const AOnComplete: TCrashUploadCompleteProc = nil): Boolean; static;
 
     { Restart the process with the same parameters, then quit. CanRestart is
       False on sandboxed platforms (iOS/Android) or when AllowRestart=False.
@@ -258,9 +291,8 @@ type
     { Basename of the last written .el (so an upload uses the same name). }
     class function LastCrashFileName: String; static;
 
-    { Delete the last written .el from disk. Call after a successful manual
-      Upload (e.g. from the dialog) to mirror the fatal-path "delete on upload
-      success" policy. No-op if there is no current file. }
+    { Delete the last written .el and its sibling pending marker. No-op if there
+      is no current file. }
     class procedure DeleteLastCrashFile; static;
 
     { Init-time verdict: True when Init's Mach thread registration succeeded
@@ -294,6 +326,7 @@ uses
   Crash.MacOS.Symbols,
   Crash.MacOS.MachExc,
   Crash.Android.Symbols,
+  Crash.Pending,
   {$IF Defined(MSWINDOWS)}
   Winapi.Windows,
   {$ENDIF}
@@ -308,6 +341,16 @@ uses
   Posix.Errno,
   {$ENDIF}
   System.SysUtils;
+
+type
+  TCrashUploadWorkerProc = reference to function(const AUrl, AFieldName,
+    AReportText, AFileName: String): Boolean;
+
+procedure CrashQueueUpload(const AUrl, AFieldName, AReportText,
+  AReportPath: String; const AOnComplete: TCrashUploadCompleteProc); forward;
+procedure CrashQueueUploadWithTransport(const AUrl, AFieldName, AReportText,
+  AReportPath: String; const ATransport: TCrashUploadWorkerProc;
+  const AOnComplete: TCrashUploadCompleteProc); forward;
 
 function DefaultCrashConfig: TCrashConfig;
 begin
@@ -464,7 +507,8 @@ type
     procedure WriteCrashBriefToConsole(const AReport: TCrashReport;
       const ATerminating: Boolean);
     procedure ConsoleLine(const S: String);
-    procedure WriteToFile(const AText: String);
+    function WriteToFile(const AText: String): Boolean;
+    function EnsureCurrentReportPending(const AText: String): Boolean;
     function WriteReportTextToUniqueFile(const AText: String;
       var APath: String): Boolean;
     procedure ResetAlreadyReported;
@@ -664,36 +708,11 @@ function TCrashReporterImpl.WriteReportTextToUniqueFile(const AText: String;
 // Shared write core (exception path via WriteToFile, freeze path directly).
 // Never clobbers an existing report - appends a numeric suffix instead.
 // APath is emptied on failure so "saved to ..." messaging stays honest.
-var
-  Base, Ext, Cand: String;
-  N: Integer;
 begin
-  if TFile.Exists(APath) then
-  begin
-    Ext  := ExtractFileExt(APath);
-    Base := ChangeFileExt(APath, '');
-    N := 2;
-    repeat
-      Cand := Base + '_' + IntToStr(N) + Ext;
-      Inc(N);
-    until not TFile.Exists(Cand);
-    APath := Cand;
-  end;
-  try
-    // A custom ReportDir may not exist yet; the platform defaults always do.
-    ForceDirectories(ExtractFilePath(APath));
-    // UTF-16LE + BOM - same encoding as a Windows EL build, so the Viewer
-    // accepts it.
-    TFile.WriteAllText(APath, AText, TEncoding.Unicode);
-    Result := True;
-  except
-    // Crashing inside a crash handler is the worst outcome. Stay silent.
-    APath := '';
-    Result := False;
-  end;
+  Result := CrashWriteReportTextToUniqueFile(AText, APath);
 end;
 
-procedure TCrashReporterImpl.WriteToFile(const AText: String);
+function TCrashReporterImpl.WriteToFile(const AText: String): Boolean;
 begin
   if FCrashFilePath = '' then
     FCrashFilePath := BuildCrashFilePath;
@@ -702,7 +721,16 @@ begin
   // slipped past the skip above) would collide. The unique-suffix logic in the
   // write core guarantees no real report is ever overwritten by another (the
   // root case - the content-less phantom - is already dropped in HandleReport).
-  WriteReportTextToUniqueFile(AText, FCrashFilePath);
+  Result := WriteReportTextToUniqueFile(AText, FCrashFilePath);
+end;
+
+function TCrashReporterImpl.EnsureCurrentReportPending(
+  const AText: String): Boolean;
+begin
+  if (FCrashFilePath = '') or (not TFile.Exists(FCrashFilePath)) then
+    if not WriteToFile(AText) then
+      Exit(False);
+  Result := CrashWritePendingMarker(FCrashFilePath);
 end;
 
 procedure TCrashReporterImpl.ResetAlreadyReported;
@@ -716,14 +744,28 @@ begin
   end;
 end;
 
+function CrashTryClaimReport(var AAlreadyReported: Boolean): Boolean;
+begin
+  Result := not AAlreadyReported;
+  if Result then
+    AAlreadyReported := True;
+end;
+
+{$IFDEF AUTOTESTS}
+function CrashAutoTestTryClaimReport(
+  var AAlreadyReported: Boolean): Boolean;
+begin
+  Result := CrashTryClaimReport(AAlreadyReported);
+end;
+{$ENDIF}
+
 procedure TCrashReporterImpl.HandleReport(const AReport: TCrashReport);
 begin
   // Anti-cascade under the lock. Long operations (dialog) happen outside it.
   FLock.Enter;
   try
-    if FAlreadyReported then
+    if not CrashTryClaimReport(FAlreadyReported) then
       Exit;
-    FAlreadyReported := True;
   finally
     FLock.Leave;
   end;
@@ -834,6 +876,7 @@ begin
     Ctx.SignalInfoSection := Ctx.SignalInfoSection +
       'Mach registration for the Init (main) thread failed - hardware-fault registers are unavailable in this report';
   end;
+  CrashCollectELModules(Ctx);
   Text := CrashBuildELReportText(AReport, Ctx);
 
   // The .el file name uses the exception's EL-style BugID as its token (see
@@ -850,25 +893,13 @@ begin
     // text is already in the file. FAlreadyReported stays True - cascade calls
     // (RTL cleanup sometimes calls ExceptionAcquired after ExceptProc) are eaten.
     WriteCrashBriefToConsole(AReport, True);
-    // EL-style: upload + delete-on-success, otherwise keep the file as-is.
-    try
-      if TCrashReporter.Upload(Text, ExtractFileName(FCrashFilePath)) then
-      begin
-        ConsoleLine('Upload: OK (report sent, local file removed)');
-        if FCrashFilePath <> '' then
-          try TFile.Delete(FCrashFilePath); except end;
-      end
-      else if FConfig.UploadEnabled then
-      begin
-        if FCrashFilePath <> '' then
-          ConsoleLine('Upload: FAILED - report kept at ' + FCrashFilePath)
-        else
-          ConsoleLine('Upload: FAILED - report not saved to disk');
-      end;
-    except
-      on E: Exception do
-        ConsoleLine('Upload: EXCEPTION ' + E.ClassName + ': ' + E.Message);
-    end;
+    // A terminating process never waits on HTTP. The marker authorizes the
+    // next startup to deliver this exact report, even when SaveToFile=False.
+    if FConfig.UploadEnabled then
+      if EnsureCurrentReportPending(Text) then
+        ConsoleLine('Upload: deferred to startup (report marked pending)')
+      else
+        ConsoleLine('Upload: deferred delivery could not be persisted');
     Exit;
   end;
 
@@ -921,25 +952,16 @@ begin
   end
   else
   begin
-    // No dialog handler (e.g. worker-thread exception in a console target). Behave
-    // like the fatal path: brief stderr + try upload + delete-or-keep. The process
-    // stays alive here, so the brief must not claim termination.
+    // No dialog handler (e.g. worker-thread exception in a console target).
+    // Persist + mark before the background transport starts; the process stays
+    // alive, so the brief must not claim termination.
     WriteCrashBriefToConsole(AReport, False);
-    try
-      if TCrashReporter.Upload(Text, ExtractFileName(FCrashFilePath)) then
-      begin
-        ConsoleLine('Upload: OK (report sent, local file removed)');
-        if FCrashFilePath <> '' then
-          try TFile.Delete(FCrashFilePath); except end;
-      end
-      else if FConfig.UploadEnabled then
-      begin
-        if FCrashFilePath <> '' then
-          ConsoleLine('Upload: FAILED - report kept at ' + FCrashFilePath)
-        else
-          ConsoleLine('Upload: FAILED - report not saved to disk');
-      end;
-    except
+    if FConfig.UploadEnabled then
+    begin
+      if TCrashReporter.UploadLastReportAsync(Text) then
+        ConsoleLine('Upload: queued in background (report marked pending)')
+      else
+        ConsoleLine('Upload: background delivery could not be armed');
     end;
     ResetAlreadyReported;
   end;
@@ -1006,7 +1028,7 @@ var
   Text, Path, FreezeNote: String;
   Info: TCrashFreezeInfo;
   Notice: TCrashRestartNotice;
-  WillRestart, WroteNotice, EnvMarked: Boolean;
+  WillRestart, WroteNotice, EnvMarked, DeliveryArmed, UploadQueued: Boolean;
 begin
   Info := Default(TCrashFreezeInfo);
   Info.FrozenForMS := AFrozenForMS;
@@ -1039,16 +1061,25 @@ begin
   else
     Ctx.SignalInfoSection := FreezeNote;
 
+  CrashCollectELModules(Ctx);
   Text := CrashBuildELReportText(AReport, Ctx);
   Info.BugID := CrashGenerateExceptionID(AReport);
 
+  WillRestart := FConfig.RestartOnFreeze and TCrashReporter.CanRestart and
+    ((not FWasFreezeRestarted) or
+     (TThread.GetTickCount64 - FAppStartTick >= FREEZE_RESTART_MIN_UPTIME_MS));
+
   Path := '';
-  if FConfig.SaveToFile then
+  if FConfig.SaveToFile or FConfig.UploadEnabled then
   begin
     Path := EffectiveReportDir + EffectiveFileNamePrefix + Info.BugID + '.el';
     WriteReportTextToUniqueFile(Text, Path);
   end;
   Info.ReportFile := Path;
+  DeliveryArmed := False;
+  if FConfig.UploadEnabled and (Path <> '') then
+    DeliveryArmed := CrashWritePendingMarker(Path);
+  UploadQueued := False;
 
   if Path <> '' then
     ConsoleLine(Format('*** freeze detected (%d ms) - report saved to %s ***',
@@ -1056,30 +1087,15 @@ begin
   else
     ConsoleLine(Format('*** freeze detected (%d ms) ***', [AFrozenForMS]));
 
-  // Same policy as the non-fatal exception path: try to send, delete the
-  // local file on success, otherwise leave it for boot recovery.
-  try
-    if TCrashReporter.Upload(Text, ExtractFileName(Path)) then
-    begin
-      Info.Uploaded := True;
-      if Path <> '' then
-        try TFile.Delete(Path); except end;
-      Info.ReportFile := '';
-      ConsoleLine('Upload: OK (freeze report sent, local file removed)');
-    end;
-  except
-    // Network failure keeps the file on disk; nothing else to do.
-  end;
-
-  // RestartOnFreeze: replace the frozen instance with a fresh one, now that
-  // the report is on disk / uploaded. The loop-guard channels are armed FIRST:
+  // RestartOnFreeze: replace the frozen instance with a fresh one. A pending
+  // marker is best-effort here, not a restart prerequisite: the replacement
+  // reads the restart notice/env guard and its startup scan authorizes ALL
+  // leftovers through FWasFreezeRestarted, including an unmarked freeze .el.
+  // The loop-guard channels are armed FIRST:
   // a restart that cannot leave a guard behind would re-create the very
   // restart loop the guard exists to break, so "no channel armed" demotes the
   // episode to report-only. All of it is decided BEFORE the host
   // notification, so Info.Restarting tells the host what actually happens.
-  WillRestart := FConfig.RestartOnFreeze and TCrashReporter.CanRestart and
-    ((not FWasFreezeRestarted) or
-     (TThread.GetTickCount64 - FAppStartTick >= FREEZE_RESTART_MIN_UPTIME_MS));
   WroteNotice := False;
   if WillRestart then
   begin
@@ -1111,6 +1127,17 @@ begin
     // A host notification failure must not kill the watchdog.
   end;
 
+  // Report-only freezes may upload while the watchdog returns immediately.
+  // Restarting freezes defer entirely to the replacement process.
+  if FConfig.UploadEnabled and DeliveryArmed and (not WillRestart) then
+  try
+    CrashQueueUpload(FConfig.UploadUrl, FConfig.UploadFieldName, Text, Path, nil);
+    UploadQueued := True;
+    ConsoleLine('Upload: queued in background (freeze report marked pending)');
+  except
+    // The marker remains for startup recovery.
+  end;
+
   if WillRestart then
   begin
     ConsoleLine('*** replacing the frozen application with a fresh instance (RestartOnFreeze) ***');
@@ -1125,6 +1152,13 @@ begin
       if WroteNotice then
         try TFile.Delete(RestartNoticeFilePath); except end;
       ConsoleLine('*** restart failed - the frozen instance stays alive (report-only) ***');
+      if FConfig.UploadEnabled and DeliveryArmed and (not UploadQueued) then
+      try
+        CrashQueueUpload(FConfig.UploadUrl, FConfig.UploadFieldName, Text, Path, nil);
+        ConsoleLine('Upload: queued after restart failure');
+      except
+        // The marker remains for startup recovery.
+      end;
     end;
   end;
 end;
@@ -1187,16 +1221,87 @@ begin
   end;
 end;
 
-const
-  { Startup-recovery upload budget per launch: a long backlog must not hold the
-    radio / endpoint for minutes; leftovers go out on the next launches. }
-  MaxStartupUploads = 3;
+procedure CrashQueueUpload(const AUrl, AFieldName, AReportText,
+  AReportPath: String; const AOnComplete: TCrashUploadCompleteProc);
+begin
+  CrashQueueUploadWithTransport(AUrl, AFieldName, AReportText, AReportPath,
+    nil, AOnComplete);
+end;
+
+procedure CrashQueueUploadWithTransport(const AUrl, AFieldName, AReportText,
+  AReportPath: String; const ATransport: TCrashUploadWorkerProc;
+  const AOnComplete: TCrashUploadCompleteProc);
+var
+  UploadUrl, UploadField, UploadText, UploadPath: String;
+  CompleteProc: TCrashUploadCompleteProc;
+  TransportProc: TCrashUploadWorkerProc;
+begin
+  // Capture only immutable values. The worker never dereferences GReporter and
+  // therefore remains safe if finalization starts while HTTP is still active.
+  UploadUrl := AUrl;
+  UploadField := AFieldName;
+  UploadText := AReportText;
+  UploadPath := AReportPath;
+  CompleteProc := AOnComplete;
+  TransportProc := ATransport;
+  TThread.CreateAnonymousThread(
+    procedure
+    var
+      Success: Boolean;
+    begin
+      if Assigned(TransportProc) then
+        Success := TransportProc(UploadUrl, UploadField, UploadText,
+          ExtractFileName(UploadPath))
+      else
+        Success := CrashUploadCore(UploadUrl, UploadField, UploadText,
+          ExtractFileName(UploadPath));
+      if Success then
+        CrashDeleteReportAndPendingMarker(UploadPath);
+      if Assigned(CompleteProc) then
+        TThread.ForceQueue(nil,
+          procedure
+          begin
+            try
+              CompleteProc(Success);
+            except
+              // A completion callback cannot affect delivery state.
+            end;
+          end);
+    end).Start;
+end;
+
+{$IFDEF AUTOTESTS}
+function CrashAutoTestQueueUpload(const AReportText, AReportPath: String;
+  const ATransport: TCrashAutoTestUploadProc;
+  const AOnComplete: TCrashUploadCompleteProc): Boolean;
+var
+  WorkerTransport: TCrashUploadWorkerProc;
+begin
+  Result := False;
+  if not Assigned(ATransport) then
+    Exit;
+  WorkerTransport :=
+    function(const AUrl, AFieldName, AText, AFileName: String): Boolean
+    begin
+      Result := ATransport(AUrl, AFieldName, AText, AFileName);
+    end;
+  try
+    CrashQueueUploadWithTransport('autotest://upload', 'fixture',
+      AReportText, AReportPath, WorkerTransport, AOnComplete);
+    Result := True;
+  except
+    // The test observes a failed queue request directly.
+  end;
+end;
+{$ENDIF}
 
 procedure TCrashReporterImpl.ScanPendingCrashReports;
 var
-  Dir, FilePath, Pattern: String;
-  Files: TArray<String>;
+  Dir, FilePath, Pattern, MarkerPattern: String;
+  Files, MarkerFiles, UploadFiles, StartupUploadFiles,
+    SurfaceFiles: TArray<String>;
   Kept: TList<String>;
+  UploadAll: Boolean;
 begin
   Dir := EffectiveReportDir; // same directory we write to (see BuildCrashFilePath)
   if Dir = '' then
@@ -1205,6 +1310,16 @@ begin
   // other's files, while (with a stable host-set ScanFileNamePrefix) still
   // matching reports written by a previous app version.
   Pattern := EffectiveScanPrefix + '*.el';
+  MarkerPattern := EffectiveScanPrefix + '*.pending';
+
+  // A crash between deleting the sent .el and deleting its marker leaves a
+  // harmless orphan. Remove it before partitioning the live reports.
+  MarkerFiles := nil;
+  try
+    MarkerFiles := TDirectory.GetFiles(Dir, MarkerPattern);
+  except
+  end;
+  CrashCleanupOrphanPendingMarkers(MarkerFiles);
 
   Files := nil;
   try
@@ -1215,61 +1330,60 @@ begin
   if Files = nil then
     Exit;
 
-  // A boot spawned by RestartOnFreeze always retries leftovers: delivering
-  // the freeze report is what the restart was for (the frozen instance's own
-  // upload may have failed, or host policy defers uploads to the next boot).
-  if FConfig.UploadEnabled and
-     (FConfig.UploadPendingOnStartup or FWasFreezeRestarted) then
-  begin
-    // Upload OFF the startup path: a slow or offline endpoint must not block
-    // launch (up to 10s connect + 30s response PER FILE adds up to an ANR on
-    // mobile). Capped per launch; files stay on disk until sent. The worker
-    // gets its own COPIES of the config strings and runs entirely on
-    // CrashUploadCore - it never touches the singleton, which may already be
-    // torn down at shutdown while an upload is still in flight.
-    var UploadUrl := FConfig.UploadUrl;
-    var UploadField := FConfig.UploadFieldName;
-    TThread.CreateAnonymousThread(
-      procedure
-      var
-        I, Attempts: Integer;
-        UpFile, UpText: String;
-      begin
-        Attempts := 0;
-        for I := 0 to High(Files) do
-        begin
-          if Attempts >= MaxStartupUploads then
-            Break;
-          UpFile := Files[I];
-          try
-            UpText := TFile.ReadAllText(UpFile, TEncoding.Unicode);
-            Inc(Attempts);
-            if CrashUploadCore(UploadUrl, UploadField, UpText,
-                 ExtractFileName(UpFile)) then
-              try TFile.Delete(UpFile); except end; // sent -> remove
-          except
-            // Unreadable - skip silently; the file stays.
-          end;
-        end;
-      end).Start;
-    Exit;
-  end;
-
-  // No startup upload: keep the texts for the host to surface (stderr etc.).
+  // RestartOnFreeze and the explicit global policy authorize every leftover.
+  // In ordinary desktop mode only a valid per-file marker authorizes upload;
+  // unmarked reports are still surfaced even when marked neighbours exist.
+  UploadAll := FConfig.UploadEnabled and
+    (FConfig.UploadPendingOnStartup or FWasFreezeRestarted);
+  CrashPartitionPendingFiles(Files, FConfig.UploadEnabled, UploadAll,
+    UploadFiles, SurfaceFiles);
   Kept := TList<String>.Create;
   try
-    for FilePath in Files do
-    begin
+    for FilePath in SurfaceFiles do
       try
         Kept.Add(TFile.ReadAllText(FilePath, TEncoding.Unicode));
       except
         // Couldn't read - skip silently; the file stays.
       end;
-    end;
     FPendingReports := Kept.ToArray;
   finally
     Kept.Free;
   end;
+
+  if Length(UploadFiles) = 0 then
+    Exit;
+
+  // Select the bounded batch before starting the worker. Reports outside it
+  // are not opened and their .pending markers remain untouched for a later
+  // launch, regardless of success/failure inside this batch.
+  StartupUploadFiles := CrashTakeStartupUploadBatch(UploadFiles,
+    CRASH_MAX_STARTUP_UPLOADS);
+  if Length(StartupUploadFiles) = 0 then
+    Exit;
+
+  // Upload OFF the startup path. The worker owns immutable copies and never
+  // dereferences the reporter singleton during or after finalization.
+  var UploadUrl := FConfig.UploadUrl;
+  var UploadField := FConfig.UploadFieldName;
+  TThread.CreateAnonymousThread(
+    procedure
+    var
+      I: Integer;
+      UpFile, UpText: String;
+    begin
+      for I := 0 to High(StartupUploadFiles) do
+      begin
+        UpFile := StartupUploadFiles[I];
+        try
+          UpText := TFile.ReadAllText(UpFile, TEncoding.Unicode);
+          if CrashUploadCore(UploadUrl, UploadField, UpText,
+               ExtractFileName(UpFile)) then
+            CrashDeleteReportAndPendingMarker(UpFile);
+        except
+          // Unreadable/upload failure: report and marker stay for a later boot.
+        end;
+      end;
+    end).Start;
 end;
 
 function TCrashReporterImpl.TakePendingCrashReports: TArray<String>;
@@ -1344,7 +1458,7 @@ class procedure TCrashReporter.DeleteLastCrashFile;
 begin
   if (GReporter <> nil) and (GReporter.FCrashFilePath <> '') then
   begin
-    try TFile.Delete(GReporter.FCrashFilePath); except end;
+    CrashDeleteReportAndPendingMarker(GReporter.FCrashFilePath);
     GReporter.FCrashFilePath := '';
   end;
 end;
@@ -1366,6 +1480,37 @@ begin
     Exit;
   Result := CrashUploadCore(GReporter.FConfig.UploadUrl,
     GReporter.FConfig.UploadFieldName, AReportText, AFileName);
+end;
+
+class function TCrashReporter.CanUpload: Boolean;
+begin
+  Result := (GReporter <> nil) and GReporter.FConfig.UploadEnabled and
+    (GReporter.FConfig.UploadUrl <> '');
+end;
+
+class function TCrashReporter.UploadLastReportAsync(const AReportText: String;
+  const AOnComplete: TCrashUploadCompleteProc): Boolean;
+var
+  Reporter: TCrashReporterImpl;
+  UploadUrl, UploadField, ReportPath: String;
+begin
+  Result := False;
+  Reporter := GReporter;
+  if (Reporter = nil) or (not Reporter.FConfig.UploadEnabled) or
+     (Reporter.FConfig.UploadUrl = '') then
+    Exit;
+  if not Reporter.EnsureCurrentReportPending(AReportText) then
+    Exit;
+  UploadUrl := Reporter.FConfig.UploadUrl;
+  UploadField := Reporter.FConfig.UploadFieldName;
+  ReportPath := Reporter.FCrashFilePath;
+  try
+    CrashQueueUpload(UploadUrl, UploadField, AReportText, ReportPath,
+      AOnComplete);
+    Result := True;
+  except
+    // The durable marker remains for startup recovery.
+  end;
 end;
 
 class function TCrashReporter.MainThreadMachCovered: Boolean;

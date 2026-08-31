@@ -197,8 +197,11 @@ begin
   Cfg.AppName         := 'CrashDemo';
   Cfg.AppVersion      := '0.0.0.1';
   Cfg.CompilationTime := FormatDateTime('dd.mm.yyyy hh:nn:ss', Now);
-  Cfg.SaveToFile      := True;
-  Cfg.UploadEnabled   := False;     // pure local test; never phones home
+  Cfg.SaveToFile      := GetEnvironmentVariable('CRASH_DEMO_SAVE_TO_FILE') <> '0';
+  // Local by default. Setting CRASH_DEMO_UPLOAD_URL explicitly enables the
+  // delivery paths so marker/deferred-upload behavior can be smoke-tested.
+  Cfg.UploadUrl       := GetEnvironmentVariable('CRASH_DEMO_UPLOAD_URL');
+  Cfg.UploadEnabled   := Cfg.UploadUrl <> '';
 
   if DoFreeze then
   begin

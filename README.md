@@ -44,7 +44,7 @@ On **Android** the deployed `.so` is stripped and the linker localizes Pascal sy
 so names + lines come from two side-files shipped with the app — `.gosym` (names) and
 `.gol` (lines); see their sections below. There is also no usable modal report dialog on
 mobile (FMX `ShowModal` is async-only), so wire `OnShowDialog := nil`: non-fatal
-exceptions are saved + uploaded headlessly, and an unhandled main-thread Pascal exception
+exceptions are saved, marked and uploaded in the background, and an unhandled main-thread Pascal exception
 is caught by FMX's `HandleException` (the app survives), not the `ExceptProc` fatal path.
 
 ## Quick start
@@ -88,13 +88,13 @@ vary is a field — there are no compile-time constants baked into the library.
 | `AppName` | exe name | Shown in the report header |
 | `AppVersion` | `''` | Host-supplied version string |
 | `CompilationTime` | `''` | "1.5 Compilation Date" field |
-| `SaveToFile` | `True` | Persist the `.el` next to the exe |
+| `SaveToFile` | `True` | Keep a normal local `.el`. With `False`, an upload-authorized fatal/headless path still creates a delivery artifact and removes it only after confirmed upload |
 | `FileNamePrefix` | `<exe>_<PLATFORM>_` | `<prefix><BugID>.el` file naming |
 | `ScanFileNamePrefix` | `''` (= `FileNamePrefix`) | Boot-recovery scan prefix; set a stable version-free prefix when `FileNamePrefix` embeds an app version, so older-version reports are still picked up |
 | `UploadEnabled` | `False` | Upload reports to `UploadUrl` |
 | `UploadUrl` | `''` | Full multipart-POST endpoint (host builds it) |
 | `UploadFieldName` | `el_upload_file_0` | Multipart file field name |
-| `UploadPendingOnStartup` | `False` | Re-upload leftover reports after `Init` (background thread, max 3 files per launch) |
+| `UploadPendingOnStartup` | `False` | Upload every leftover report after `Init`; when `False`, only reports with their own `.pending` authorization are retried (background, max 3 attempts per launch) |
 | `AllowRestart` | `True` | Allow the Restart action (platform-gated) |
 | `OnShowDialog` | `nil` | GUI dialog provider; `nil` → brief stderr |
 | `OnCollectContext` | `nil` | Optional extra text appended to the report |
@@ -108,6 +108,31 @@ vary is a field — there are no compile-time constants baked into the library.
 
 Set the env var `CRASH_NO_UPLOAD=1` to skip uploads and keep the file on disk
 (useful for local testing).
+
+### Durable delivery (`.pending`)
+
+Network I/O never runs on fatal, freeze-watchdog or modal-event paths. Before a
+report is eligible for automatic delivery, Crash publishes the complete UTF-16LE
+`.el` through a same-directory temporary file and creates a sibling marker:
+
+```text
+Crash_LINUX_DEADBEEF.el
+Crash_LINUX_DEADBEEF.pending
+```
+
+The marker contains `CRASH_PENDING_V1` (an empty marker is accepted for forward
+compatibility). Upload success deletes the `.el` first and the marker second;
+failure leaves both. At startup each file is classified independently: a valid
+marker authorizes retry even when `UploadPendingOnStartup=False`, while an
+unmarked neighbour is returned by `TakePending` for the host to surface. A
+freeze-restarted process is the deliberate global exception and retries every
+matching leftover. Orphan markers are removed. `CRASH_NO_UPLOAD=1` models a
+failed transport, so both artifacts remain.
+
+The FMX Send action creates the marker only after the user clicks it, performs
+HTTP in a worker and displays retry state without blocking the UI. Closing the
+dialog without Send leaves no delivery marker. Restart creates the marker before
+process replacement and never waits for the network.
 
 ### Vetoing a report (`OnFilterReport`)
 
@@ -157,6 +182,7 @@ Core (framework-agnostic):
 - `Crash.CallStack` — RTL exception hooks + stack capture; `TCrashCapture`, `TCrashReport`, `TCrashReportSection`.
 - `Crash.Signals` — POSIX `sigaction` CPU-register snapshot for hardware faults.
 - `Crash.Modules` — loaded-module enumeration.
+- `Crash.Pending` — atomic report publication, delivery markers and startup partitioning.
 - `Crash.LineNumbers` — `.gol` line-number reader.
 - `Crash.Android.Symbols` — `.gosym` reader: address → Pascal name + source file on Android.
 - `Crash.ELFormat` — EurekaLog `.el` text writer.
@@ -432,8 +458,8 @@ compiles to no-op stubs (Windows is EurekaLog territory).
 
 ### RestartOnFreeze
 
-With `RestartOnFreeze := True` the reporter, after writing/uploading the freeze
-`.el`, **replaces the frozen process**: a fresh instance is spawned with the
+With `RestartOnFreeze := True` the reporter, after writing and marking the freeze
+`.el`, **replaces the frozen process** without waiting for HTTP: a fresh instance is spawned with the
 same command line (fork/execv; CreateProcess on Windows) and the frozen one
 exits *without* unit finalization — it is not runnable enough for one. The exit
 happens only once the spawn is **confirmed** (the CreateProcess result on
@@ -510,6 +536,12 @@ CRASH_NO_UPLOAD=1 ./CrashDemo --freeze         # run 1 blocks its watched thread
                                                # REPLACED by a fresh instance; that instance (same
                                                # argv) prints the restart notice, freezes again and
                                                # stays report-only (loop guard), then exits
+
+# delivery smoke: explicit env enables upload paths; the unroutable URL proves
+# fatal capture returns immediately and leaves matching .el + .pending files.
+CRASH_DEMO_UPLOAD_URL=http://10.255.255.1:9 ./CrashDemo --crash=raise
+# SaveToFile=False still persists the private delivery artifact:
+CRASH_DEMO_SAVE_TO_FILE=0 CRASH_DEMO_UPLOAD_URL=http://10.255.255.1:9 ./CrashDemo --crash=raise
 ```
 
 With no `--crash` argument it just prints `Reporter Active = True`. The reporter

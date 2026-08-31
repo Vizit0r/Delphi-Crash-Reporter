@@ -6,8 +6,8 @@ unit Crash.Dialog.FMX;
   crash/exception reporting for Delphi cross-platform targets.
 
   Shows the .el-formatted report in a TMemo (read-only, scrollable). Two buttons:
-    [OK]      = upload the report (if an URL is configured) and close.
-    [Restart] = upload + restart the process. Hidden if CanRestart=False.
+    [Send/OK] = queue upload (when configured) or just close.
+    [Restart] = mark + queue delivery, then restart. Hidden if CanRestart=False.
 
   This unit is optional and FMX-only. The host opts in by wiring it into the
   config:
@@ -46,6 +46,22 @@ uses
   Crash.Reporter;
 
 type
+  TCrashReportForm = class;
+
+  ICrashDialogUploadToken = interface
+    procedure Detach;
+    procedure Complete(const ASuccess: Boolean);
+  end;
+
+  TCrashDialogUploadToken = class(TInterfacedObject, ICrashDialogUploadToken)
+  private
+    FForm: TCrashReportForm;
+  public
+    constructor Create(const AForm: TCrashReportForm);
+    procedure Detach;
+    procedure Complete(const ASuccess: Boolean);
+  end;
+
   TCrashReportForm = class(TForm)
   private
     FMemo: TMemo;
@@ -53,6 +69,9 @@ type
     FOkButton: TButton;
     FRestartButton: TButton;
     FReportText: String; // pristine CRLF report for Upload - TMemo.Text re-joins lines with #10 on POSIX
+    FUploadToken: ICrashDialogUploadToken;
+    procedure BeginUpload(const ARestartAfterQueue: Boolean);
+    procedure UploadFinished(const ASuccess: Boolean);
     procedure DoOkClick(Sender: TObject);
     procedure DoRestartClick(Sender: TObject);
   protected
@@ -60,6 +79,7 @@ type
       Shift: TShiftState); override;
   public
     constructor CreateNew(AOwner: TComponent; Dummy: NativeInt = 0); override;
+    destructor Destroy; override;
     procedure SetReportText(const AText: String);
   end;
 
@@ -70,6 +90,23 @@ const
   BTN_PAD = 8;
   FORM_W = 820;
   FORM_H = 560;
+
+constructor TCrashDialogUploadToken.Create(const AForm: TCrashReportForm);
+begin
+  inherited Create;
+  FForm := AForm;
+end;
+
+procedure TCrashDialogUploadToken.Detach;
+begin
+  FForm := nil;
+end;
+
+procedure TCrashDialogUploadToken.Complete(const ASuccess: Boolean);
+begin
+  if FForm <> nil then
+    FForm.UploadFinished(ASuccess);
+end;
 
 constructor TCrashReportForm.CreateNew(AOwner: TComponent; Dummy: NativeInt);
 var
@@ -113,10 +150,13 @@ begin
   FOkButton.Margins.Right := BTN_PAD;
   FOkButton.Margins.Top := (BAR_H - BTN_H) div 2;
   FOkButton.Margins.Bottom := (BAR_H - BTN_H) div 2;
-  FOkButton.Text := 'OK';
+  if TCrashReporter.CanUpload then
+    FOkButton.Text := 'Send'
+  else
+    FOkButton.Text := 'OK';
   FOkButton.OnClick := DoOkClick;
   FOkButton.Default := True;
-  FOkButton.ModalResult := mrOk;
+  FOkButton.ModalResult := mrNone;
 
   FMemo := TMemo.Create(Self);
   FMemo.Parent := Self;
@@ -143,6 +183,15 @@ begin
   FMemo.TextSettings.Font.Family := 'Courier New';
   {$ENDIF}
   FMemo.TextSettings.Font.Size := 10;
+  FUploadToken := TCrashDialogUploadToken.Create(Self);
+end;
+
+destructor TCrashReportForm.Destroy;
+begin
+  if FUploadToken <> nil then
+    FUploadToken.Detach;
+  FUploadToken := nil;
+  inherited;
 end;
 
 function MeasureMaxLineWidth(const AText: String; const AFontFamily: String;
@@ -214,22 +263,68 @@ begin
   end;
 end;
 
+procedure TCrashReportForm.BeginUpload(const ARestartAfterQueue: Boolean);
+var
+  Token: ICrashDialogUploadToken;
+begin
+  if not TCrashReporter.CanUpload then
+  begin
+    ModalResult := mrOk;
+    if ARestartAfterQueue then
+      TCrashReporter.Restart;
+    Exit;
+  end;
+
+  // Restart never waits for HTTP: a successfully written marker guarantees
+  // startup recovery if the process replacement wins the race with the worker.
+  if ARestartAfterQueue then
+  begin
+    if not TCrashReporter.UploadLastReportAsync(FReportText) then
+    begin
+      Caption := CrashDialogTitle + ' - report could not be queued';
+      Exit;
+    end;
+    ModalResult := mrOk;
+    TCrashReporter.Restart;
+    Exit;
+  end;
+
+  FOkButton.Enabled := False;
+  FOkButton.Text := 'Sending...';
+  if FRestartButton <> nil then
+    FRestartButton.Enabled := False;
+  Token := FUploadToken;
+  if not TCrashReporter.UploadLastReportAsync(FReportText,
+    procedure(const ASuccess: Boolean)
+    begin
+      Token.Complete(ASuccess);
+    end) then
+    UploadFinished(False);
+end;
+
+procedure TCrashReportForm.UploadFinished(const ASuccess: Boolean);
+begin
+  if ASuccess then
+  begin
+    TCrashReporter.DeleteLastCrashFile;
+    ModalResult := mrOk;
+    Exit;
+  end;
+  Caption := CrashDialogTitle + ' - send failed; report kept';
+  FOkButton.Text := 'Retry';
+  FOkButton.Enabled := True;
+  if FRestartButton <> nil then
+    FRestartButton.Enabled := True;
+end;
+
 procedure TCrashReportForm.DoOkClick(Sender: TObject);
 begin
-  // OK = send report + continue. Upload is synchronous - the user waits a few
-  // seconds. On success drop the local .el (it's on the server now); on failure
-  // keep it on disk for the next boot-recovery attempt.
-  if TCrashReporter.Upload(FReportText, TCrashReporter.LastCrashFileName) then
-    TCrashReporter.DeleteLastCrashFile;
-  ModalResult := mrOk;
+  BeginUpload(False);
 end;
 
 procedure TCrashReportForm.DoRestartClick(Sender: TObject);
 begin
-  if TCrashReporter.Upload(FReportText, TCrashReporter.LastCrashFileName) then
-    TCrashReporter.DeleteLastCrashFile;
-  ModalResult := mrOk;
-  TCrashReporter.Restart; // returns only if the replacement failed to spawn - then the app just stays up
+  BeginUpload(True);
 end;
 
 procedure TCrashReportForm.KeyDown(var Key: Word; var KeyChar: WideChar;
