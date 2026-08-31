@@ -29,6 +29,7 @@ Derived from [grijjy/JustAddCode](https://github.com/grijjy/JustAddCode)
 | Call stack (Pascal names) | ✅ | ✅ (LC_SYMTAB) | ✅ (`.gosym`) | ❓ untested | — |
 | Source line numbers (`.gol`) | ✅ | ✅ | ✅ | — | — |
 | CPU registers on hardware faults | ✅ | ✅ (signal ucontext / Mach) | ✅ (ARM64) | — | — |
+| Raw fallback when RTL conversion does not survive | ✅ | ✅ | ✅ (ARM64) | — | — |
 | Modules section | ✅ | ✅ | ✅ | — | — |
 | EL-compatible `.el` output | ✅ | ✅ | ✅ | ✅ | — |
 | Save / upload / dialog / restart | ✅ | ✅ | ✅ (no restart) | ✅ (no restart) | — |
@@ -181,6 +182,7 @@ Core (framework-agnostic):
 - `Crash.Reporter` — public façade: `TCrashConfig`, `DefaultCrashConfig`, `TCrashReporter`.
 - `Crash.CallStack` — RTL exception hooks + stack capture; `TCrashCapture`, `TCrashReport`, `TCrashReportSection`.
 - `Crash.Signals` — POSIX `sigaction` CPU-register snapshot for hardware faults.
+- `Crash.RawFallback` — preallocated binary fallback slots and startup recovery.
 - `Crash.Modules` — loaded-module enumeration.
 - `Crash.Pending` — atomic report publication, delivery markers and startup partitioning.
 - `Crash.LineNumbers` — `.gol` line-number reader.
@@ -424,6 +426,23 @@ location-only (signal, code, ip, thread) and printed as a `Concurrent :` line.
 `Invocations` counts entries into *this* handler only; faults converted by the
 RTL while the handler was uninstalled are invisible to it (the report wording
 says so).
+
+**Raw fallback.** Before signal handlers are installed, `Crash.RawFallback`
+opens two fixed-size, process-unique files with `O_CLOEXEC`: a primary slot and
+a concurrent location-only slot. After a snapshot is published, but before the
+handler restores the RTL disposition, it copies that already-filled snapshot
+into the preallocated block using only bounded `write`/`fsync` calls. The final
+commit byte is written last. This covers failures such as a real stack overflow
+where the handler runs on the alternate stack but the later Delphi RTL
+conversion cannot build a Pascal exception or `.el`.
+
+On the next startup, a fail-closed parser accepts only the exact versioned
+layout with valid stage and commit markers. It converts the block into a normal
+EL-compatible `ERawHardwareFault` report, deduplicates it against a full `.el`
+by the embedded `Raw Capture Key`, and removes the raw file only after successful
+conversion or confirmed duplication. Fresh incomplete/corrupt blocks are kept
+for diagnosis; stale ones expire after seven days. A successfully persisted
+ordinary hardware-fault `.el` supersedes and removes its matching raw slot.
 
 Scope: Linux x86-64, macOS x86-64 + ARM64, and Android ARM64 (aarch64). Other
 targets compile to no-ops.

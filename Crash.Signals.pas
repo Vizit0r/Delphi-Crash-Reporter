@@ -38,6 +38,9 @@ unit Crash.Signals;
 
 interface
 
+uses
+  Crash.RawFallback;
+
 type
   { Alternate signal-stack verdict for one calling thread. Signal handlers are
     still process-global; only this stack is per-thread. }
@@ -101,6 +104,11 @@ function  CrashPrimaryFaultCallerAddr(out ACaller: UIntPtr): Boolean;
 procedure CrashTakeAndFormatSnapshots(AExceptAddr: UIntPtr;
   out ARegistersSection, ASignalInfoSection: String);
 
+{ Calm-path formatter for a committed startup raw fallback record. Does not
+  touch or consume the live signal slots. }
+procedure CrashFormatRecoveredRaw(const ARaw: TCrashRawRecord;
+  out ARegistersSection, ASignalInfoSection: String);
+
 type
   { CPU registers captured by the macOS Mach handler (Crash.MacOS.MachExc) and
     handed to CrashRecordMacOSSnapshot. Mirrors x86_thread_state64. }
@@ -153,52 +161,17 @@ uses
   Posix.String_;
 
 const
-  STACK_DUMP_BYTES = 256;
+  STACK_DUMP_BYTES = CRASH_RAW_STACK_BYTES;
   CRLF             = #13#10;
 
 type
-  TSnapshotKind = (skNone, skLinuxX64, skMacOSX64, skMacOSArm64, skLinuxArm64);
-
-  TSignalSnapshot = packed record
-    Claimed:       Integer;                         // atomic claim: writer wins the slot, fills the fields, THEN publishes
-    Captured:      Integer;                         // atomic publish flag: 0=empty, 1=complete (set LAST by the writer)
-    InvocationCount: Integer;                       // total times handler was entered (any signal)
-    SignalNum:     Integer;
-    SignalCode:    Integer;
-    FaultAddr:     UInt64;
-    ThreadID:      UInt64;                          // pthread identity of the faulting thread - correlation key for the reporter (0 = unknown)
-    Kind:          Integer;                         // TSnapshotKind ordinal
-    {$IF Defined(CPUX64)}
-    Rax, Rbx, Rcx, Rdx, Rdi, Rsi, Rbp, Rsp: UInt64;
-    R8,  R9,  R10, R11, R12, R13, R14, R15: UInt64;
-    Rip, Rflags, Cs:                        UInt64;
-    {$ELSEIF Defined(CPUARM64)}
-    X:      array[0..28] of UInt64;
-    Fp, Lr, Sp, Pc: UInt64;
-    Cpsr:   UInt32;
-    {$ENDIF}
-    StackBaseAddr: UInt64;
-    StackBytes:    array[0..STACK_DUMP_BYTES-1] of Byte;
-  end;
-
-  { Location-only record of a SECOND hardware fault that entered the handler
-    while the primary snapshot above was still pending (unconsumed). Full
-    registers are deliberately not kept - the point is to NAME the concurrent
-    fault in the report instead of silently losing it. }
-  TConcurrentSignal = packed record
-    Claimed:    Integer;   // atomic claim: the first extra fault wins this slot
-    Captured:   Integer;   // atomic publish flag (set LAST by the writer)
-    Epoch:      Integer;   // capture cycle of the claim (epoch read at handler ENTRY, before the CAS): a slot published after its cycle was consumed is dropped
-    SignalNum:  Integer;
-    SignalCode: Integer;
-    FaultAddr:  UInt64;
-    IP:         UInt64;    // RIP/PC of the concurrent fault
-    ThreadID:   UInt64;    // pthread identity of that thread
-  end;
+  TSignalSnapshot = TCrashRawPrimarySnapshot;
+  TConcurrentSignal = TCrashRawConcurrentSnapshot;
 
 var
   GSignalSnapshot: TSignalSnapshot;
   GConcurrentSignal: TConcurrentSignal;
+  GZeroStackBytes: array[0..STACK_DUMP_BYTES - 1] of Byte;
   GSnapshotEpoch:  Integer = 0;  // bumped by TakeSnapshot; pairs a concurrent claim with its primary capture cycle
   GOldHandlers:    array[1..31] of sigaction_t;
   GInstalled:      Boolean = False;
@@ -449,11 +422,24 @@ begin
        STACK_DUMP_BYTES);
 end;
 
+function CrashLooksLikeStackOverflow(const SP, FaultAddr: UInt64): Boolean;
+// A stack-growth guard fault is normally at/below the interrupted SP. Avoid the
+// bounded stack copy in that narrow window: crossing the guard would recurse
+// into SIGSEGV before the raw fallback can publish anything.
+const
+  STACK_GUARD_WINDOW = 64 * 1024;
+begin
+  Result := (SP <> 0) and (FaultAddr <> 0) and
+    (((FaultAddr <= SP) and (SP - FaultAddr <= STACK_GUARD_WINDOW)) or
+     ((FaultAddr > SP) and (FaultAddr - SP <= 4096)));
+end;
+
 procedure CrashSignalHandler(SigNum: Integer; SigInfo: Psiginfo_t;
   Context: Pointer); cdecl;
 var
   Restored: sigaction_t;
   ClaimEpoch: Integer;
+  SP: UInt64;
 begin
   TInterlocked.Increment(GSignalSnapshot.InvocationCount);
   // Read the capture-cycle epoch on ENTRY, before any claim attempt: read
@@ -464,17 +450,26 @@ begin
   if TInterlocked.CompareExchange(GSignalSnapshot.Claimed, 1, 0) = 0 then
   begin
     GSignalSnapshot.SignalNum := SigNum;
+    GSignalSnapshot.SignalCode := 0;
+    GSignalSnapshot.FaultAddr := 0;
     GSignalSnapshot.ThreadID  := CurrentThreadIdent;
+    GSignalSnapshot.StackBaseAddr := 0;
+    Move(GZeroStackBytes[0], GSignalSnapshot.StackBytes[0],
+      STACK_DUMP_BYTES);
     if SigInfo <> nil then
     begin
       GSignalSnapshot.SignalCode := SigInfo.si_code;
       GSignalSnapshot.FaultAddr  := ExtractFaultAddr(SigInfo);
     end;
     CaptureFromUContext(Context);
-    CopyStackTop(GetStackPointer);
+    SP := GetStackPointer;
+    if not CrashLooksLikeStackOverflow(SP, GSignalSnapshot.FaultAddr) then
+      CopyStackTop(SP);
     // Publish AFTER the fields are complete - a reader keying on Captured=1
     // must never see a half-filled snapshot.
     TInterlocked.Exchange(GSignalSnapshot.Captured, 1);
+    CrashRawBeginSlot(CRASH_RAW_SLOT_PRIMARY);
+    CrashRawCommitPrimary(GSignalSnapshot);
   end
   else if TInterlocked.CompareExchange(GConcurrentSignal.Claimed, 1, 0) = 0 then
   begin
@@ -485,6 +480,8 @@ begin
     // second register set is not worth the extra handler complexity.
     GConcurrentSignal.Epoch := ClaimEpoch;
     GConcurrentSignal.SignalNum := SigNum;
+    GConcurrentSignal.SignalCode := 0;
+    GConcurrentSignal.FaultAddr := 0;
     if SigInfo <> nil then
     begin
       GConcurrentSignal.SignalCode := SigInfo.si_code;
@@ -493,6 +490,8 @@ begin
     GConcurrentSignal.IP       := ExtractIPFromContext(Context);
     GConcurrentSignal.ThreadID := CurrentThreadIdent;
     TInterlocked.Exchange(GConcurrentSignal.Captured, 1);
+    CrashRawBeginSlot(CRASH_RAW_SLOT_CONCURRENT);
+    CrashRawCommitConcurrent(GConcurrentSignal);
   end;
 
   if (SigNum >= Low(GOldHandlers)) and (SigNum <= High(GOldHandlers)) then
@@ -799,13 +798,13 @@ function FormatRegistersSection(const S: TSignalSnapshot): String;
 // Viewer fails to parse the Stack/Memory Dump.
 var
   SB:   TStringBuilder;
-  Kind: TSnapshotKind;
+  Kind: TCrashRawSnapshotKind;
   {$IF Defined(CPUX64)}
   RIP, RSP_, EXP_, STK_: UInt64;
   {$ENDIF}
   I:    Integer;
 begin
-  Kind := TSnapshotKind(S.Kind);
+  Kind := TCrashRawSnapshotKind(S.Kind);
 
   {$IF Defined(CPUX64)}
   RIP  := S.Rip;
@@ -1054,6 +1053,20 @@ begin
   end;
 end;
 
+procedure AppendRawCaptureKeys(var ASignalInfoSection: String;
+  const AIncludeConcurrent: Boolean);
+var
+  Key: String;
+begin
+  if CrashRawGetCommittedKey(CRASH_RAW_SLOT_PRIMARY, Key) then
+    ASignalInfoSection := ASignalInfoSection + CRLF +
+      '  Raw Capture Key: ' + Key;
+  if AIncludeConcurrent and
+     CrashRawGetCommittedKey(CRASH_RAW_SLOT_CONCURRENT, Key) then
+    ASignalInfoSection := ASignalInfoSection + CRLF +
+      '  Concurrent Raw Capture Key: ' + Key;
+end;
+
 procedure CrashTakeAndFormatSnapshots(AExceptAddr: UIntPtr;
   out ARegistersSection, ASignalInfoSection: String);
 var
@@ -1106,6 +1119,45 @@ begin
     ARegistersSection := FormatRegistersSection(S);
   ASignalInfoSection := FormatSignalInfoSection(S, C, Attribution,
     UInt64(AExceptAddr), SelfID);
+  AppendRawCaptureKeys(ASignalInfoSection, C.Captured = 1);
+end;
+
+procedure CrashFormatRecoveredRaw(const ARaw: TCrashRawRecord;
+  out ARegistersSection, ASignalInfoSection: String);
+var
+  EmptyConcurrent: TConcurrentSignal;
+  SB: TStringBuilder;
+begin
+  ARegistersSection := '';
+  ASignalInfoSection := '';
+  if ARaw.PayloadKind = rpkPrimary then
+  begin
+    FillChar(EmptyConcurrent, SizeOf(EmptyConcurrent), 0);
+    ARegistersSection := FormatRegistersSection(ARaw.Primary);
+    ASignalInfoSection := FormatSignalInfoSection(ARaw.Primary,
+      EmptyConcurrent, saOwnFault, CrashRawPrimaryIP(ARaw.Primary),
+      ARaw.Primary.ThreadID);
+    ASignalInfoSection := ASignalInfoSection + CRLF +
+      '  Raw Capture Key: ' + ARaw.CaptureKey + CRLF +
+      '  Recovery   : committed raw fallback converted during startup';
+  end
+  else if ARaw.PayloadKind = rpkConcurrent then
+  begin
+    SB := TStringBuilder.Create;
+    try
+      SB.Append('Crash Signal Info:').Append(CRLF);
+      SB.Append(StringOfChar('-', 20)).Append(CRLF);
+      SB.AppendFormat('  Concurrent : %s (code=%d) at ip=%s, fault addr=%s, thread=%d',
+        [SignalNameOf(ARaw.Concurrent.SignalNum), ARaw.Concurrent.SignalCode,
+         Hex16(ARaw.Concurrent.IP), Hex16(ARaw.Concurrent.FaultAddr),
+         ARaw.Concurrent.ThreadID]).Append(CRLF);
+      SB.Append('  Raw Capture Key: ').Append(ARaw.CaptureKey).Append(CRLF);
+      SB.Append('  Recovery   : committed concurrent raw fallback converted during startup');
+      ASignalInfoSection := SB.ToString;
+    finally
+      SB.Free;
+    end;
+  end;
 end;
 
 procedure CrashRecordMacOSSnapshot(const ARegs: TCrashMacOSRegs;
@@ -1127,6 +1179,9 @@ begin
     GSignalSnapshot.SignalCode := ASignalCode;
     GSignalSnapshot.FaultAddr  := AFaultAddr;
     GSignalSnapshot.ThreadID   := AFaultThreadID;
+    GSignalSnapshot.StackBaseAddr := 0;
+    Move(GZeroStackBytes[0], GSignalSnapshot.StackBytes[0],
+      STACK_DUMP_BYTES);
     {$IF Defined(CPUX64)}
     GSignalSnapshot.Rax := ARegs.Rax;  GSignalSnapshot.Rbx := ARegs.Rbx;
     GSignalSnapshot.Rcx := ARegs.Rcx;  GSignalSnapshot.Rdx := ARegs.Rdx;
@@ -1150,6 +1205,8 @@ begin
       Move(AStackBytes^, GSignalSnapshot.StackBytes[0], AStackLen);
     end;
     TInterlocked.Exchange(GSignalSnapshot.Captured, 1); // publish after fill
+    CrashRawBeginSlot(CRASH_RAW_SLOT_PRIMARY);
+    CrashRawCommitPrimary(GSignalSnapshot);
   end
   else if TInterlocked.CompareExchange(GConcurrentSignal.Claimed, 1, 0) = 0 then
   begin
@@ -1162,6 +1219,8 @@ begin
     GConcurrentSignal.IP         := ARegs.Rip;
     GConcurrentSignal.ThreadID   := AFaultThreadID;
     TInterlocked.Exchange(GConcurrentSignal.Captured, 1);
+    CrashRawBeginSlot(CRASH_RAW_SLOT_CONCURRENT);
+    CrashRawCommitConcurrent(GConcurrentSignal);
   end;
 end;
 
@@ -1179,6 +1238,12 @@ procedure CrashDiscardPendingSnapshot;           begin end;
 function  CrashPrimaryFaultAddr(out AAddr: UIntPtr): Boolean; begin AAddr := 0; Result := False; end;
 function  CrashPrimaryFaultCallerAddr(out ACaller: UIntPtr): Boolean; begin ACaller := 0; Result := False; end;
 procedure CrashTakeAndFormatSnapshots(AExceptAddr: UIntPtr;
+  out ARegistersSection, ASignalInfoSection: String);
+begin
+  ARegistersSection := '';
+  ASignalInfoSection := '';
+end;
+procedure CrashFormatRecoveredRaw(const ARaw: TCrashRawRecord;
   out ARegistersSection, ASignalInfoSection: String);
 begin
   ARegistersSection := '';

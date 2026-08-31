@@ -227,6 +227,8 @@ function CrashAutoTestQueueUpload(const AReportText, AReportPath: String;
 { The exact anti-cascade transition used by HandleReport, exposed so state
   tests can prove that a second capture is not allowed to create a file. }
 function CrashAutoTestTryClaimReport(var AAlreadyReported: Boolean): Boolean;
+function CrashAutoTestELContainsRawCaptureKey(const AFilePath,
+  ACaptureKey: String): Boolean;
 {$ENDIF}
 
 {$IF not Defined(MSWINDOWS)}
@@ -364,6 +366,7 @@ uses
   Crash.MacOS.MachExc,
   Crash.Android.Symbols,
   Crash.Pending,
+  Crash.RawFallback,
   {$IF Defined(MSWINDOWS)}
   Winapi.Windows,
   {$ENDIF}
@@ -557,6 +560,8 @@ type
     procedure InstallFreezeDetector;
     procedure HandleFreezeCapture(const AReport: TCrashReport;
       const AFrozenForMS: Int64);
+    function WriteRecoveredRawReport(const ARaw: TCrashRawRecord): Boolean;
+    procedure RecoverRawFallbackReports;
     procedure ScanPendingCrashReports;
   public
     constructor Create;
@@ -589,6 +594,7 @@ begin
   TCrashFreeze.OnCapture := nil;
   TCrashFreeze.OnExternalSuppress := nil;
   TCrashCapture.OnReport := nil;
+  CrashRawShutdown(True);
   FreeAndNil(FThreadCoverages);
   FreeAndNil(FLock);
   inherited;
@@ -843,6 +849,7 @@ begin
     // (ReportException ignores handler exceptions): drop a possibly un-consumed
     // snapshot, re-arm the one-shot signal handlers and the reporter - a
     // formatter failure must not degrade every future report of this process.
+    CrashRawRotate(False);
     CrashDiscardPendingSnapshot;
     CrashInstallSignalHandlers;
     ResetAlreadyReported;
@@ -855,6 +862,7 @@ var
   Text: String;
   Ctx: TCrashELContext;
   IsFatal: Boolean;
+  ReportPersisted: Boolean;
   LocalDialogProc: TCrashShowDialogProc;
 begin
 
@@ -889,6 +897,7 @@ begin
     begin
       // Leave the same state as a delivered report: drop the un-consumed
       // hardware snapshot and re-arm the one-shot POSIX handlers.
+      CrashRawRotate(True);
       CrashDiscardPendingSnapshot;
       CrashInstallSignalHandlers;
       ResetAlreadyReported;
@@ -950,8 +959,9 @@ begin
   // WriteToFile builds the path.
   FExceptionID := CrashGenerateExceptionID(AReport);
 
+  ReportPersisted := False;
   if FConfig.SaveToFile then
-    WriteToFile(Text); // un-locked is safe: HandleReport is single-flight via FAlreadyReported
+    ReportPersisted := WriteToFile(Text); // single-flight via FAlreadyReported
 
   if IsFatal then
   begin
@@ -963,9 +973,16 @@ begin
     // next startup to deliver this exact report, even when SaveToFile=False.
     if FConfig.UploadEnabled then
       if EnsureCurrentReportPending(Text) then
+      begin
+        ReportPersisted := True;
         ConsoleLine('Upload: deferred to startup (report marked pending)')
+      end
       else
         ConsoleLine('Upload: deferred delivery could not be persisted');
+    // A full .el (normal or delivery artifact) carries the Raw Capture Key and
+    // supersedes the binary slot. Otherwise preserve the committed slot for the
+    // next startup. Fatal flow never needs a replacement generation.
+    CrashRawShutdown(ReportPersisted);
     Exit;
   end;
 
@@ -976,6 +993,10 @@ begin
   // us -> later .el files would lack the "Registers:" section. This crash's
   // snapshot was already consumed in CrashBuildELReportText above, so re-install
   // is safe; GOldHandlers keeps the original Pascal RTL handler.
+  // The one-shot handler is about to be re-armed. Rotate its raw descriptors
+  // first: delete the old generation only after full .el persistence; otherwise
+  // preserve it for startup recovery and open a fresh generation.
+  CrashRawRotate(ReportPersisted);
   CrashInstallSignalHandlers;
 
   LocalDialogProc := FConfig.OnShowDialog;
@@ -1054,6 +1075,18 @@ begin
 
   if FConfig.FreezeDetection then
     InstallFreezeDetector;
+
+  // Convert committed slots from previous processes before opening this
+  // process's own preallocated files. Recovered .el files then flow through the
+  // ordinary surface/upload scan below.
+  RecoverRawFallbackReports;
+
+  // Prepare fixed O_CLOEXEC raw slots before hardware signal handlers are
+  // installed by Init. No-op on unsupported targets or when persistence and
+  // delivery are both disabled.
+  CrashRawPrepare(EffectiveReportDir, EffectiveScanPrefix, FConfig.AppName,
+    FConfig.AppVersion, FConfig.CompilationTime, GetExeBaseName,
+    FConfig.SaveToFile or FConfig.UploadEnabled);
 
   // Boot-recovery: pick up crash files from previous runs. Done after wiring the
   // handler so any exception during the scan lands in our handler too.
@@ -1360,6 +1393,149 @@ begin
   end;
 end;
 {$ENDIF}
+
+function CrashELContainsRawCaptureKey(const AFilePath,
+  ACaptureKey: String): Boolean;
+var
+  Text: String;
+begin
+  Result := False;
+  if (AFilePath = '') or (ACaptureKey = '') then
+    Exit;
+  try
+    Text := TFile.ReadAllText(AFilePath, TEncoding.Unicode);
+    Result := Pos('Raw Capture Key: ' + ACaptureKey, Text) > 0;
+  except
+  end;
+end;
+
+{$IFDEF AUTOTESTS}
+function CrashAutoTestELContainsRawCaptureKey(const AFilePath,
+  ACaptureKey: String): Boolean;
+begin
+  Result := CrashELContainsRawCaptureKey(AFilePath, ACaptureKey);
+end;
+{$ENDIF}
+
+function TCrashReporterImpl.WriteRecoveredRawReport(
+  const ARaw: TCrashRawRecord): Boolean;
+var
+  Report: TCrashReport;
+  Ctx: TCrashELContext;
+  Text, Path: String;
+  IP, FaultAddr, ThreadID: UInt64;
+  SignalNum, SignalCode: Integer;
+  Address: array[0..0] of UIntPtr;
+begin
+  Result := False;
+  Report := Default(TCrashReport);
+  if ARaw.PayloadKind = rpkPrimary then
+  begin
+    IP := CrashRawPrimaryIP(ARaw.Primary);
+    FaultAddr := ARaw.Primary.FaultAddr;
+    ThreadID := ARaw.Primary.ThreadID;
+    SignalNum := ARaw.Primary.SignalNum;
+    SignalCode := ARaw.Primary.SignalCode;
+    Report.ExceptionClassName := 'ERawHardwareFault';
+  end
+  else if ARaw.PayloadKind = rpkConcurrent then
+  begin
+    IP := ARaw.Concurrent.IP;
+    FaultAddr := ARaw.Concurrent.FaultAddr;
+    ThreadID := ARaw.Concurrent.ThreadID;
+    SignalNum := ARaw.Concurrent.SignalNum;
+    SignalCode := ARaw.Concurrent.SignalCode;
+    Report.ExceptionClassName := 'ERawConcurrentHardwareFault';
+  end
+  else
+    Exit;
+
+  Report.ExceptionMessage := Format(
+    'Committed raw fallback recovered signal %d (code=%d, fault=%s)',
+    [SignalNum, SignalCode, IntToHex(FaultAddr, SizeOf(Pointer) * 2)]);
+  Report.Source := csFatalProc;
+  Address[0] := UIntPtr(IP);
+  if IP <> 0 then
+    Report.CallStack := TCrashCapture.SymbolizeAddressList(Address);
+  if Length(Report.CallStack) > 0 then
+    Report.ExceptionLocation := Report.CallStack[0]
+  else
+  begin
+    Report.ExceptionLocation.Clear;
+    Report.ExceptionLocation.CodeAddress := UIntPtr(IP);
+  end;
+
+  Ctx := CrashDefaultELContext(FAppStartTime, UIntPtr(IP), False);
+  if ARaw.InitUnixSeconds > 0 then
+    Ctx.StartTime := UnixToDateTime(ARaw.InitUnixSeconds, False);
+  try
+    Ctx.ExceptionTime := TFile.GetLastWriteTime(ARaw.FilePath);
+  except
+    Ctx.ExceptionTime := Now;
+  end;
+  Ctx.AppParameters := '';
+  if ARaw.AppName <> '' then
+    Ctx.AppName := ARaw.AppName
+  else if ARaw.ExeName <> '' then
+    Ctx.AppName := ARaw.ExeName
+  else if FConfig.AppName <> '' then
+    Ctx.AppName := FConfig.AppName;
+  Ctx.AppVersion := ARaw.AppVersion;
+  Ctx.CompileTime := ARaw.CompilationTime;
+  Ctx.ThreadID := Cardinal(ThreadID);
+  Ctx.ThreadName := 'RAW';
+  Ctx.DisabledSections := FConfig.DisabledSections;
+  CrashFormatRecoveredRaw(ARaw, Ctx.CpuSnapshot, Ctx.SignalInfoSection);
+  CrashCollectELModules(Ctx);
+  Text := CrashBuildELReportText(Report, Ctx);
+
+  FExceptionID := CrashGenerateExceptionID(Report);
+  Path := BuildCrashFilePath;
+  Result := CrashWriteReportTextToUniqueFile(Text, Path);
+  FExceptionID := '';
+end;
+
+procedure TCrashReporterImpl.RecoverRawFallbackReports;
+var
+  Dir, Pattern, RawPath, ELPath: String;
+  RawFiles, ELFiles: TArray<String>;
+  Raw: TCrashRawRecord;
+  Duplicate: Boolean;
+begin
+  Dir := EffectiveReportDir;
+  if Dir = '' then
+    Exit;
+  RawFiles := CrashRawEnumerateFiles(Dir, EffectiveScanPrefix);
+  if Length(RawFiles) = 0 then
+    Exit;
+  Pattern := EffectiveScanPrefix + '*.el';
+  try
+    ELFiles := TDirectory.GetFiles(Dir, Pattern);
+  except
+    ELFiles := nil;
+  end;
+  for RawPath in RawFiles do
+  begin
+    if not CrashRawReadBlock(RawPath, Raw) then
+    begin
+      if CrashRawFileIsStale(RawPath) then
+        CrashRawDeleteFile(RawPath);
+      Continue;
+    end;
+    Duplicate := False;
+    for ELPath in ELFiles do
+      if CrashELContainsRawCaptureKey(ELPath, Raw.CaptureKey) then
+      begin
+        Duplicate := True;
+        Break;
+      end;
+    if Duplicate or WriteRecoveredRawReport(Raw) then
+    begin
+      CrashRawDeleteFile(RawPath);
+      CrashRawDeleteUntouchedSibling(Raw);
+    end;
+  end;
+end;
 
 procedure TCrashReporterImpl.ScanPendingCrashReports;
 var
