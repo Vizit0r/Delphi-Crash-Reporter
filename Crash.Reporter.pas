@@ -1904,7 +1904,7 @@ begin
   begin
     if not CrashRawReadBlock(RawPath, Raw) then
     begin
-      if CrashRawFileIsStale(RawPath) then
+      if CrashRawFileIsAbandoned(RawPath) or CrashRawFileIsStale(RawPath) then
         CrashRawDeleteFile(RawPath);
       Continue;
     end;

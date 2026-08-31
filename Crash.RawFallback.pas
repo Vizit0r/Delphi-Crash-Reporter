@@ -144,6 +144,16 @@ function CrashRawReadBlock(const AFilePath: String;
 function CrashRawInspectMarkers(const AFilePath: String;
   out AStage, ACommit: Byte): Boolean;
 function CrashRawFileIsStale(const AFilePath: String): Boolean;
+{ True when the OS still knows the process that preallocated a slot. Instances
+  share one report directory, so this is what keeps a running sibling's files;
+  unknown owner or no way to ask counts as alive. }
+function CrashRawOwnerAlive(const AProcessID: UInt64): Boolean;
+{ Never-entered slot of a process that is gone: nothing was captured there and
+  nobody will. Collected on the next start instead of waiting out the stale
+  window. The owner comes from the block header, or - for a slot preallocated
+  and never written, which is all zeros on disk - from the capture key in the
+  file name. Entered-but-torn blocks stay for the stale policy. }
+function CrashRawFileIsAbandoned(const AFilePath: String): Boolean;
 procedure CrashRawDeleteFile(const AFilePath: String);
 procedure CrashRawDeleteUntouchedSibling(const ARaw: TCrashRawRecord);
 
@@ -152,9 +162,22 @@ function CrashRawPrimarySP(const APrimary: TCrashRawPrimarySnapshot): UInt64;
 function CrashRawPrimaryFP(const APrimary: TCrashRawPrimarySnapshot): UInt64;
 
 {$IFDEF AUTOTESTS}
+type
+  TCrashRawOwnerAliveProbe = reference to function(
+    const AProcessID: UInt64): Boolean;
+
 function CrashRawAutoTestWriteBlock(const AFilePath, ACaptureKey: String;
   const APayloadKind: TCrashRawPayloadKind;
   const ACommitted: Boolean): Boolean;
+{ Slot as CrashRawPrepare leaves it: valid header, zero stage/commit.
+  AProcessID = 0 stamps the current process. }
+function CrashRawAutoTestWritePristineBlock(const AFilePath,
+  ACaptureKey: String; const APayloadKind: TCrashRawPayloadKind;
+  const AProcessID: UInt64): Boolean;
+{ Slot as CrashRawOpenPreallocated leaves it: block-sized and all zeros. }
+function CrashRawAutoTestWriteZeroBlock(const AFilePath: String): Boolean;
+procedure CrashRawAutoTestSetOwnerAliveProbe(
+  const AProbe: TCrashRawOwnerAliveProbe);
 {$ENDIF}
 
 implementation
@@ -166,6 +189,8 @@ uses
   System.DateUtils
   {$IF not Defined(MSWINDOWS)}
   , Posix.Fcntl,
+  Posix.Signal,
+  Posix.SysTypes,
   Posix.Unistd,
   Posix.Errno
   {$ENDIF};
@@ -205,6 +230,9 @@ var
   GRawGeneration: UInt32;
   GRawStageByte: Byte = CRASH_RAW_STAGE_ENTERED;
   GRawCommitByte: Byte = CRASH_RAW_COMMIT;
+  {$IFDEF AUTOTESTS}
+  GRawOwnerAliveProbe: TCrashRawOwnerAliveProbe = nil;
+  {$ENDIF}
 
 function CrashRawSupported: Boolean;
 begin
@@ -405,14 +433,19 @@ end;
 procedure CrashRawCloseCurrent;
 var
   Slot: Integer;
+  {$IF not Defined(MSWINDOWS)}
+  FD: Integer;
+  {$ENDIF}
 begin
   for Slot := 0 to CRASH_RAW_SLOT_COUNT - 1 do
   begin
     {$IF not Defined(MSWINDOWS)}
-    if GRawFD[Slot] >= 0 then
-      __close(GRawFD[Slot]);
+    FD := TInterlocked.Exchange(GRawFD[Slot], -1);
+    if FD >= 0 then
+      __close(FD);
+    {$ELSE}
+    TInterlocked.Exchange(GRawFD[Slot], -1);
     {$ENDIF}
-    GRawFD[Slot] := -1;
   end;
 end;
 
@@ -740,6 +773,90 @@ begin
   end;
 end;
 
+function CrashRawOwnerAlive(const AProcessID: UInt64): Boolean;
+begin
+  {$IFDEF AUTOTESTS}
+  if Assigned(GRawOwnerAliveProbe) then
+    Exit(GRawOwnerAliveProbe(AProcessID));
+  {$ENDIF}
+  Result := True;
+  {$IF not Defined(MSWINDOWS)}
+  // 0 would signal our own process group and a value past pid_t cannot be
+  // asked about at all - both keep the file.
+  if (AProcessID = 0) or (AProcessID > UInt64(High(Integer))) then
+    Exit;
+  if kill(pid_t(AProcessID), 0) = 0 then
+    Exit;
+  Result := errno <> ESRCH;
+  {$ENDIF}
+end;
+
+function CrashRawFileCaptureKey(const AFilePath: String): String;
+var
+  Name: String;
+  At: Integer;
+begin
+  // "<prefix>raw_<key>.crashraw"; the key itself carries no underscore.
+  Name := ChangeFileExt(ExtractFileName(AFilePath), '');
+  At := LastDelimiter('_', Name);
+  if At <= 0 then
+    Exit('');
+  Result := Copy(Name, At + 1, MaxInt);
+end;
+
+function CrashRawKeyProcessID(const ACaptureKey: String): UInt64;
+var
+  Start, At: Integer;
+begin
+  Result := 0;
+  if Copy(ACaptureKey, 1, 3) <> 'R1-' then
+    Exit;
+  Start := 4;
+  At := Start;
+  while (At <= Length(ACaptureKey)) and (ACaptureKey[At] <> '-') do
+    Inc(At);
+  if At <= Start then
+    Exit;
+  Result := StrToUInt64Def('$' + Copy(ACaptureKey, Start, At - Start), 0);
+end;
+
+function CrashRawFileIsAbandoned(const AFilePath: String): Boolean;
+var
+  Block: TCrashRawDiskBlockV1;
+  Stream: TFileStream;
+  OwnerID: UInt64;
+begin
+  Result := False;
+  FillChar(Block, SizeOf(Block), 0);
+  try
+    Stream := TFileStream.Create(AFilePath, fmOpenRead or fmShareDenyNone);
+    try
+      if Stream.Size <> SizeOf(Block) then
+        Exit;
+      Stream.ReadBuffer(Block, SizeOf(Block));
+    finally
+      Stream.Free;
+    end;
+  except
+    Exit;
+  end;
+  if (Block.Stage <> 0) or (Block.Commit <> 0) then
+    Exit;
+  if CompareMem(@Block.Header.Magic[0], @CRASH_RAW_MAGIC[0],
+       SizeOf(CRASH_RAW_MAGIC)) and
+     (Block.Header.Version = CRASH_RAW_VERSION) then
+    OwnerID := Block.Header.ProcessID
+  else
+  begin
+    // Preallocated and never written: ftruncate leaves the whole block zeroed,
+    // so the owner is only in the capture key the file is named after.
+    OwnerID := CrashRawKeyProcessID(CrashRawFileCaptureKey(AFilePath));
+    if OwnerID = 0 then
+      Exit;
+  end;
+  Result := not CrashRawOwnerAlive(OwnerID);
+end;
+
 procedure CrashRawDeleteFile(const AFilePath: String);
 begin
   if AFilePath = '' then
@@ -894,6 +1011,81 @@ begin
     end;
   except
   end;
+end;
+
+function CrashRawAutoTestWritePristineBlock(const AFilePath,
+  ACaptureKey: String; const APayloadKind: TCrashRawPayloadKind;
+  const AProcessID: UInt64): Boolean;
+var
+  Block: TCrashRawDiskBlockV1;
+  Stream: TFileStream;
+begin
+  Result := False;
+  FillChar(Block, SizeOf(Block), 0);
+  Move(CRASH_RAW_MAGIC[0], Block.Header.Magic[0], SizeOf(CRASH_RAW_MAGIC));
+  Block.Header.Version := CRASH_RAW_VERSION;
+  Block.Header.HeaderSize := SizeOf(TCrashRawHeaderV1);
+  Block.Header.BlockSize := SizeOf(TCrashRawDiskBlockV1);
+  Block.Header.PayloadKind := Ord(APayloadKind);
+  Block.Header.Platform := CrashRawPlatform;
+  Block.Header.Architecture := CrashRawArchitecture;
+  if APayloadKind = rpkPrimary then
+  begin
+    Block.Header.SlotIndex := CRASH_RAW_SLOT_PRIMARY;
+    Block.Header.PayloadSize := SizeOf(TCrashRawPrimarySnapshot);
+  end
+  else
+  begin
+    Block.Header.SlotIndex := CRASH_RAW_SLOT_CONCURRENT;
+    Block.Header.PayloadSize := SizeOf(TCrashRawConcurrentSnapshot);
+  end;
+  Block.Header.ProcessID := AProcessID;
+  {$IF not Defined(MSWINDOWS)}
+  if Block.Header.ProcessID = 0 then
+    Block.Header.ProcessID := UInt64(getpid);
+  {$ENDIF}
+  Block.Header.InitTick := 5678;
+  Block.Header.InitUnixSeconds := DateTimeToUnix(Now, False);
+  Block.Header.Generation := 9;
+  CopyFixedUtf8(ACaptureKey, @Block.Header.CaptureKey[0],
+    SizeOf(Block.Header.CaptureKey));
+  CopyFixedUtf8('RawFixture', @Block.Header.AppName[0],
+    SizeOf(Block.Header.AppName));
+  try
+    Stream := TFileStream.Create(AFilePath, fmCreate or fmShareDenyNone);
+    try
+      Stream.WriteBuffer(Block, SizeOf(Block));
+      Result := True;
+    finally
+      Stream.Free;
+    end;
+  except
+  end;
+end;
+
+function CrashRawAutoTestWriteZeroBlock(const AFilePath: String): Boolean;
+var
+  Block: TCrashRawDiskBlockV1;
+  Stream: TFileStream;
+begin
+  Result := False;
+  FillChar(Block, SizeOf(Block), 0);
+  try
+    Stream := TFileStream.Create(AFilePath, fmCreate or fmShareDenyNone);
+    try
+      Stream.WriteBuffer(Block, SizeOf(Block));
+      Result := True;
+    finally
+      Stream.Free;
+    end;
+  except
+  end;
+end;
+
+procedure CrashRawAutoTestSetOwnerAliveProbe(
+  const AProbe: TCrashRawOwnerAliveProbe);
+begin
+  GRawOwnerAliveProbe := AProbe;
 end;
 {$ENDIF}
 
