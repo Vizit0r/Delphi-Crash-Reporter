@@ -55,6 +55,12 @@ type
     section (e.g. "what the app was doing"). Called at report time. }
   TCrashCollectContextProc = reference to function: String;
 
+  { Optional privacy hook. Receives ParamStr(1..N) as separate values and
+    returns the exact single-line text allowed into Application/1.4. An
+    exception fails private and emits an empty field. }
+  TCrashSanitizeParametersProc = reference to function(
+    const AArguments: TArray<String>): String;
+
   { Optional last-step veto. Called with the fully-built report (message, class,
     stack, source) right before it is persisted/surfaced. Return False to drop the
     report entirely; True (or a nil callback) keeps it. Runs in the crash path -
@@ -72,6 +78,14 @@ type
     AppVersion: String;
     { "1.5 Compilation Date" field. Host-supplied free-form string. }
     CompilationTime: String;
+    { Application/1.4 is empty by default. True is an explicit legacy opt-in
+      that includes every argument when no allowlist/callback is configured. }
+    IncludeAppParameters: Boolean;
+    { Case-insensitive switch names allowed into 1.4. Entries may be written as
+      "name", "/name" or "--name"; /name=value preserves the value. }
+    AppParameterAllowList: TArray<String>;
+    { Highest-priority parameter policy. nil -> allowlist/include-all rules. }
+    OnSanitizeParameters: TCrashSanitizeParametersProc;
     { Persist the .el as a normal local report. Default True. When False, an
       upload-authorized fatal/headless path may still create a delivery artifact;
       it is removed after confirmed upload and retained only on failure. }
@@ -79,6 +93,9 @@ type
     { File name prefix; the timestamp + ".el" are appended. Empty ->
       "<ExeBaseName>_<PLATFORM>_". }
     FileNamePrefix: String;
+    { Optional filename-only template. Supported tokens are App, Platform,
+      Version and BugID in braces. When set, it wins over FileNamePrefix. }
+    FileNameTemplate: String;
     { Boot-recovery scan prefix (the scan matches "<prefix>*.el"). Empty ->
       FileNamePrefix. Set a STABLE prefix (no version token) when FileNamePrefix
       embeds an app version, so reports written by a previous version are still
@@ -101,6 +118,9 @@ type
     OnShowDialog: TCrashShowDialogProc;
     { Optional extra-context provider appended to the report. nil -> none. }
     OnCollectContext: TCrashCollectContextProc;
+    { Number of recent host-supplied breadcrumbs retained in memory. Clamped to
+      0..256; 0 disables collection. Default 64. }
+    BreadcrumbCapacity: Integer;
     { Optional last-step veto: return False to drop a report (e.g. user-initiated
       Ctrl-C / EControlC, or other known-benign exceptions). nil -> keep all. }
     OnFilterReport: TCrashReportFilterProc;
@@ -229,6 +249,15 @@ function CrashAutoTestQueueUpload(const AReportText, AReportPath: String;
 function CrashAutoTestTryClaimReport(var AAlreadyReported: Boolean): Boolean;
 function CrashAutoTestELContainsRawCaptureKey(const AFilePath,
   ACaptureKey: String): Boolean;
+function CrashAutoTestFormatParameters(const AArguments,
+  AAllowList: TArray<String>; const AIncludeAll: Boolean;
+  const ASanitizer: TCrashSanitizeParametersProc = nil): String;
+function CrashAutoTestRenderFileName(const ATemplate, AApp, AVersion,
+  ABugID: String): String;
+function CrashAutoTestTemplateScanPrefix(const ATemplate, AApp: String): String;
+function CrashAutoTestAcceptInitialConfig(var AInstalled: Boolean;
+  var ACurrent: TCrashConfig; const AIncoming: TCrashConfig): Boolean;
+function CrashAutoTestOperationLifetimeGate: Boolean;
 {$ENDIF}
 
 {$IF not Defined(MSWINDOWS)}
@@ -276,7 +305,14 @@ type
   public
     { Install hooks + scan for pending reports. Call once at startup. Idempotent. }
     class procedure Init(const AConfig: TCrashConfig); static;
+    { Stop Reporter services on a calm, quiesced host path. Bootstrap signal/RTL
+      hooks remain process-global. A later Init creates a fresh runtime. }
+    class procedure Shutdown; static;
     class function Active: Boolean; static;
+    { Cheap host-owned diagnostic trail. Category/message must already be
+      redacted for the application's privacy policy. }
+    class procedure AddBreadcrumb(const ACategory, AMessage: String); static;
+    class procedure ClearBreadcrumbs; static;
     { Cover the CALLING thread on a calm path. Repeated calls from the same
       thread are idempotent. AName is diagnostic only. }
     class function RegisterCurrentThread(const AName: String = ''):
@@ -365,6 +401,7 @@ uses
   Crash.MacOS.Symbols,
   Crash.MacOS.MachExc,
   Crash.Android.Symbols,
+  Crash.Breadcrumbs,
   Crash.Pending,
   Crash.RawFallback,
   {$IF Defined(MSWINDOWS)}
@@ -387,11 +424,27 @@ type
   TCrashUploadWorkerProc = reference to function(const AUrl, AFieldName,
     AReportText, AFileName: String): Boolean;
 
-procedure CrashQueueUpload(const AUrl, AFieldName, AReportText,
-  AReportPath: String; const AOnComplete: TCrashUploadCompleteProc); forward;
-procedure CrashQueueUploadWithTransport(const AUrl, AFieldName, AReportText,
+  ICrashOperationLifetime = interface
+    function Active: Boolean;
+    procedure Deactivate;
+  end;
+
+  TCrashOperationLifetime = class(TInterfacedObject, ICrashOperationLifetime)
+  private
+    FActive: Integer;
+  public
+    constructor Create;
+    function Active: Boolean;
+    procedure Deactivate;
+  end;
+
+function CrashQueueUpload(const AUrl, AFieldName, AReportText,
+  AReportPath: String; const AOnComplete: TCrashUploadCompleteProc;
+  const ALifetime: ICrashOperationLifetime): Boolean; forward;
+function CrashQueueUploadWithTransport(const AUrl, AFieldName, AReportText,
   AReportPath: String; const ATransport: TCrashUploadWorkerProc;
-  const AOnComplete: TCrashUploadCompleteProc); forward;
+  const AOnComplete: TCrashUploadCompleteProc;
+  const ALifetime: ICrashOperationLifetime): Boolean; forward;
 
 function DefaultCrashConfig: TCrashConfig;
 begin
@@ -401,9 +454,26 @@ begin
   Result.UploadFieldName := 'el_upload_file_0';
   Result.UploadPendingOnStartup := False;
   Result.AllowRestart := True;
+  Result.BreadcrumbCapacity := CRASH_BREADCRUMB_DEFAULT_CAPACITY;
   Result.FreezeDetection := False; // opt in - see the field comment
   Result.FreezeTimeoutMS := 30000;
   Result.RestartOnFreeze := False; // opt in - see the field comment
+end;
+
+constructor TCrashOperationLifetime.Create;
+begin
+  inherited Create;
+  FActive := 1;
+end;
+
+function TCrashOperationLifetime.Active: Boolean;
+begin
+  Result := TInterlocked.CompareExchange(FActive, 1, 1) = 1;
+end;
+
+procedure TCrashOperationLifetime.Deactivate;
+begin
+  TInterlocked.Exchange(FActive, 0);
 end;
 
 function GetExeBaseName: String; inline;
@@ -420,6 +490,172 @@ begin
   {$ELSEIF Defined(LINUX)}  Result := 'LINUX';
   {$ELSE}                   Result := 'UNKNOWN';
   {$ENDIF}
+end;
+
+const
+  CRASH_APP_PARAMETERS_MAX_CHARS = 4096;
+
+function CrashSingleLineBounded(const AText: String;
+  const AMaxChars: Integer): String;
+begin
+  Result := StringReplace(AText, #13, ' ', [rfReplaceAll]);
+  Result := StringReplace(Result, #10, ' ', [rfReplaceAll]);
+  if Length(Result) > AMaxChars then
+    SetLength(Result, AMaxChars);
+end;
+
+function CrashArgumentSwitchName(const AArgument: String;
+  const ARequirePrefix: Boolean): String;
+var
+  P: Integer;
+begin
+  Result := Trim(AArgument);
+  if Result = '' then
+    Exit;
+  if ARequirePrefix and not CharInSet(Result[1], ['/', '-']) then
+    Exit('');
+  while (Result <> '') and CharInSet(Result[1], ['/', '-']) do
+    Delete(Result, 1, 1);
+  P := Pos('=', Result);
+  if P > 0 then
+    SetLength(Result, P - 1);
+  Result := LowerCase(Trim(Result));
+end;
+
+function CrashFormatParameters(const AArguments,
+  AAllowList: TArray<String>; const AIncludeAll: Boolean;
+  const ASanitizer: TCrashSanitizeParametersProc): String;
+var
+  Allowed, ArgName: String;
+  Argument: String;
+  Selected: TList<String>;
+begin
+  Result := '';
+  if Assigned(ASanitizer) then
+  begin
+    try
+      Result := ASanitizer(AArguments);
+    except
+      Result := '';
+    end;
+    Exit(CrashSingleLineBounded(Result, CRASH_APP_PARAMETERS_MAX_CHARS));
+  end;
+  if Length(AAllowList) > 0 then
+  begin
+    Selected := TList<String>.Create;
+    try
+      for Argument in AArguments do
+      begin
+        ArgName := CrashArgumentSwitchName(Argument, True);
+        if ArgName = '' then
+          Continue;
+        for Allowed in AAllowList do
+          if ArgName = CrashArgumentSwitchName(Allowed, False) then
+          begin
+            Selected.Add(Argument);
+            Break;
+          end;
+      end;
+      Result := String.Join(' ', Selected.ToArray);
+    finally
+      Selected.Free;
+    end;
+  end
+  else if AIncludeAll then
+    Result := String.Join(' ', AArguments);
+  Result := CrashSingleLineBounded(Result, CRASH_APP_PARAMETERS_MAX_CHARS);
+end;
+
+function CrashCurrentParameters(const AConfig: TCrashConfig): String;
+var
+  Arguments: TArray<String>;
+  I: Integer;
+begin
+  SetLength(Arguments, ParamCount);
+  for I := 1 to ParamCount do
+    Arguments[I - 1] := ParamStr(I);
+  Result := CrashFormatParameters(Arguments, AConfig.AppParameterAllowList,
+    AConfig.IncludeAppParameters, AConfig.OnSanitizeParameters);
+end;
+
+function CrashSanitizeFileName(const AValue: String): String;
+var
+  C: Char;
+  I: Integer;
+begin
+  Result := Trim(AValue);
+  for I := 1 to Length(Result) do
+  begin
+    C := Result[I];
+    if (Ord(C) < 32) or CharInSet(C, ['<', '>', ':', '"', '/', '\', '|', '?', '*']) then
+      Result[I] := '_';
+  end;
+end;
+
+function CrashRenderFileNameTemplate(const ATemplate, AApp, AVersion,
+  ABugID: String): String;
+var
+  AppValue: String;
+begin
+  Result := '';
+  if (ATemplate = '') or
+     (Pos('{bugid}', LowerCase(ATemplate)) = 0) then
+    Exit;
+  AppValue := AApp;
+  if AppValue = '' then
+    AppValue := GetExeBaseName;
+  Result := StringReplace(ATemplate, '{App}',
+    CrashSanitizeFileName(AppValue), [rfReplaceAll, rfIgnoreCase]);
+  Result := StringReplace(Result, '{Platform}', GetPlatformTag,
+    [rfReplaceAll, rfIgnoreCase]);
+  Result := StringReplace(Result, '{Version}',
+    CrashSanitizeFileName(AVersion), [rfReplaceAll, rfIgnoreCase]);
+  Result := StringReplace(Result, '{BugID}',
+    CrashSanitizeFileName(ABugID), [rfReplaceAll, rfIgnoreCase]);
+  if (Pos('{', Result) > 0) or (Pos('}', Result) > 0) then
+    Exit('');
+  Result := CrashSanitizeFileName(Result);
+  if Result = '' then
+    Exit;
+  if not SameText(ExtractFileExt(Result), '.el') then
+    Result := Result + '.el';
+end;
+
+function CrashTemplateScanPrefix(const ATemplate, AApp: String): String;
+var
+  AppValue, LowerTemplate, PrefixTemplate: String;
+  BugPos, CutPos, VersionPos: Integer;
+begin
+  Result := '';
+  LowerTemplate := LowerCase(ATemplate);
+  BugPos := Pos('{bugid}', LowerTemplate);
+  if BugPos = 0 then
+    Exit;
+  VersionPos := Pos('{version}', LowerTemplate);
+  CutPos := BugPos;
+  if (VersionPos > 0) and (VersionPos < CutPos) then
+    CutPos := VersionPos;
+  PrefixTemplate := Copy(ATemplate, 1, CutPos - 1);
+  AppValue := AApp;
+  if AppValue = '' then
+    AppValue := GetExeBaseName;
+  Result := StringReplace(PrefixTemplate, '{App}',
+    CrashSanitizeFileName(AppValue), [rfReplaceAll, rfIgnoreCase]);
+  Result := StringReplace(Result, '{Platform}', GetPlatformTag,
+    [rfReplaceAll, rfIgnoreCase]);
+  if (Pos('{', Result) > 0) or (Pos('}', Result) > 0) then
+    Exit('');
+  Result := CrashSanitizeFileName(Result);
+end;
+
+function CrashAcceptInitialConfig(var AInstalled: Boolean;
+  var ACurrent: TCrashConfig; const AIncoming: TCrashConfig): Boolean;
+begin
+  Result := not AInstalled;
+  if not Result then
+    Exit;
+  ACurrent := AIncoming;
+  AInstalled := True;
 end;
 
 const
@@ -541,9 +777,13 @@ type
     FMachMainThreadCovered: Boolean; // Init-time Mach registration verdict (main thread only; NOT a live watcher status)
     FMainThreadCoverage: TCrashThreadCoverage;
     FThreadCoverages: TDictionary<UInt64, TCrashThreadCoverage>;
+    FBreadcrumbs: TCrashBreadcrumbStore;
+    FOperationLifetime: ICrashOperationLifetime;
+    FInstanceID: UInt64;
     function EffectiveFileNamePrefix: String;
     function EffectiveScanPrefix: String;
     function EffectiveReportDir: String;
+    function BuildCrashFilePathForID(const ABugID: String): String;
     function BuildCrashFilePath: String;
     function RestartNoticeFilePath: String;
     procedure ReadRestartNoticeAtBoot;
@@ -572,15 +812,18 @@ type
 
 var
   GReporter: TCrashReporterImpl;
+  GReporterInstanceSeq: Int64;
 
 threadvar
   GCoverageReporter: Pointer;
+  GCoverageReporterInstanceID: UInt64;
 
 constructor TCrashReporterImpl.Create;
 begin
   inherited Create;
   FLock := TCriticalSection.Create;
   FThreadCoverages := TDictionary<UInt64, TCrashThreadCoverage>.Create;
+  FInstanceID := UInt64(TInterlocked.Increment(GReporterInstanceSeq));
   FMachMainThreadCovered := True; // no verdict yet - only Init's registration may flip it
   FAppStartTime := Now; // "close enough to process start"
   FAppStartTick := TThread.GetTickCount64;
@@ -588,6 +831,9 @@ end;
 
 destructor TCrashReporterImpl.Destroy;
 begin
+  FInstalled := False;
+  if FOperationLifetime <> nil then
+    FOperationLifetime.Deactivate;
   // Stop the freeze watchdog BEFORE the singleton goes away: its capture and
   // suppress hooks are closures over Self.
   TCrashFreeze.Shutdown;
@@ -595,6 +841,13 @@ begin
   TCrashFreeze.OnExternalSuppress := nil;
   TCrashCapture.OnReport := nil;
   CrashRawShutdown(True);
+  FConfig.OnShowDialog := nil;
+  FConfig.OnCollectContext := nil;
+  FConfig.OnSanitizeParameters := nil;
+  FConfig.OnFilterReport := nil;
+  FConfig.OnFreezeReport := nil;
+  FreeAndNil(FBreadcrumbs);
+  FOperationLifetime := nil;
   FreeAndNil(FThreadCoverages);
   FreeAndNil(FLock);
   inherited;
@@ -633,6 +886,13 @@ function TCrashReporterImpl.EffectiveScanPrefix: String;
 begin
   if FConfig.ScanFileNamePrefix <> '' then
     Result := FConfig.ScanFileNamePrefix
+  else if FConfig.FileNameTemplate <> '' then
+  begin
+    Result := CrashTemplateScanPrefix(FConfig.FileNameTemplate,
+      FConfig.AppName);
+    if Result = '' then
+      Result := EffectiveFileNamePrefix;
+  end
   else
     Result := EffectiveFileNamePrefix;
 end;
@@ -680,9 +940,9 @@ begin
   Result := IncludeTrailingPathDelimiter(ExeDir);
 end;
 
-function TCrashReporterImpl.BuildCrashFilePath: String;
+function TCrashReporterImpl.BuildCrashFilePathForID(const ABugID: String): String;
 var
-  Dir, Tail: String;
+  Dir, FileName, Tail: String;
 begin
   Dir := EffectiveReportDir;
   // <prefix><id>.el - prefix (project + platform + version) keeps reports from
@@ -691,11 +951,23 @@ begin
   // The same bug yields the same name (WriteToFile appends a numeric suffix for
   // repeated instances). Fall back to a timestamp if the id is somehow empty, so
   // we never emit "<prefix>.el". .el lets the EurekaLog Viewer open it natively.
-  if FExceptionID <> '' then
-    Tail := FExceptionID
+  if ABugID <> '' then
+    Tail := ABugID
   else
     Tail := FormatDateTime('yyyymmddhhnnss', Now);
-  Result := IncludeTrailingPathDelimiter(Dir) + EffectiveFileNamePrefix + Tail + '.el';
+  if FConfig.FileNameTemplate <> '' then
+    FileName := CrashRenderFileNameTemplate(FConfig.FileNameTemplate,
+      FConfig.AppName, FConfig.AppVersion, Tail)
+  else
+    FileName := '';
+  if FileName = '' then
+    FileName := EffectiveFileNamePrefix + Tail + '.el';
+  Result := IncludeTrailingPathDelimiter(Dir) + FileName;
+end;
+
+function TCrashReporterImpl.BuildCrashFilePath: String;
+begin
+  Result := BuildCrashFilePathForID(FExceptionID);
 end;
 
 function TCrashReporterImpl.RestartNoticeFilePath: String;
@@ -915,7 +1187,14 @@ begin
   if FConfig.AppName <> '' then Ctx.AppName := FConfig.AppName;
   Ctx.AppVersion := FConfig.AppVersion;
   Ctx.CompileTime := FConfig.CompilationTime;
+  Ctx.AppParameters := CrashCurrentParameters(FConfig);
   Ctx.DisabledSections := FConfig.DisabledSections;
+  if FBreadcrumbs <> nil then
+  try
+    Ctx.StepsToReproduceText := FBreadcrumbs.SnapshotText;
+  except
+    // Breadcrumbs are diagnostic-only and cannot break the report.
+  end;
   // Exception thread: HandleReport runs synchronously in the crashing thread
   // (RTL hook -> TCrashCapture.ReportException -> OnReport -> here), so
   // CurrentThread IS the faulting thread - capture its real ID and name.
@@ -1056,10 +1335,12 @@ end;
 
 procedure TCrashReporterImpl.Install(const AConfig: TCrashConfig);
 begin
-  FConfig := AConfig;
-  if FInstalled then
+  // A live runtime is strictly idempotent: a repeated Init never mutates only
+  // half of the configuration. Reconfigure is Shutdown + a fresh Init.
+  if not CrashAcceptInitialConfig(FInstalled, FConfig, AConfig) then
     Exit;
-  FInstalled := True;
+  FOperationLifetime := TCrashOperationLifetime.Create;
+  FBreadcrumbs := TCrashBreadcrumbStore.Create(FConfig.BreadcrumbCapacity);
 
   // TCrashCapture is created in Crash.CallStack's initialization (it installs
   // ExceptProc / ExceptionAcquired / GetExceptionStackInfoProc). Here we just
@@ -1139,7 +1420,14 @@ begin
   if FConfig.AppName <> '' then Ctx.AppName := FConfig.AppName;
   Ctx.AppVersion := FConfig.AppVersion;
   Ctx.CompileTime := FConfig.CompilationTime;
+  Ctx.AppParameters := CrashCurrentParameters(FConfig);
   Ctx.DisabledSections := FConfig.DisabledSections;
+  if FBreadcrumbs <> nil then
+  try
+    Ctx.StepsToReproduceText := FBreadcrumbs.SnapshotText;
+  except
+    // A frozen breadcrumb writer must not hold up freeze reporting.
+  end;
   // The report describes the frozen MAIN thread, not the watchdog.
   Ctx.ThreadID := Cardinal(MainThreadID);
   Ctx.ThreadName := 'MAIN';
@@ -1171,7 +1459,7 @@ begin
   Path := '';
   if FConfig.SaveToFile or FConfig.UploadEnabled then
   begin
-    Path := EffectiveReportDir + EffectiveFileNamePrefix + Info.BugID + '.el';
+    Path := BuildCrashFilePathForID(Info.BugID);
     WriteReportTextToUniqueFile(Text, Path);
   end;
   Info.ReportFile := Path;
@@ -1230,9 +1518,10 @@ begin
   // Restarting freezes defer entirely to the replacement process.
   if FConfig.UploadEnabled and DeliveryArmed and (not WillRestart) then
   try
-    CrashQueueUpload(FConfig.UploadUrl, FConfig.UploadFieldName, Text, Path, nil);
-    UploadQueued := True;
-    ConsoleLine('Upload: queued in background (freeze report marked pending)');
+    UploadQueued := CrashQueueUpload(FConfig.UploadUrl,
+      FConfig.UploadFieldName, Text, Path, nil, FOperationLifetime);
+    if UploadQueued then
+      ConsoleLine('Upload: queued in background (freeze report marked pending)');
   except
     // The marker remains for startup recovery.
   end;
@@ -1253,8 +1542,9 @@ begin
       ConsoleLine('*** restart failed - the frozen instance stays alive (report-only) ***');
       if FConfig.UploadEnabled and DeliveryArmed and (not UploadQueued) then
       try
-        CrashQueueUpload(FConfig.UploadUrl, FConfig.UploadFieldName, Text, Path, nil);
-        ConsoleLine('Upload: queued after restart failure');
+        if CrashQueueUpload(FConfig.UploadUrl, FConfig.UploadFieldName, Text,
+             Path, nil, FOperationLifetime) then
+          ConsoleLine('Upload: queued after restart failure');
       except
         // The marker remains for startup recovery.
       end;
@@ -1320,21 +1610,27 @@ begin
   end;
 end;
 
-procedure CrashQueueUpload(const AUrl, AFieldName, AReportText,
-  AReportPath: String; const AOnComplete: TCrashUploadCompleteProc);
+function CrashQueueUpload(const AUrl, AFieldName, AReportText,
+  AReportPath: String; const AOnComplete: TCrashUploadCompleteProc;
+  const ALifetime: ICrashOperationLifetime): Boolean;
 begin
-  CrashQueueUploadWithTransport(AUrl, AFieldName, AReportText, AReportPath,
-    nil, AOnComplete);
+  Result := CrashQueueUploadWithTransport(AUrl, AFieldName, AReportText,
+    AReportPath, nil, AOnComplete, ALifetime);
 end;
 
-procedure CrashQueueUploadWithTransport(const AUrl, AFieldName, AReportText,
+function CrashQueueUploadWithTransport(const AUrl, AFieldName, AReportText,
   AReportPath: String; const ATransport: TCrashUploadWorkerProc;
-  const AOnComplete: TCrashUploadCompleteProc);
+  const AOnComplete: TCrashUploadCompleteProc;
+  const ALifetime: ICrashOperationLifetime): Boolean;
 var
   UploadUrl, UploadField, UploadText, UploadPath: String;
   CompleteProc: TCrashUploadCompleteProc;
   TransportProc: TCrashUploadWorkerProc;
+  Lifetime: ICrashOperationLifetime;
 begin
+  Result := False;
+  if (ALifetime <> nil) and (not ALifetime.Active) then
+    Exit;
   // Capture only immutable values. The worker never dereferences GReporter and
   // therefore remains safe if finalization starts while HTTP is still active.
   UploadUrl := AUrl;
@@ -1343,6 +1639,7 @@ begin
   UploadPath := AReportPath;
   CompleteProc := AOnComplete;
   TransportProc := ATransport;
+  Lifetime := ALifetime;
   TThread.CreateAnonymousThread(
     procedure
     var
@@ -1356,10 +1653,13 @@ begin
           ExtractFileName(UploadPath));
       if Success then
         CrashDeleteReportAndPendingMarker(UploadPath);
-      if Assigned(CompleteProc) then
+      if Assigned(CompleteProc) and
+         ((Lifetime = nil) or Lifetime.Active) then
         TThread.ForceQueue(nil,
           procedure
           begin
+            if (Lifetime <> nil) and (not Lifetime.Active) then
+              Exit;
             try
               CompleteProc(Success);
             except
@@ -1367,6 +1667,7 @@ begin
             end;
           end);
     end).Start;
+  Result := True;
 end;
 
 {$IFDEF AUTOTESTS}
@@ -1385,9 +1686,8 @@ begin
       Result := ATransport(AUrl, AFieldName, AText, AFileName);
     end;
   try
-    CrashQueueUploadWithTransport('autotest://upload', 'fixture',
-      AReportText, AReportPath, WorkerTransport, AOnComplete);
-    Result := True;
+    Result := CrashQueueUploadWithTransport('autotest://upload', 'fixture',
+      AReportText, AReportPath, WorkerTransport, AOnComplete, nil);
   except
     // The test observes a failed queue request directly.
   end;
@@ -1414,6 +1714,92 @@ function CrashAutoTestELContainsRawCaptureKey(const AFilePath,
   ACaptureKey: String): Boolean;
 begin
   Result := CrashELContainsRawCaptureKey(AFilePath, ACaptureKey);
+end;
+
+function CrashAutoTestFormatParameters(const AArguments,
+  AAllowList: TArray<String>; const AIncludeAll: Boolean;
+  const ASanitizer: TCrashSanitizeParametersProc): String;
+begin
+  Result := CrashFormatParameters(AArguments, AAllowList, AIncludeAll,
+    ASanitizer);
+end;
+
+function CrashAutoTestRenderFileName(const ATemplate, AApp, AVersion,
+  ABugID: String): String;
+begin
+  Result := CrashRenderFileNameTemplate(ATemplate, AApp, AVersion, ABugID);
+end;
+
+function CrashAutoTestTemplateScanPrefix(const ATemplate, AApp: String): String;
+begin
+  Result := CrashTemplateScanPrefix(ATemplate, AApp);
+end;
+
+function CrashAutoTestAcceptInitialConfig(var AInstalled: Boolean;
+  var ACurrent: TCrashConfig; const AIncoming: TCrashConfig): Boolean;
+begin
+  Result := CrashAcceptInitialConfig(AInstalled, ACurrent, AIncoming);
+end;
+
+function CrashAutoTestOperationLifetimeGate: Boolean;
+var
+  TestResult: Boolean;
+begin
+  TestResult := False;
+  // Unit tests run on a registry worker. Observe ForceQueue from the actual
+  // main thread, where CheckSynchronize is legal.
+  TThread.Synchronize(nil,
+    procedure
+    var
+      Lifetime: ICrashOperationLifetime;
+      Gate, Entered, TransportDone: TEvent;
+      CallbackCalled, GateResult: Boolean;
+      Deadline: UInt64;
+    begin
+      Lifetime := TCrashOperationLifetime.Create;
+      Gate := TEvent.Create(nil, True, False, '');
+      Entered := TEvent.Create(nil, True, False, '');
+      TransportDone := TEvent.Create(nil, True, False, '');
+      try
+        CallbackCalled := False;
+        GateResult := Lifetime.Active and CrashQueueUploadWithTransport(
+          'autotest://lifetime', 'fixture', 'fixture', 'fixture.el',
+          function(const AUrl, AFieldName, AText, AFileName: String): Boolean
+          begin
+            Entered.SetEvent;
+            Gate.WaitFor(2000);
+            TransportDone.SetEvent;
+            Result := False;
+          end,
+          procedure(const ASuccess: Boolean)
+          begin
+            CallbackCalled := True;
+          end,
+          Lifetime);
+        GateResult := GateResult and (Entered.WaitFor(2000) = wrSignaled);
+        Lifetime.Deactivate;
+        Gate.SetEvent;
+        GateResult := GateResult and (not Lifetime.Active) and
+          (TransportDone.WaitFor(2000) = wrSignaled);
+        // Give the worker time to cross the post-transport gate and pump the
+        // main queue. An incorrectly queued callback becomes observable here.
+        Deadline := TThread.GetTickCount64 + 250;
+        repeat
+          CheckSynchronize(0);
+          if CallbackCalled then
+            Break;
+          TThread.Sleep(5);
+        until TThread.GetTickCount64 >= Deadline;
+        TestResult := GateResult and (not CallbackCalled);
+      finally
+        Gate.SetEvent;
+        TransportDone.WaitFor(2000);
+        TransportDone.Free;
+        Entered.Free;
+        Gate.Free;
+      end;
+    end);
+  Result := TestResult;
 end;
 {$ENDIF}
 
@@ -1702,6 +2088,48 @@ begin
   end);
 end;
 
+class procedure TCrashReporter.Shutdown;
+var
+  Reporter: TCrashReporterImpl;
+begin
+  // Calm/quiesced host path by contract. Publish inactivity first so no new
+  // façade operation can attach itself to the runtime being dismantled.
+  Reporter := GReporter;
+  if Reporter = nil then
+    Exit;
+  GReporter := nil;
+  Reporter.Free;
+end;
+
+class procedure TCrashReporter.AddBreadcrumb(const ACategory,
+  AMessage: String);
+var
+  Reporter: TCrashReporterImpl;
+begin
+  Reporter := GReporter;
+  if (Reporter = nil) or (not Reporter.FInstalled) or
+     (Reporter.FBreadcrumbs = nil) then
+    Exit;
+  try
+    Reporter.FBreadcrumbs.Add(ACategory, AMessage);
+  except
+    // Diagnostics must never affect the host operation being recorded.
+  end;
+end;
+
+class procedure TCrashReporter.ClearBreadcrumbs;
+var
+  Reporter: TCrashReporterImpl;
+begin
+  Reporter := GReporter;
+  if (Reporter = nil) or (Reporter.FBreadcrumbs = nil) then
+    Exit;
+  try
+    Reporter.FBreadcrumbs.Clear;
+  except
+  end;
+end;
+
 class function TCrashReporter.Active: Boolean;
 begin
   Result := (GReporter <> nil) and GReporter.FInstalled;
@@ -1721,7 +2149,8 @@ begin
   Result.ThreadID := CrashCurrentThreadIdentity;
   // Fast idempotent path. The TLS owner prevents a stale dictionary entry from
   // an abnormally exited old thread with a recycled OS identity being trusted.
-  if GCoverageReporter = Pointer(Reporter) then
+  if (GCoverageReporter = Pointer(Reporter)) and
+     (GCoverageReporterInstanceID = Reporter.FInstanceID) then
   begin
     Reporter.FLock.Enter;
     try
@@ -1743,6 +2172,7 @@ begin
     Reporter.FLock.Leave;
   end;
   GCoverageReporter := Pointer(Reporter);
+  GCoverageReporterInstanceID := Reporter.FInstanceID;
 end;
 
 class procedure TCrashReporter.UnregisterCurrentThread;
@@ -1752,7 +2182,8 @@ var
 begin
   Reporter := TCrashReporterImpl(GCoverageReporter);
   ThreadID := CrashCurrentThreadIdentity;
-  if (Reporter <> nil) and (Reporter = GReporter) then
+  if (Reporter <> nil) and (Reporter = GReporter) and
+     (GCoverageReporterInstanceID = Reporter.FInstanceID) then
   begin
     Reporter.FLock.Enter;
     try
@@ -1762,6 +2193,7 @@ begin
     end;
   end;
   GCoverageReporter := nil;
+  GCoverageReporterInstanceID := 0;
   CrashUnregisterAltStackForCurrentThread;
 end;
 
@@ -1791,7 +2223,8 @@ begin
       Result.Threads[I] := Coverage;
       Inc(I);
     end;
-    if GCoverageReporter = Pointer(Reporter) then
+    if (GCoverageReporter = Pointer(Reporter)) and
+       (GCoverageReporterInstanceID = Reporter.FInstanceID) then
       Reporter.FThreadCoverages.TryGetValue(CurrentID, Result.CurrentThread);
   finally
     Reporter.FLock.Leave;
@@ -1855,9 +2288,8 @@ begin
   UploadField := Reporter.FConfig.UploadFieldName;
   ReportPath := Reporter.FCrashFilePath;
   try
-    CrashQueueUpload(UploadUrl, UploadField, AReportText, ReportPath,
-      AOnComplete);
-    Result := True;
+    Result := CrashQueueUpload(UploadUrl, UploadField, AReportText, ReportPath,
+      AOnComplete, Reporter.FOperationLifetime);
   except
     // The durable marker remains for startup recovery.
   end;

@@ -37,8 +37,10 @@ unit Crash.MacOS.MachExc;
   registers in the .el (RIP = fault address) and the KERN_FAILURE reply falls
   through to the RTL, which raises the Pascal exception as before.
 
-  Message layout (EXCEPTION_STATE_IDENTITY, msgh_id 2403) mirrors the Delphi RTL
-  System.Internal.MachExceptions.MachMsgSend. }
+  Message layout uses mach_exc/exception_raise_state_identity with
+  MACH_EXCEPTION_CODES (msgh_id 2407). The 64-bit exception codes preserve a
+  full fault address; KERN_FAILURE still falls through to the Delphi RTL's
+  task-level classic handler. }
 
 interface
 
@@ -72,10 +74,13 @@ const
   _PU = '';
   {$ENDIF}
 
-  // msgh_id of exception_raise_state_identity (classic, 32-bit codes). Same as
-  // the RTL registers (no MACH_EXCEPTION_CODES), so the kernel sends us the
-  // identical message format it sends the RTL.
-  EXC_RAISE_STATE_IDENTITY_ID = 2403;
+  // mach_exc.defs subsystem 2405: exception_raise_state_identity is routine
+  // 2, hence request id 2407. MACH_EXCEPTION_CODES selects mach_exc instead of
+  // the classic exception.defs subsystem and makes both codes signed 64-bit.
+  MACH_EXC_RAISE_STATE_IDENTITY_ID = 2407;
+  MACH_EXCEPTION_CODES = exception_behavior_t(-2147483648); // 0x80000000
+  MACH_EXCEPTION_STATE_IDENTITY =
+    EXCEPTION_STATE_IDENTITY or MACH_EXCEPTION_CODES;
 
   // mach_msg receive: the queued message is larger than rcv_size (mach/message.h).
   MACH_RCV_TOO_LARGE = $10004004;
@@ -142,7 +147,7 @@ type
     _type: UInt8;
   end;
 
-  // Incoming exception_raise_state_identity request (matches RTL MachMsgSend).
+  // Incoming mach_exception_raise_state_identity request (mach_exc.defs).
   TMachExcRequest = packed record
     header:       mach_msg_header_t;
     body:         mach_msg_body_t;
@@ -151,7 +156,7 @@ type
     NDR:          NDR_record_t;
     exception:    exception_type_t;
     codeCnt:      mach_msg_type_number_t;
-    code:         array[0..1] of Int32;       // 32-bit codes (classic behavior)
+    code:         array[0..1] of Int64;       // mach_exception_data_type_t
     flavor:       Int32;
     old_stateCnt: mach_msg_type_number_t;
     old_state:    array[0..223] of natural_t; // x86_thread_state_t lives here
@@ -210,12 +215,11 @@ begin
   end;
 
   // code[0] = kern code (KERN_INVALID_ADDRESS / KERN_PROTECTION_FAILURE / ...).
-  // code[1] = fault address, but TRUNCATED to 32 bits in classic behavior. Good
-  // enough for a NULL-deref test; full 64-bit needs MACH_EXCEPTION_CODES (TODO).
+  // code[1] = the complete 64-bit fault address (MACH_EXCEPTION_CODES).
   Code0  := 0;
   FaultA := 0;
-  if Req.codeCnt >= 1 then Code0  := Req.code[0];
-  if Req.codeCnt >= 2 then FaultA := UInt64(UInt32(Req.code[1]));
+  if Req.codeCnt >= 1 then Code0  := Integer(Req.code[0]);
+  if Req.codeCnt >= 2 then FaultA := UInt64(Req.code[1]);
 
   // Dump the faulting thread's stack SAFELY: vm_read_overwrite returns an error
   // (not a fault) if RSP is unmapped. A raw Move here would crash our watcher
@@ -317,7 +321,7 @@ begin
 
     // Snapshot registers for the exceptions we asked for. Anything unexpected -
     // skip the capture and still reply-fail so the kernel falls through.
-    if Req.header.msgh_id = EXC_RAISE_STATE_IDENTITY_ID then
+    if Req.header.msgh_id = MACH_EXC_RAISE_STATE_IDENTITY_ID then
     try
       CaptureRequest(Req);
     except
@@ -339,7 +343,7 @@ begin
 
     // The request descriptors carry +1 send rights for the faulting thread and
     // its task - release them, they leak otherwise (one pair per exception).
-    if Req.header.msgh_id = EXC_RAISE_STATE_IDENTITY_ID then
+    if Req.header.msgh_id = MACH_EXC_RAISE_STATE_IDENTITY_ID then
     begin
       if Req.thread.name <> 0 then
         mach_port_deallocate(mach_task_self, Req.thread.name);
@@ -433,12 +437,13 @@ begin
 
     // Register THIS thread's exception port (thread-level -> tried before the
     // task-level RTL port). EXCEPTION_STATE_IDENTITY + MACHINE_THREAD_STATE
-    // mirror the RTL so the kernel hands us the same message shape it gives
-    // the RTL.
+    // use the same state flavor as the RTL. MACH_EXCEPTION_CODES selects the
+    // mach_exc request layout; our failure reply deliberately hands control to
+    // the RTL's task-level classic handler afterwards.
     Thr := mach_thread_self;
     KR := thread_set_exception_ports(Thr,
       EXC_MASK_BAD_ACCESS or EXC_MASK_ARITHMETIC or EXC_MASK_BAD_INSTRUCTION,
-      Port, EXCEPTION_STATE_IDENTITY, MACHINE_THREAD_STATE);
+      Port, MACH_EXCEPTION_STATE_IDENTITY, MACHINE_THREAD_STATE);
     mach_port_deallocate(mach_task_self, Thr); // mach_thread_self returns a +1 send right
     if KR <> KERN_SUCCESS then
     begin

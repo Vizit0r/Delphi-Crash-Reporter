@@ -25,20 +25,20 @@ Derived from [grijjy/JustAddCode](https://github.com/grijjy/JustAddCode)
 
 | Capability | Linux | macOS | Android | iOS | Windows |
 |---|---|---|---|---|---|
-| Unhandled-exception trapping | ✅ | ✅ | ✅ | ✅ | ❌ (EurekaLog) |
-| Call stack (Pascal names) | ✅ | ✅ (LC_SYMTAB) | ✅ (`.gosym`) | ❓ untested | — |
+| Unhandled-exception trapping | ✅ | ✅ | ✅ | ⚠ compile-only | ❌ (EurekaLog) |
+| Call stack (Pascal names) | ✅ | ✅ (LC_SYMTAB) | ✅ (`.gosym`) | ⚠ compile-only | — |
 | Source line numbers (`.gol`) | ✅ | ✅ | ✅ | — | — |
-| CPU registers on hardware faults | ✅ | ✅ (signal ucontext / Mach) | ✅ (ARM64) | — | — |
-| Raw fallback when RTL conversion does not survive | ✅ | ✅ | ✅ (ARM64) | — | — |
+| CPU registers on hardware faults | ✅ | ✅ x64 Mach; ⚠ ARM64 gap | ✅ (ARM64) | ⚠ compile-only | ❌ (EurekaLog) |
+| Raw fallback when RTL conversion does not survive | ✅ | ✅ x64; ⚠ ARM64 gap | ✅ (ARM64) | ⚠ compile-only | ❌ |
 | Modules section | ✅ | ✅ | ✅ | — | — |
-| EL-compatible `.el` output | ✅ | ✅ | ✅ | ✅ | — |
-| Save / upload / dialog / restart | ✅ | ✅ | ✅ (no restart) | ✅ (no restart) | — |
+| EL-compatible `.el` output | ✅ | ✅ | ✅ | ⚠ compile-only | — |
+| Save / upload / dialog / restart | ✅ | ✅ | ✅ (no restart) | ⚠ compile-only, no restart | — |
 | Freeze (hang) watchdog + restart-on-freeze | ✅ (x64) | ✅ | ✅ (report-only) | — | — |
 
-**iOS is not runtime-tested.** The units compile for iOS and its paths mirror the macOS
-Mach-O ones (so the call stack *should* resolve via `LC_SYMTAB`), but nothing in the iOS
-column has been verified on device — treat those marks as *expected, not confirmed*. The
-Pascal-name call stack is the least certain: iOS strips/signs binaries differently, which
+**iOS is experimental and compile-only.** Its ordinary Pascal-exception/report path is
+expected to work, but no device runtime has verified it. Hardware register/raw capture is
+not claimed: like macOS, Delphi hardware faults use Mach delivery, while Crash has no iOS
+Mach observer. Pascal-name call stacks are also uncertain because iOS stripping/signing
 can leave `LC_SYMTAB` without the local symbols the resolver needs.
 
 On **Android** the deployed `.so` is stripped and the linker localizes Pascal symbols,
@@ -77,7 +77,13 @@ begin
 end;
 ```
 
-`Init` is idempotent and should run once at startup, before forms are created.
+`Init` is strictly idempotent and should run once at startup, before forms are
+created. A repeated call is a no-op and cannot silently replace the accepted
+configuration. To use a different configuration on a calm path, stop host workers that
+call Crash, invoke `TCrashReporter.Shutdown`, then call `Init` again. Process-level RTL
+and signal bootstrap hooks intentionally remain installed for the process lifetime.
+`Shutdown` is therefore not a concurrent teardown primitive: the host must not race it
+against `AddBreadcrumb`, `GetStatus`, registration, or other Crash API calls.
 
 ## Configuration (`TCrashConfig`)
 
@@ -89,8 +95,12 @@ vary is a field — there are no compile-time constants baked into the library.
 | `AppName` | exe name | Shown in the report header |
 | `AppVersion` | `''` | Host-supplied version string |
 | `CompilationTime` | `''` | "1.5 Compilation Date" field |
+| `IncludeAppParameters` | `False` | Explicit legacy opt-in to include every argument when no allowlist/callback is configured |
+| `AppParameterAllowList` | `[]` | Case-insensitive switch names allowed into `1.4 Parameters`; positional arguments are never selected |
+| `OnSanitizeParameters` | `nil` | Highest-priority privacy callback; returns the exact allowed parameter text and fails private on exception |
 | `SaveToFile` | `True` | Keep a normal local `.el`. With `False`, an upload-authorized fatal/headless path still creates a delivery artifact and removes it only after confirmed upload |
 | `FileNamePrefix` | `<exe>_<PLATFORM>_` | `<prefix><BugID>.el` file naming |
+| `FileNameTemplate` | `''` | Optional filename template using `{App}`, `{Platform}`, `{Version}`, `{BugID}`; invalid templates fall back to legacy naming |
 | `ScanFileNamePrefix` | `''` (= `FileNamePrefix`) | Boot-recovery scan prefix; set a stable version-free prefix when `FileNamePrefix` embeds an app version, so older-version reports are still picked up |
 | `UploadEnabled` | `False` | Upload reports to `UploadUrl` |
 | `UploadUrl` | `''` | Full multipart-POST endpoint (host builds it) |
@@ -99,6 +109,7 @@ vary is a field — there are no compile-time constants baked into the library.
 | `AllowRestart` | `True` | Allow the Restart action (platform-gated) |
 | `OnShowDialog` | `nil` | GUI dialog provider; `nil` → brief stderr |
 | `OnCollectContext` | `nil` | Optional extra text appended to the report |
+| `BreadcrumbCapacity` | `64` | Recent host-supplied breadcrumbs retained in a bounded ring; clamped to `0..256`, where `0` disables it |
 | `OnFilterReport` | `nil` | Last-step veto: `function(const AReport): Boolean`; return `False` to drop the report |
 | `DisabledSections` | `[]` (full report) | Report sections to omit entirely (header + body); Application, Exception and Call Stack are mandatory and not omittable |
 | `ReportDir` | `''` (platform default) | Directory for `.el` files (write + boot-recovery scan). Empty → next to the `.app` on macOS (not inside the bundle), the exe's own dir on Linux/Windows |
@@ -109,6 +120,31 @@ vary is a field — there are no compile-time constants baked into the library.
 
 Set the env var `CRASH_NO_UPLOAD=1` to skip uploads and keep the file on disk
 (useful for local testing).
+
+### Parameter privacy
+
+Application parameters are empty by default. Policy precedence is
+`OnSanitizeParameters` → `AppParameterAllowList` → `IncludeAppParameters` → empty.
+The final value is single-line and bounded to 4096 characters. An allowlisted
+`/name=value` keeps its value, so secrets that need redaction belong in the callback,
+not merely in the allowlist.
+
+### Breadcrumbs
+
+The host may add a cheap diagnostic trail without coupling Crash to application
+managers:
+
+```pascal
+TCrashReporter.AddBreadcrumb('network', 'login connected');
+TCrashReporter.AddBreadcrumb('script', 'started healer');
+```
+
+The ring keeps at most `BreadcrumbCapacity` entries in old-to-new order. Category and
+message are made single-line and bounded to 48/256 characters. The host must redact
+their content before passing it. A crash-path snapshot uses `TryEnter`, so a fault while
+another thread owns the ring cannot deadlock reporting; that report simply has no
+breadcrumbs. Entries are rendered in the existing `Steps to reproduce / 8.1 Text`
+section. `ClearBreadcrumbs` removes them explicitly.
 
 ### Durable delivery (`.pending`)
 
@@ -182,6 +218,7 @@ Core (framework-agnostic):
 - `Crash.Reporter` — public façade: `TCrashConfig`, `DefaultCrashConfig`, `TCrashReporter`.
 - `Crash.CallStack` — RTL exception hooks + stack capture; `TCrashCapture`, `TCrashReport`, `TCrashReportSection`.
 - `Crash.Signals` — POSIX `sigaction` CPU-register snapshot for hardware faults.
+- `Crash.Breadcrumbs` — bounded, thread-safe host diagnostic trail.
 - `Crash.RawFallback` — preallocated binary fallback slots and startup recovery.
 - `Crash.Modules` — loaded-module enumeration.
 - `Crash.Pending` — atomic report publication, delivery markers and startup partitioning.
@@ -444,8 +481,19 @@ conversion or confirmed duplication. Fresh incomplete/corrupt blocks are kept
 for diagnosis; stale ones expire after seven days. A successfully persisted
 ordinary hardware-fault `.el` supersedes and removes its matching raw slot.
 
-Scope: Linux x86-64, macOS x86-64 + ARM64, and Android ARM64 (aarch64). Other
-targets compile to no-ops.
+Active fatal-path scope is Linux x86-64, macOS x86-64 and Android ARM64
+(aarch64). On macOS x64 the Mach observer requests `MACH_EXCEPTION_CODES`, so
+the recovered fault address is not truncated to 32 bits. macOS ARM64 has the
+snapshot format but no production Mach observer yet; Delphi hardware faults
+bypass the POSIX handler there, so raw/register capture is not claimed.
+
+Two recovery limitations are deliberate and visible. A recovered report's
+Modules section describes the current recovery process, not the process that
+crashed. Also, a raw record stores an absolute instruction pointer: that is
+symbolizable across runs for the current non-PIE Linux build, but Android PIE
+ASLR changes the module base, so recovered Android source symbolization needs a
+future persisted module-relative address/base contract. The register and fault
+metadata remain available meanwhile.
 
 ## Freeze (hang) detection
 

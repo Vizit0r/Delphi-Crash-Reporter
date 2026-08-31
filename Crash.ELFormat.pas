@@ -28,13 +28,14 @@ type
   TCrashELContext = record
     AppName: String;           // e.g. "MyApp"
     AppVersion: String;        // e.g. "1.2.3.4"
-    AppParameters: String;     // ParamStr(1..N) joined
+    AppParameters: String;     // already sanitized by the Reporter/host
     StartTime: TDateTime;
     CompileTime: String;       // host-supplied literal, no reparsing
     ExceptionTime: TDateTime;
     ModulesText: String;       // pre-formatted Modules table body; '' = no table
     CpuSnapshot: String;       // pre-formatted "Registers:" section body (regs + stack hex). '' = empty section.
     SignalInfoSection: String; // separate "Crash Signal Info:" section (outside the EL format), '' = omit.
+    StepsToReproduceText: String; // bounded breadcrumbs or host-supplied text
     UserName: String;
     ComputerName: String;
     OSDescription: String;
@@ -710,7 +711,7 @@ begin
     if not (crsStepsToReproduce in ACtx.DisabledSections) then
     begin
       AppendSectionHeader(SB, 'Steps to reproduce');
-      AppendField(SB, '8.1 Text', '', 10);
+      AppendField(SB, '8.1 Text', ACtx.StepsToReproduceText, 10);
       SB.Append(CRLF);
     end;
 
@@ -967,25 +968,16 @@ end;
 
 function CrashDefaultELContext(const AStartTime: TDateTime;
   const AExceptAddr: UIntPtr; const ATakeSnapshot: Boolean): TCrashELContext;
+{$IF not Defined(MSWINDOWS)}
 var
-  I: Integer;
-  Params: TStringList;
-  {$IF not Defined(MSWINDOWS)}
   UTS: utsname;
-  {$ENDIF}
+{$ENDIF}
 begin
   Result := Default(TCrashELContext);
   Result.AppName := ExtractFileName(ParamStr(0));
-  // AppName/AppVersion/CompileTime are host-supplied: the reporter overlays
-  // them from TCrashConfig after this call. Left empty here by design.
-  Params := TStringList.Create;
-  try
-    for I := 1 to ParamCount do
-      Params.Add(ParamStr(I));
-    Result.AppParameters := String.Join(' ', Params.ToStringArray);
-  finally
-    Params.Free;
-  end;
+  // AppName/AppVersion/CompileTime/AppParameters are host-supplied: the
+  // reporter overlays them from TCrashConfig after this call. Parameters stay
+  // empty here deliberately so direct formatter use cannot leak argv.
   if AStartTime <> 0 then
     Result.StartTime := AStartTime
   else
