@@ -32,7 +32,8 @@ interface
 
 uses
   Crash.CallStack, // TCrashConfig, TCrashReport, TCrashReportSection(s)
-  Crash.Freeze;    // TCrashFreezeInfo / TCrashFreezeReportProc (freeze detector)
+  Crash.Freeze,    // TCrashFreezeInfo / TCrashFreezeReportProc (freeze detector)
+  Crash.Signals;   // TCrashAltStackState (per-thread hardware-fault coverage)
 
 type
   { Shows a modal dialog with the full report text for non-fatal exceptions.
@@ -153,6 +154,34 @@ type
 function DefaultCrashConfig: TCrashConfig;
 
 type
+  TCrashMachState = (
+    cmsNotRequired,
+    cmsUnavailable,
+    cmsInstalled
+  );
+
+  { Actual calm-path coverage verdict for one registered thread. }
+  TCrashThreadCoverage = record
+    Registered: Boolean;
+    ThreadID: UInt64;
+    Name: String;
+    AltStack: TCrashAltStackState;
+    MachHandler: TCrashMachState;
+  end;
+
+  { Point-in-time reporter status. Threads contains only callers that really
+    registered and have not yet unregistered; direct TThread/vendored workers
+    are deliberately not inferred. }
+  TCrashStatus = record
+    Active: Boolean;
+    SignalHandlersInstalled: Boolean;
+    FreezeDetectorActive: Boolean;
+    RegisteredThreadCount: Integer;
+    MainThread: TCrashThreadCoverage;
+    CurrentThread: TCrashThreadCoverage;
+    Threads: TArray<TCrashThreadCoverage>;
+  end;
+
   { What a previous run left behind when RestartOnFreeze replaced a frozen
     instance. Read (and consumed) from the notice file at Init; the host
     surfaces it via TCrashReporter.TakeRestartNotice - a dialog, a journal
@@ -246,6 +275,15 @@ type
     { Install hooks + scan for pending reports. Call once at startup. Idempotent. }
     class procedure Init(const AConfig: TCrashConfig); static;
     class function Active: Boolean; static;
+    { Cover the CALLING thread on a calm path. Repeated calls from the same
+      thread are idempotent. AName is diagnostic only. }
+    class function RegisterCurrentThread(const AName: String = ''):
+      TCrashThreadCoverage; static;
+    { Final action of a registered worker's try/finally. Owned alt-stack is
+      disabled then freed; a borrowed stack is never touched. On macOS the
+      thread-level Mach registration disappears with the exiting kernel thread. }
+    class procedure UnregisterCurrentThread; static;
+    class function GetStatus: TCrashStatus; static;
 
     { Unmarked/not-upload-authorized reports from previous runs (boot recovery).
       Empties the buffer. Marked reports are handled by the background worker. }
@@ -322,7 +360,6 @@ uses
   System.Net.Mime,
   System.Net.URLClient,
   Crash.ELFormat,
-  Crash.Signals,
   Crash.MacOS.Symbols,
   Crash.MacOS.MachExc,
   Crash.Android.Symbols,
@@ -331,6 +368,7 @@ uses
   Winapi.Windows,
   {$ENDIF}
   {$IF not Defined(MSWINDOWS)}
+  Posix.Pthread,
   Posix.Unistd, // getpid(), fork(), execv(), pipe()
   Posix.Stdlib,
   Posix.SysTypes,
@@ -498,6 +536,8 @@ type
     FRestartNotice: TCrashRestartNotice; // what the previous run's RestartOnFreeze left behind (consumed via TakeRestartNotice)
     FWasFreezeRestarted: Boolean; // loop-guard flag: this run WAS spawned by RestartOnFreeze (survives TakeRestartNotice)
     FMachMainThreadCovered: Boolean; // Init-time Mach registration verdict (main thread only; NOT a live watcher status)
+    FMainThreadCoverage: TCrashThreadCoverage;
+    FThreadCoverages: TDictionary<UInt64, TCrashThreadCoverage>;
     function EffectiveFileNamePrefix: String;
     function EffectiveScanPrefix: String;
     function EffectiveReportDir: String;
@@ -528,10 +568,14 @@ type
 var
   GReporter: TCrashReporterImpl;
 
+threadvar
+  GCoverageReporter: Pointer;
+
 constructor TCrashReporterImpl.Create;
 begin
   inherited Create;
   FLock := TCriticalSection.Create;
+  FThreadCoverages := TDictionary<UInt64, TCrashThreadCoverage>.Create;
   FMachMainThreadCovered := True; // no verdict yet - only Init's registration may flip it
   FAppStartTime := Now; // "close enough to process start"
   FAppStartTick := TThread.GetTickCount64;
@@ -545,8 +589,30 @@ begin
   TCrashFreeze.OnCapture := nil;
   TCrashFreeze.OnExternalSuppress := nil;
   TCrashCapture.OnReport := nil;
+  FreeAndNil(FThreadCoverages);
   FreeAndNil(FLock);
   inherited;
+end;
+
+function CrashCurrentThreadIdentity: UInt64;
+begin
+  {$IF Defined(MSWINDOWS)}
+  Result := UInt64(GetCurrentThreadId);
+  {$ELSE}
+  Result := UInt64(NativeUInt(pthread_self));
+  {$ENDIF}
+end;
+
+function CrashRegisterMachForCurrentThread: TCrashMachState;
+begin
+  {$IF Defined(MACOS) and Defined(CPUX64)}
+  if CrashInstallMacOSMachHandlerForCurrentThread then
+    Result := cmsInstalled
+  else
+    Result := cmsUnavailable;
+  {$ELSE}
+  Result := cmsNotRequired;
+  {$ENDIF}
 end;
 
 function TCrashReporterImpl.EffectiveFileNamePrefix: String;
@@ -1395,20 +1461,37 @@ end;
 { ---- TCrashReporter façade ---- }
 
 class procedure TCrashReporter.Init(const AConfig: TCrashConfig);
+var
+  MainCoverage: TCrashThreadCoverage;
+  MainAlreadyRegistered, MachMainCovered: Boolean;
 begin
   if GReporter = nil then
     GReporter := TCrashReporterImpl.Create;
   GReporter.Install(AConfig);
+  GReporter.FLock.Enter;
+  try
+    MainAlreadyRegistered := GReporter.FMainThreadCoverage.Registered;
+  finally
+    GReporter.FLock.Leave;
+  end;
+  if MainAlreadyRegistered then
+    Exit;
   // POSIX: capture registers + stack for AV/div0/illegal-instruction before the
   // kernel re-delivers the signal to the Pascal RTL handler. No-op on Windows.
   CrashInstallSignalHandlers;
-  // macOS: install our thread-level Mach exception port on the MAIN thread (we
-  // run on it here). Captures CPU registers for hardware faults, which the RTL's
-  // POSIX-bypassing Mach handler otherwise hides. True on non-Mach targets
-  // (nothing to cover); False = MAIN-thread faults will report without the
-  // Registers section. Init-time verdict only (see MainThreadMachCovered).
-  GReporter.FMachMainThreadCovered := CrashInstallMacOSMachHandlerForCurrentThread;
-  if not GReporter.FMachMainThreadCovered then
+  // Register the calling MAIN thread through the same calm-path API workers use.
+  // This reuses the alt-stack just installed above and adds the existing macOS
+  // thread-level Mach observer where required.
+  MainCoverage := RegisterCurrentThread('MAIN');
+  MachMainCovered := MainCoverage.MachHandler <> cmsUnavailable;
+  GReporter.FLock.Enter;
+  try
+    GReporter.FMainThreadCoverage := MainCoverage;
+    GReporter.FMachMainThreadCovered := MachMainCovered;
+  finally
+    GReporter.FLock.Leave;
+  end;
+  if not MachMainCovered then
     GReporter.ConsoleLine('Mach registration for the Init thread failed - main-thread Registers sections will be missing');
   // macOS: build the Pascal-symbol cache from the running Mach-O LC_SYMTAB so the
   // call stack shows real function names (not the nearest dladdr export). No-op
@@ -1446,6 +1529,97 @@ end;
 class function TCrashReporter.Active: Boolean;
 begin
   Result := (GReporter <> nil) and GReporter.FInstalled;
+end;
+
+class function TCrashReporter.RegisterCurrentThread(
+  const AName: String): TCrashThreadCoverage;
+var
+  Reporter: TCrashReporterImpl;
+  Existing: TCrashThreadCoverage;
+begin
+  Result := Default(TCrashThreadCoverage);
+  Reporter := GReporter;
+  if (Reporter = nil) or (not Reporter.FInstalled) then
+    Exit;
+
+  Result.ThreadID := CrashCurrentThreadIdentity;
+  // Fast idempotent path. The TLS owner prevents a stale dictionary entry from
+  // an abnormally exited old thread with a recycled OS identity being trusted.
+  if GCoverageReporter = Pointer(Reporter) then
+  begin
+    Reporter.FLock.Enter;
+    try
+      if Reporter.FThreadCoverages.TryGetValue(Result.ThreadID, Existing) then
+        Exit(Existing);
+    finally
+      Reporter.FLock.Leave;
+    end;
+  end;
+
+  Result.Registered := True;
+  Result.Name := AName;
+  Result.AltStack := CrashRegisterAltStackForCurrentThread;
+  Result.MachHandler := CrashRegisterMachForCurrentThread;
+  Reporter.FLock.Enter;
+  try
+    Reporter.FThreadCoverages.AddOrSetValue(Result.ThreadID, Result);
+  finally
+    Reporter.FLock.Leave;
+  end;
+  GCoverageReporter := Pointer(Reporter);
+end;
+
+class procedure TCrashReporter.UnregisterCurrentThread;
+var
+  Reporter: TCrashReporterImpl;
+  ThreadID: UInt64;
+begin
+  Reporter := TCrashReporterImpl(GCoverageReporter);
+  ThreadID := CrashCurrentThreadIdentity;
+  if (Reporter <> nil) and (Reporter = GReporter) then
+  begin
+    Reporter.FLock.Enter;
+    try
+      Reporter.FThreadCoverages.Remove(ThreadID);
+    finally
+      Reporter.FLock.Leave;
+    end;
+  end;
+  GCoverageReporter := nil;
+  CrashUnregisterAltStackForCurrentThread;
+end;
+
+class function TCrashReporter.GetStatus: TCrashStatus;
+var
+  Reporter: TCrashReporterImpl;
+  Coverage: TCrashThreadCoverage;
+  I: Integer;
+  CurrentID: UInt64;
+begin
+  Result := Default(TCrashStatus);
+  Reporter := GReporter;
+  if Reporter = nil then
+    Exit;
+  Result.Active := Reporter.FInstalled;
+  Result.SignalHandlersInstalled := CrashSignalHandlersInstalled;
+  Result.FreezeDetectorActive := TCrashFreeze.Active;
+  CurrentID := CrashCurrentThreadIdentity;
+  Reporter.FLock.Enter;
+  try
+    Result.RegisteredThreadCount := Reporter.FThreadCoverages.Count;
+    Result.MainThread := Reporter.FMainThreadCoverage;
+    SetLength(Result.Threads, Result.RegisteredThreadCount);
+    I := 0;
+    for Coverage in Reporter.FThreadCoverages.Values do
+    begin
+      Result.Threads[I] := Coverage;
+      Inc(I);
+    end;
+    if GCoverageReporter = Pointer(Reporter) then
+      Reporter.FThreadCoverages.TryGetValue(CurrentID, Result.CurrentThread);
+  finally
+    Reporter.FLock.Leave;
+  end;
 end;
 
 class function TCrashReporter.LastCrashFileName: String;

@@ -38,7 +38,20 @@ unit Crash.Signals;
 
 interface
 
+type
+  { Alternate signal-stack verdict for one calling thread. Signal handlers are
+    still process-global; only this stack is per-thread. }
+  TCrashAltStackState = (
+    casNotRequired, // signal capture is not compiled for this target
+    casUnavailable, // query/allocation/registration failed
+    casBorrowed,    // an active host/RTL stack already existed; never touch it
+    casOwned        // Crash allocated and registered this thread's stack
+  );
+
 procedure CrashInstallSignalHandlers;
+function CrashSignalHandlersInstalled: Boolean;
+function CrashRegisterAltStackForCurrentThread: TCrashAltStackState;
+procedure CrashUnregisterAltStackForCurrentThread;
 function  CrashHasSignalSnapshot: Boolean;
 
 // Drop a captured-but-unconsumed snapshot (host veto, discarded report) and
@@ -189,8 +202,11 @@ var
   GSnapshotEpoch:  Integer = 0;  // bumped by TakeSnapshot; pairs a concurrent claim with its primary capture cycle
   GOldHandlers:    array[1..31] of sigaction_t;
   GInstalled:      Boolean = False;
-  GAltStackDone:   Boolean = False;
-  GAltStack:       Pointer = nil; // registered with the kernel for process lifetime - never freed
+
+threadvar
+  GAltStackRegistered: Boolean;
+  GAltStackState: TCrashAltStackState;
+  GOwnedAltStack: Pointer;
 
 const
   // 64 KB: comfortably above every platform's MINSIGSTKSZ (macOS demands 32 KB;
@@ -200,30 +216,91 @@ const
   // differs per platform (Linux=2, macOS=4).
   ALT_SS_DISABLE  = {$IF Defined(CRASH_LINUXLIKE)}2{$ELSEIF Defined(MACOS)}4{$ENDIF};
 
-procedure InstallAltStackOnce;
-// Register an alternate signal stack for the CALLING thread (first call only;
-// Init runs on the main thread, so that is the covered one). Without it
-// SA_ONSTACK is inert and a stack-overflow SIGSEGV kills the process before the
-// handler can even start (no room for the kernel's signal frame). With it the
-// handler runs and snapshots the registers; whether a full .el follows still
-// depends on the RTL conversion surviving on the exhausted original stack.
+function CrashRegisterAltStackForCurrentThread: TCrashAltStackState;
+// Register an alternate signal stack for the CALLING thread. Without it
+// SA_ONSTACK is inert and a stack-overflow SIGSEGV can kill the process before
+// the handler starts. Idempotent per thread: an owned/borrowed verdict is reused
+// without allocating again.
 var
   SS, OldSS: stack_t;
+  NewStack: Pointer;
 begin
-  if GAltStackDone then Exit;
-  GAltStackDone := True;
+  if GAltStackRegistered then
+    Exit(GAltStackState);
+  GAltStackRegistered := True;
+  GAltStackState := casUnavailable;
+  GOwnedAltStack := nil;
+
   // Respect a pre-registered alt-stack (host or RTL): it is per-thread state
   // owned by whoever set it.
   FillChar(OldSS, SizeOf(OldSS), 0);
-  if (sigaltstack(nil, @OldSS) = 0) and (OldSS.ss_sp <> nil) and
+  if sigaltstack(nil, @OldSS) <> 0 then
+    Exit(GAltStackState);
+  if (OldSS.ss_sp <> nil) and
      ((OldSS.ss_flags and ALT_SS_DISABLE) = 0) then
-    Exit;
-  GetMem(GAltStack, ALT_STACK_BYTES);
+  begin
+    GAltStackState := casBorrowed;
+    Exit(GAltStackState);
+  end;
+
+  try
+    GetMem(NewStack, ALT_STACK_BYTES);
+  except
+    Exit(GAltStackState);
+  end;
   FillChar(SS, SizeOf(SS), 0);
-  SS.ss_sp    := GAltStack;
+  SS.ss_sp    := NewStack;
   SS.ss_size  := ALT_STACK_BYTES;
   SS.ss_flags := 0;
-  sigaltstack(@SS, nil);
+  if sigaltstack(@SS, nil) <> 0 then
+  begin
+    FreeMem(NewStack);
+    Exit(GAltStackState);
+  end;
+  GOwnedAltStack := NewStack;
+  GAltStackState := casOwned;
+  Result := GAltStackState;
+end;
+
+procedure CrashUnregisterAltStackForCurrentThread;
+// Intended for the final finally-block of the calling thread. A borrowed stack
+// is never modified. An owned buffer is freed only after it is no longer the
+// active kernel stack; uncertainty deliberately leaks instead of risking UAF.
+var
+  CurrentSS, DisableSS: stack_t;
+  Owned: Pointer;
+begin
+  if not GAltStackRegistered then
+    Exit;
+  if GAltStackState <> casOwned then
+  begin
+    GAltStackRegistered := False;
+    GAltStackState := casNotRequired;
+    Exit;
+  end;
+
+  Owned := GOwnedAltStack;
+  if Owned = nil then
+    Exit;
+  FillChar(CurrentSS, SizeOf(CurrentSS), 0);
+  if sigaltstack(nil, @CurrentSS) <> 0 then
+    Exit;
+
+  if (CurrentSS.ss_sp = Owned) and
+     ((CurrentSS.ss_flags and ALT_SS_DISABLE) = 0) then
+  begin
+    FillChar(DisableSS, SizeOf(DisableSS), 0);
+    DisableSS.ss_flags := ALT_SS_DISABLE;
+    if sigaltstack(@DisableSS, nil) <> 0 then
+      Exit;
+  end;
+  // Either SS_DISABLE succeeded, the stack was already disabled, or the host
+  // replaced it with another active stack. In every case Owned is no longer
+  // registered; never touch the current foreign pointer.
+  FreeMem(Owned);
+  GOwnedAltStack := nil;
+  GAltStackRegistered := False;
+  GAltStackState := casNotRequired;
 end;
 
 function ExtractFaultAddr(SigInfo: Psiginfo_t): UInt64; inline;
@@ -501,11 +578,16 @@ begin
     FillChar(GConcurrentSignal, SizeOf(GConcurrentSignal), 0);
   end;
   GInstalled := True;
-  InstallAltStackOnce; // covers the calling thread (main at Init) - see there
+  CrashRegisterAltStackForCurrentThread;
   InstallOne(SIGSEGV);
   InstallOne(SIGFPE);
   InstallOne(SIGILL);
   InstallOne(SIGBUS);
+end;
+
+function CrashSignalHandlersInstalled: Boolean;
+begin
+  Result := GInstalled;
 end;
 
 function CrashHasSignalSnapshot: Boolean;
@@ -1086,6 +1168,12 @@ end;
 {$ELSE}  // not CRASH_SIGCAP -> no-op stubs
 
 procedure CrashInstallSignalHandlers;            begin end;
+function CrashSignalHandlersInstalled: Boolean;  begin Result := False; end;
+function CrashRegisterAltStackForCurrentThread: TCrashAltStackState;
+begin
+  Result := casNotRequired;
+end;
+procedure CrashUnregisterAltStackForCurrentThread; begin end;
 function  CrashHasSignalSnapshot: Boolean;       begin Result := False; end;
 procedure CrashDiscardPendingSnapshot;           begin end;
 function  CrashPrimaryFaultAddr(out AAddr: UIntPtr): Boolean; begin AAddr := 0; Result := False; end;
