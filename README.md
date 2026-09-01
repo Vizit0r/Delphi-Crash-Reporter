@@ -369,9 +369,20 @@ Both files are produced together and shipped together:
    overwrite files`), so after an app update the extracted side-file still belongs to the
    previous build and is rejected on the build-id check — silently costing you names and
    lines on exactly the reports you care about.
+   Runtime lookup is also gated by the exact load base recorded for this `.so`:
+   an offset from vDSO or another shared library is never looked up in the app's
+   `.gol/.gosym`, even if the numeric offset happens to match an app entry.
 4. **Archive the unstripped `.so` per release** so any leftover `module + offset` report
    (a no-DWARF frame, or an old report whose side-files were lost) can still be symbolized
    offline against it.
+
+This repository provides `tools/Crash.AndroidSymbols.targets` for Delphi FMX
+projects. Import it after the generated `.deployproj`: it invokes the existing
+`gen-android-crash-sidefiles.ps1` before `_CalculateDeployment`, adds both files
+to `assets/internal`, and runs `verify-android-crash-symbols.ps1` after `Deploy`
+to reject a proven build-id mismatch. `Demo/Mobile/CrashDemoFMX.dproj` is the
+small reference integration; the host application's Android build uses the same
+target through its host-specific wrapper.
 
 ## Wiring into your build
 
@@ -473,8 +484,16 @@ commit byte is written last. This covers failures such as a real stack overflow
 where the handler runs on the alternate stack but the later Delphi RTL
 conversion cannot build a Pascal exception or `.el`.
 
-On the next startup, a fail-closed parser accepts only the exact versioned
-layout with valid stage and commit markers. It converts the block into a normal
+On Android ARM64, a recognized stack guard-page fault terminates through
+async-signal-safe `_exit(128 + SIGSEGV)` immediately after the durable raw
+commit. Returning to Bionic/Delphi RTL on the exhausted stack can otherwise
+loop in secondary SIGSEGV delivery instead of terminating. This path may have
+no debuggerd tombstone; the committed raw block is the authoritative artifact.
+
+On the next startup, a fail-closed parser accepts the known V1/V2 layouts with
+valid stage and commit markers (unknown versions are rejected). V2 keeps the V1
+1354-byte block size, adds the crashed main-image base/size and a 16-byte image
+identity, and reduces only the unused payload reserve. It converts the block into a normal
 EL-compatible `ERawHardwareFault` report, deduplicates it against a full `.el`
 by the embedded `Raw Capture Key`, and removes the raw file only after successful
 conversion or confirmed duplication. Fresh incomplete/corrupt blocks are kept
@@ -487,13 +506,14 @@ the recovered fault address is not truncated to 32 bits. macOS ARM64 has the
 snapshot format but no production Mach observer yet; Delphi hardware faults
 bypass the POSIX handler there, so raw/register capture is not claimed.
 
-Two recovery limitations are deliberate and visible. A recovered report's
-Modules section describes the current recovery process, not the process that
-crashed. Also, a raw record stores an absolute instruction pointer: that is
-symbolizable across runs for the current non-PIE Linux build, but Android PIE
-ASLR changes the module base, so recovered Android source symbolization needs a
-future persisted module-relative address/base contract. The register and fault
-metadata remain available meanwhile.
+One recovery limitation is deliberate and visible: a recovered report's Modules
+section describes the current recovery process, not the process that crashed.
+V2 closes the Android PIE/ASLR gap by translating an IP inside the captured image
+to the same module offset in the current image. The translation is allowed only
+when the exact GNU build-id matches (or, on targets without an image ID, when a
+non-empty compilation identity matches); otherwise recovery stays unresolved.
+Symbol lookup runs at the current address and the emitted stack row is then
+translated back to the captured address range.
 
 ## Freeze (hang) detection
 
@@ -614,6 +634,28 @@ CRASH_DEMO_SAVE_TO_FILE=0 CRASH_DEMO_UPLOAD_URL=http://10.255.255.1:9 ./CrashDem
 With no `--crash` argument it just prints `Reporter Active = True`. The reporter
 consumes the library purely via the unit search path (a single `..` entry — the
 directory holding the `Crash.*` units), exactly as an external consumer would.
+
+### Android FMX runtime harness
+
+`Demo/Mobile/CrashDemoFMX.dproj` is the Android64 FMX runtime harness. It shows
+`TCrashStatus`, breadcrumbs and report artifacts and provides buttons for a
+software raise, main/worker AV, stack overflow and a 15-second freeze. Build an
+APK with a fresh native library in one invocation:
+
+```
+msbuild Demo\Mobile\CrashDemoFMX.dproj /t:Build;Deploy \
+  /p:Config=Debug /p:Platform=Android64
+```
+
+The project deliberately carries the complete 88-jar FMX mobile dex list from
+the RAD Studio 37.0 template. If that list changes, delete generated
+`Android64\Debug\BuildClassesDex.stamp` and `CrashDemoFMX.classes` before the
+next `Build;Deploy`; the IDE target does not include `EnabledSysJars` in its
+cache stamp. The build also generates `.gosym` and `.gol` from the fresh
+unstripped `.so`, packages them into `assets/internal`, and verifies all three
+build IDs after deployment. Reports live under the app-private
+`Documents/CrashDemoFMX/CrashReports`. The UI lists only committed raw blocks;
+the two empty preallocated `.crashraw` slots remain on disk but are not reports.
 
 ## License
 

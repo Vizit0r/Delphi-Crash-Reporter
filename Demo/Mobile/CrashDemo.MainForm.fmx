@@ -1,0 +1,190 @@
+object CrashDemoMainForm: TCrashDemoMainForm
+  Caption = 'Crash Android Runtime Demo'
+  ClientHeight = 760
+  ClientWidth = 420
+  Position = ScreenCenter
+  FormFactor.Width = 320
+  FormFactor.Height = 480
+  FormFactor.Devices = [Desktop, iPhone, iPad]
+  OnCreate = FormCreate
+  OnDestroy = FormDestroy
+  DesignerMasterStyle = 0
+  object RootScroll: TVertScrollBox
+    Align = Client
+    Size.Width = 420.000000000000000000
+    Size.Height = 760.000000000000000000
+    Size.PlatformDefault = False
+    TabOrder = 0
+    object ContentLayout: TLayout
+      Align = Top
+      Size.Width = 420.000000000000000000
+      Size.Height = 1210.000000000000000000
+      Size.PlatformDefault = False
+      TabOrder = 0
+      object TitleLabel: TLabel
+        Align = Top
+        Margins.Left = 8.000000000000000000
+        Margins.Top = 8.000000000000000000
+        Margins.Right = 8.000000000000000000
+        Size.Width = 404.000000000000000000
+        Size.Height = 28.000000000000000000
+        Size.PlatformDefault = False
+        TextSettings.Font.Size = 18.000000000000000000
+        Text = 'Crash Reporter runtime demo'
+      end
+      object ReportDirLabel: TLabel
+        Align = Top
+        Margins.Left = 8.000000000000000000
+        Margins.Right = 8.000000000000000000
+        Position.Y = 36.000000000000000000
+        Size.Width = 404.000000000000000000
+        Size.Height = 64.000000000000000000
+        Size.PlatformDefault = False
+        TextSettings.WordWrap = True
+        Text = 'Report directory:'
+      end
+      object RaiseButton: TButton
+        Anchors = [akLeft, akTop, akRight]
+        Position.X = 8.000000000000000000
+        Position.Y = 108.000000000000000000
+        Size.Width = 404.000000000000000000
+        Size.Height = 42.000000000000000000
+        Size.PlatformDefault = False
+        Text = 'Software raise'
+        OnClick = RaiseButtonClick
+      end
+      object AccessViolationButton: TButton
+        Anchors = [akLeft, akTop, akRight]
+        Position.X = 8.000000000000000000
+        Position.Y = 156.000000000000000000
+        Size.Width = 404.000000000000000000
+        Size.Height = 42.000000000000000000
+        Size.PlatformDefault = False
+        Text = 'Access violation'
+        OnClick = AccessViolationButtonClick
+      end
+      object WorkerButton: TButton
+        Anchors = [akLeft, akTop, akRight]
+        Position.X = 8.000000000000000000
+        Position.Y = 204.000000000000000000
+        Size.Width = 404.000000000000000000
+        Size.Height = 42.000000000000000000
+        Size.PlatformDefault = False
+        Text = 'AV in worker'
+        OnClick = WorkerButtonClick
+      end
+      object StackOverflowButton: TButton
+        Anchors = [akLeft, akTop, akRight]
+        Position.X = 8.000000000000000000
+        Position.Y = 252.000000000000000000
+        Size.Width = 404.000000000000000000
+        Size.Height = 42.000000000000000000
+        Size.PlatformDefault = False
+        Text = 'Stack overflow'
+        OnClick = StackOverflowButtonClick
+      end
+      object FreezeButton: TButton
+        Anchors = [akLeft, akTop, akRight]
+        Position.X = 8.000000000000000000
+        Position.Y = 300.000000000000000000
+        Size.Width = 404.000000000000000000
+        Size.Height = 42.000000000000000000
+        Size.PlatformDefault = False
+        Text = 'Freeze 15 seconds'
+        OnClick = FreezeButtonClick
+      end
+      object StatusLabel: TLabel
+        Anchors = [akLeft, akTop, akRight]
+        Position.X = 8.000000000000000000
+        Position.Y = 354.000000000000000000
+        Size.Width = 404.000000000000000000
+        Size.Height = 22.000000000000000000
+        Size.PlatformDefault = False
+        Text = 'Reporter status'
+      end
+      object StatusMemo: TMemo
+        Anchors = [akLeft, akTop, akRight]
+        Touch.InteractiveGestures = [Pan, LongTap, DoubleTap]
+        DataDetectorTypes = []
+        ReadOnly = True
+        Position.X = 8.000000000000000000
+        Position.Y = 378.000000000000000000
+        Size.Width = 404.000000000000000000
+        Size.Height = 175.000000000000000000
+        Size.PlatformDefault = False
+        TabOrder = 5
+        Viewport.Width = 396.000000000000000000
+        Viewport.Height = 144.000000000000000000
+      end
+      object FilesLabel: TLabel
+        Anchors = [akLeft, akTop, akRight]
+        Position.X = 8.000000000000000000
+        Position.Y = 565.000000000000000000
+        Size.Width = 404.000000000000000000
+        Size.Height = 22.000000000000000000
+        Size.PlatformDefault = False
+        Text = 'Crash artifacts'
+      end
+      object RefreshButton: TButton
+        Anchors = [akLeft, akTop, akRight]
+        Position.X = 8.000000000000000000
+        Position.Y = 595.000000000000000000
+        Size.Width = 404.000000000000000000
+        Size.Height = 42.000000000000000000
+        Size.PlatformDefault = False
+        Text = 'Refresh'
+        OnClick = RefreshButtonClick
+      end
+      object ClearButton: TButton
+        Anchors = [akLeft, akTop, akRight]
+        Position.X = 8.000000000000000000
+        Position.Y = 643.000000000000000000
+        Size.Width = 404.000000000000000000
+        Size.Height = 42.000000000000000000
+        Size.PlatformDefault = False
+        Text = 'Clear all'
+        OnClick = ClearButtonClick
+      end
+      object FileList: TListBox
+        Anchors = [akLeft, akTop, akRight]
+        Position.X = 8.000000000000000000
+        Position.Y = 691.000000000000000000
+        Size.Width = 404.000000000000000000
+        Size.Height = 168.000000000000000000
+        Size.PlatformDefault = False
+        TabOrder = 8
+        OnChange = FileListChange
+      end
+      object ReportLabel: TLabel
+        Anchors = [akLeft, akTop, akRight]
+        Position.X = 8.000000000000000000
+        Position.Y = 871.000000000000000000
+        Size.Width = 404.000000000000000000
+        Size.Height = 22.000000000000000000
+        Size.PlatformDefault = False
+        Text = 'Selected report'
+      end
+      object ReportMemo: TMemo
+        Anchors = [akLeft, akTop, akRight]
+        Touch.InteractiveGestures = [Pan, LongTap, DoubleTap]
+        DataDetectorTypes = []
+        ReadOnly = True
+        Position.X = 8.000000000000000000
+        Position.Y = 895.000000000000000000
+        Size.Width = 404.000000000000000000
+        Size.Height = 304.000000000000000000
+        Size.PlatformDefault = False
+        TabOrder = 10
+        Viewport.Width = 396.000000000000000000
+        Viewport.Height = 296.000000000000000000
+      end
+    end
+  end
+  object HeartbeatTimer: TTimer
+    Enabled = True
+    Interval = 250
+    OnTimer = HeartbeatTimerTimer
+    Left = 360
+    Top = 24
+  end
+end

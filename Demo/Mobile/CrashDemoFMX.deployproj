@@ -1,0 +1,91 @@
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+    <Import Condition="Exists('$(BDS)\bin\CodeGear.Deployment.targets')" Project="$(BDS)\bin\CodeGear.Deployment.targets"/>
+    <ProjectExtensions>
+        <ProjectFileVersion>12</ProjectFileVersion>
+    </ProjectExtensions>
+    <PropertyGroup>
+        <BDSProjectType>Application</BDSProjectType>
+    </PropertyGroup>
+    <ItemGroup Condition="'$(Platform)'=='Android64'">
+        <DeployFile Include="Android64\$(Config)\AndroidManifest.xml">
+            <RemoteDir>CrashDemoFMX\</RemoteDir>
+            <RemoteName>AndroidManifest.xml</RemoteName>
+        </DeployFile>
+        <DeployFile Include="Android64\$(Config)\libCrashDemoFMX.so">
+            <RemoteDir>CrashDemoFMX\library\lib\arm64-v8a\</RemoteDir>
+            <RemoteName>libCrashDemoFMX.so</RemoteName>
+        </DeployFile>
+        <DeployFile Include="$(BDS)\lib\android64\debug\libProxyAndroidService.so">
+            <RemoteDir>CrashDemoFMX\library\lib\arm64-v8a\</RemoteDir>
+            <RemoteName>libProxyAndroidService.so</RemoteName>
+        </DeployFile>
+        <DeployFile Include="Android64\$(Config)\styles.xml">
+            <RemoteDir>CrashDemoFMX\res\values\</RemoteDir>
+            <RemoteName>styles.xml</RemoteName>
+        </DeployFile>
+        <DeployFile Include="Android64\$(Config)\styles-v21.xml">
+            <RemoteDir>CrashDemoFMX\res\values-v21\</RemoteDir>
+            <RemoteName>styles.xml</RemoteName>
+        </DeployFile>
+        <DeployFile Include="Android64\$(Config)\styles-v35.xml">
+            <RemoteDir>CrashDemoFMX\res\values-v35\</RemoteDir>
+            <RemoteName>styles.xml</RemoteName>
+        </DeployFile>
+        <DeployFile Include="Android64\$(Config)\colors.xml">
+            <RemoteDir>CrashDemoFMX\res\values\</RemoteDir>
+            <RemoteName>colors.xml</RemoteName>
+        </DeployFile>
+        <DeployFile Include="Android64\$(Config)\colors-night-v21.xml">
+            <RemoteDir>CrashDemoFMX\res\values-night-v21\</RemoteDir>
+            <RemoteName>colors.xml</RemoteName>
+        </DeployFile>
+        <DeployFile Include="Android64\$(Config)\strings.xml">
+            <RemoteDir>CrashDemoFMX\res\values\</RemoteDir>
+            <RemoteName>strings.xml</RemoteName>
+        </DeployFile>
+        <DeployFile Include="Android64\$(Config)\splash_image_def.xml">
+            <RemoteDir>CrashDemoFMX\res\drawable\</RemoteDir>
+            <RemoteName>splash_image_def.xml</RemoteName>
+        </DeployFile>
+        <DeployFile Include="$(BDS)\bin\Artwork\Android\FM_LauncherIcon_36x36.png">
+            <RemoteDir>CrashDemoFMX\res\drawable-ldpi\</RemoteDir>
+            <RemoteName>ic_launcher.png</RemoteName>
+        </DeployFile>
+        <DeployFile Include="$(BDS)\bin\Artwork\Android\FM_LauncherIcon_48x48.png">
+            <RemoteDir>CrashDemoFMX\res\drawable-mdpi\</RemoteDir>
+            <RemoteName>ic_launcher.png</RemoteName>
+        </DeployFile>
+        <DeployFile Include="$(BDS)\bin\Artwork\Android\FM_LauncherIcon_72x72.png">
+            <RemoteDir>CrashDemoFMX\res\drawable-hdpi\</RemoteDir>
+            <RemoteName>ic_launcher.png</RemoteName>
+        </DeployFile>
+        <DeployFile Include="$(BDS)\bin\Artwork\Android\FM_LauncherIcon_96x96.png">
+            <RemoteDir>CrashDemoFMX\res\drawable-xhdpi\</RemoteDir>
+            <RemoteName>ic_launcher.png</RemoteName>
+        </DeployFile>
+        <DeployFile Include="$(BDS)\bin\Artwork\Android\FM_LauncherIcon_144x144.png">
+            <RemoteDir>CrashDemoFMX\res\drawable-xxhdpi\</RemoteDir>
+            <RemoteName>ic_launcher.png</RemoteName>
+        </DeployFile>
+        <DeployFile Include="$(BDS)\bin\Artwork\Android\FM_LauncherIcon_192x192.png">
+            <RemoteDir>CrashDemoFMX\res\drawable-xxxhdpi\</RemoteDir>
+            <RemoteName>ic_launcher.png</RemoteName>
+        </DeployFile>
+        <DeployFile Include="$(BDS)\bin\Artwork\Android\FM_SplashImage_426x320.png">
+            <RemoteDir>CrashDemoFMX\res\drawable-small\</RemoteDir>
+            <RemoteName>splash_image.png</RemoteName>
+        </DeployFile>
+        <DeployFile Include="$(BDS)\bin\Artwork\Android\FM_SplashImage_470x320.png">
+            <RemoteDir>CrashDemoFMX\res\drawable-normal\</RemoteDir>
+            <RemoteName>splash_image.png</RemoteName>
+        </DeployFile>
+        <DeployFile Include="$(BDS)\bin\Artwork\Android\FM_SplashImage_640x480.png">
+            <RemoteDir>CrashDemoFMX\res\drawable-large\</RemoteDir>
+            <RemoteName>splash_image.png</RemoteName>
+        </DeployFile>
+        <DeployFile Include="$(BDS)\bin\Artwork\Android\FM_SplashImage_960x720.png">
+            <RemoteDir>CrashDemoFMX\res\drawable-xlarge\</RemoteDir>
+            <RemoteName>splash_image.png</RemoteName>
+        </DeployFile>
+    </ItemGroup>
+</Project>
