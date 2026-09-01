@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Generic Android64 crash-symbolication side-file pipeline for Delphi FMX apps.
+
+  Generates <so>.gosym (function names + source files) and <so>.gol (line
+  numbers) from the unstripped DCC_ExeOutput .so before RAD calculates the
+  deployment list. Both files are packaged as assets/internal/ and are read
+  directly from the APK by Crash.Android.Symbols.
+
+  The post-Deploy gate verifies that the packaged .so and both side-files carry
+  the same ELF build-id. Projects importing this target must keep DWARF
+  (DCC_DebugInformation=2) and link with the build-id=sha1 option.
+-->
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Condition="'$(Platform)'=='Android64'">
+    <DeployFile Include="$(DCC_ExeOutput)\lib$(MSBuildProjectName).so.gosym">
+      <RemoteDir>$(MSBuildProjectName)\assets\internal\</RemoteDir>
+      <RemoteName>lib$(MSBuildProjectName).so.gosym</RemoteName>
+      <DeployClass>File</DeployClass>
+      <Operation>0</Operation>
+      <Overwrite>True</Overwrite>
+    </DeployFile>
+    <DeployFile Include="$(DCC_ExeOutput)\lib$(MSBuildProjectName).so.gol">
+      <RemoteDir>$(MSBuildProjectName)\assets\internal\</RemoteDir>
+      <RemoteName>lib$(MSBuildProjectName).so.gol</RemoteName>
+      <DeployClass>File</DeployClass>
+      <Operation>0</Operation>
+      <Overwrite>True</Overwrite>
+    </DeployFile>
+  </ItemGroup>
+
+  <Target Name="CrashAndroidGenerateSidefiles"
+          BeforeTargets="_CalculateDeployment"
+          Condition="'$(Platform)'=='Android64'">
+    <PropertyGroup>
+      <_CrashAndroidSo>$(DCC_ExeOutput)\lib$(MSBuildProjectName).so</_CrashAndroidSo>
+    </PropertyGroup>
+    <Message Importance="High" Text="[Crash] Android side-files for $(MSBuildProjectFile), so=$(_CrashAndroidSo)" />
+    <Exec Command='"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "$(MSBuildThisFileDirectory)gen-android-crash-sidefiles.ps1" "$(_CrashAndroidSo)"' />
+  </Target>
+
+  <Target Name="CrashAndroidVerifySidefiles"
+          AfterTargets="Deploy"
+          Condition="'$(Platform)'=='Android64'">
+    <PropertyGroup>
+      <_CrashAndroidApk>$(DCC_ExeOutput)\$(MSBuildProjectName)\bin\$(MSBuildProjectName).apk</_CrashAndroidApk>
+    </PropertyGroup>
+    <Exec Command='"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "$(MSBuildThisFileDirectory)verify-android-crash-symbols.ps1" "$(_CrashAndroidApk)"' />
+  </Target>
+</Project>

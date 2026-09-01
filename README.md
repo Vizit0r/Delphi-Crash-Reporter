@@ -376,13 +376,14 @@ Both files are produced together and shipped together:
    (a no-DWARF frame, or an old report whose side-files were lost) can still be symbolized
    offline against it.
 
-This repository provides `tools/Crash.AndroidSymbols.targets` for Delphi FMX
-projects. Import it after the generated `.deployproj`: it invokes the existing
-`gen-android-crash-sidefiles.ps1` before `_CalculateDeployment`, adds both files
-to `assets/internal`, and runs `verify-android-crash-symbols.ps1` after `Deploy`
-to reject a proven build-id mismatch. `Demo/Mobile/CrashDemoFMX.dproj` is the
-small reference integration; the host application's Android build uses the same
-target through its host-specific wrapper.
+This repository provides `Tools/Crash.AndroidSymbols.targets` for Delphi FMX
+projects. Import it after the generated `.deployproj`: it invokes
+`Tools/gen-android-crash-sidefiles.ps1` before `_CalculateDeployment`, adds both
+files to `assets/internal`, and runs `Tools/verify-android-crash-symbols.ps1`
+after `Deploy` to reject a proven build-id mismatch. `LNG_ELF.exe` is built
+automatically on first use. `Demo/Mobile/CrashDemoFMX.dproj` is the small
+reference integration; a host application can consume the same target through
+its own wrapper `.targets`.
 
 ## Wiring into your build
 
