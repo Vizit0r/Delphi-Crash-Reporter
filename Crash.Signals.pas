@@ -25,9 +25,15 @@ unit Crash.Signals;
        that propagates up to the call-stack walker and then to the reporter,
        which builds the .el and pulls in the snapshot.
 
+    Android stack-overflow exception: after a guard-page fault has committed its
+    raw fallback, the handler calls _exit instead of returning to the exhausted
+    stack. Bionic/Delphi RTL otherwise loops while trying to allocate the
+    exception object on that same stack.
+
   Async-signal-safety:
-    Inside the handler - only Move (memcpy is signal-safe), an atomic flag
-    write, and sigaction. No allocations, no formatting, no logging.
+    Inside the handler - only Move (memcpy is signal-safe), atomic operations,
+    raw write/fsync, sigaction and Android _exit after a captured stack overflow.
+    No allocations, no formatting, no logging.
 
   Scope:
     - Linux x86-64.
@@ -158,7 +164,8 @@ uses
   System.SyncObjs,
   Posix.Signal,
   Posix.Pthread,
-  Posix.String_;
+  Posix.String_,
+  Posix.Unistd;
 
 const
   STACK_DUMP_BYTES = CRASH_RAW_STACK_BYTES;
@@ -440,6 +447,7 @@ var
   Restored: sigaction_t;
   ClaimEpoch: Integer;
   SP: UInt64;
+  IsStackOverflow: Boolean;
 begin
   TInterlocked.Increment(GSignalSnapshot.InvocationCount);
   // Read the capture-cycle epoch on ENTRY, before any claim attempt: read
@@ -463,13 +471,24 @@ begin
     end;
     CaptureFromUContext(Context);
     SP := GetStackPointer;
-    if not CrashLooksLikeStackOverflow(SP, GSignalSnapshot.FaultAddr) then
+    IsStackOverflow := CrashLooksLikeStackOverflow(SP,
+      GSignalSnapshot.FaultAddr);
+    if not IsStackOverflow then
       CopyStackTop(SP);
     // Publish AFTER the fields are complete - a reader keying on Captured=1
     // must never see a half-filled snapshot.
     TInterlocked.Exchange(GSignalSnapshot.Captured, 1);
     CrashRawBeginSlot(CRASH_RAW_SLOT_PRIMARY);
     CrashRawCommitPrimary(GSignalSnapshot);
+    {$IF Defined(ANDROID)}
+    { Bionic's signal chain hands a guard-page fault to the Delphi RTL after we
+      return. The RTL then tries to allocate an exception on the exhausted
+      stack, faults again and can loop forever at full CPU. The durable raw
+      fallback is already published; terminate without finalization instead of
+      returning to an unusable stack. _exit is async-signal-safe. }
+    if IsStackOverflow then
+      Posix.Unistd._exit(128 + SigNum);
+    {$ENDIF}
   end
   else if TInterlocked.CompareExchange(GConcurrentSignal.Claimed, 1, 0) = 0 then
   begin

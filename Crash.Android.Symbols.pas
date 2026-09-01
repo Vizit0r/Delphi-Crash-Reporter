@@ -25,6 +25,9 @@
 
 interface
 
+type
+  TCrashAndroidBuildID = array[0..15] of Byte;
+
 { Load the .gosym for the running module and verify it matches (build-id). Safe to
   call once at startup; idempotent. Failure (missing/mismatched file) just leaves
   symbols unavailable - the reporter falls back to module+offset, as before. }
@@ -32,6 +35,13 @@ procedure CrashInitAndroidSymbols;
 
 { True once a matching .gosym is loaded. }
 function CrashAndroidSymbolsActive: Boolean;
+
+{ Exact GNU build-id of the running Android .so. The non-Android stub returns
+  False. Calling this also performs the normal one-time symbol initialization. }
+function CrashAndroidGetBuildID(out ABuildID: TCrashAndroidBuildID): Boolean;
+{ Load base returned by dladdr for the same .so whose build-id/side-files were
+  accepted. 0 on non-Android or failed initialization. }
+function CrashAndroidModuleBase: UIntPtr;
 
 { Resolve a code address (absolute runtime) within OUR module to a demangled
   Pascal name. AModuleBase is the module's load base (dladdr dli_fbase).
@@ -84,6 +94,9 @@ type
 
 var
   GLoaded: Boolean = False;
+  GModuleBase: UIntPtr = 0;      // load base of the .so matched by both side-files
+  GImageID: TCrashAndroidBuildID;
+  GImageIDValid: Boolean = False;
   GData: TBytes = nil;          // the whole .gosym, kept in memory
   GCount: UInt32 = 0;
   GEntriesOff: UInt32 = 0;      // = HEADER_SIZE
@@ -180,13 +193,19 @@ end;
 
 { ---- locate our own module (path + base) via dladdr on this unit's code ---- }
 
-function OurModulePath(out APath: String): Boolean;
+function OurModulePath(out APath: String; out ABase: UIntPtr): Boolean;
 var
   Info: dl_info;
 begin
+  APath := '';
+  ABase := 0;
   Result := dladdr(UIntPtr(@ReadElfBuildId), Info) <> 0;
   if Result then
+  begin
     APath := String(Info.dli_fname);
+    ABase := UIntPtr(Info.dli_fbase);
+    Result := (APath <> '') and (ABase <> 0);
+  end;
 end;
 
 { ---- side-file bytes: the APK asset is the source of truth ---- }
@@ -340,7 +359,10 @@ var
   Lo, Hi, Mid, Found: Integer;
 begin
   Result := 0;
-  if (GGolRelAddrs = nil) or (ACodeAddr < AModuleBase) then Exit;
+  // The side-file describes this unit's .so only. A small offset in vDSO or a
+  // system library can otherwise accidentally hit a valid row in our .gol.
+  if (GGolRelAddrs = nil) or (GModuleBase = 0) or
+     (AModuleBase <> GModuleBase) or (ACodeAddr < AModuleBase) then Exit;
   VAddr := UInt64(ACodeAddr) - UInt64(AModuleBase);
   if VAddr < GGolStartVA then Exit;
   Rel := VAddr - GGolStartVA;
@@ -373,10 +395,12 @@ begin
     Exit;
   GLoaded := True; // attempt once regardless of outcome
 
-  if not OurModulePath(SoPath) then
+  if not OurModulePath(SoPath, GModuleBase) then
     Exit;
   if not ReadElfBuildId(SoPath, ImgId) then
     Exit; // no build-id in the running .so -> can't trust a side-file match
+  Move(ImgId, GImageID, SizeOf(GImageID));
+  GImageIDValid := True;
 
   // Both side-files are deployed into the APK as assets\internal\<so-base>.<ext>;
   // an asset name is the path relative to assets\.
@@ -432,6 +456,21 @@ begin
   Result := (GData <> nil) and (GCount > 0);
 end;
 
+function CrashAndroidGetBuildID(out ABuildID: TCrashAndroidBuildID): Boolean;
+begin
+  FillChar(ABuildID, SizeOf(ABuildID), 0);
+  CrashInitAndroidSymbols;
+  Result := GImageIDValid;
+  if Result then
+    ABuildID := GImageID;
+end;
+
+function CrashAndroidModuleBase: UIntPtr;
+begin
+  CrashInitAndroidSymbols;
+  Result := GModuleBase;
+end;
+
 function EntryAddr(const AIndex: UInt32): UInt64; inline;
 begin
   // Move, not PUInt64^: with ENTRY_SIZE=20 every odd entry sits at 4-byte
@@ -479,7 +518,10 @@ begin
   ASourceFile := '';
   if not CrashAndroidSymbolsActive then
     Exit;
-  if ACodeAddr < AModuleBase then
+  // .gosym is equally module-specific: never resolve a foreign module by
+  // treating its unrelated module-relative offset as one of our functions.
+  if (GModuleBase = 0) or (AModuleBase <> GModuleBase) or
+     (ACodeAddr < AModuleBase) then
     Exit;
   Target := UInt64(ACodeAddr) - UInt64(AModuleBase); // module-relative VM address
 
@@ -547,6 +589,17 @@ end;
 function CrashAndroidSymbolsActive: Boolean;
 begin
   Result := False;
+end;
+
+function CrashAndroidGetBuildID(out ABuildID: TCrashAndroidBuildID): Boolean;
+begin
+  FillChar(ABuildID, SizeOf(ABuildID), 0);
+  Result := False;
+end;
+
+function CrashAndroidModuleBase: UIntPtr;
+begin
+  Result := 0;
 end;
 
 function CrashAndroidLookupName(const ACodeAddr, AModuleBase: UIntPtr;

@@ -337,6 +337,12 @@ begin
   ReportException(E, ExceptAddr, csOnException);
 end;
 
+{$IF Defined(MACOS) or Defined(ANDROID) or Defined(LINUX)}
+procedure CrashModuleAnchor;
+begin
+end;
+{$ENDIF}
+
 constructor TCrashCapture.InternalCreate(const ADummy: Integer);
 {$IF Defined(MACOS) or Defined(ANDROID) or Defined(LINUX)}
 var
@@ -369,11 +375,10 @@ begin
   Exception.CleanUpStackInfoProc := GlobalCleanUpStackInfo;
 
   {$IF Defined(MACOS) or Defined(ANDROID) or Defined(LINUX)}
-  { Get address of current module. We use this to see if an entry in the call
-    stack is part of this module.
-    We use the dladdr API as a "trick" to get the address of this method, which
-    is obviously part of this module. }
-  if (dladdr(UIntPtr(@TCrashCapture.InternalCreate), Info) <> 0) then
+  { A Delphi class-method address is not a reliable native code address on all
+    targets (Android may expose a JIT/thunk address). Anchor dladdr on a plain
+    unit procedure that is unambiguously emitted in this module. }
+  if (dladdr(UIntPtr(@CrashModuleAnchor), Info) <> 0) then
     FModuleAddress := UIntPtr(Info.dli_fbase);
   {$ENDIF}
 end;

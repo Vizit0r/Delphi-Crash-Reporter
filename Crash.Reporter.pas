@@ -398,6 +398,7 @@ uses
   System.Net.Mime,
   System.Net.URLClient,
   Crash.ELFormat,
+  Crash.Modules,
   Crash.MacOS.Symbols,
   Crash.MacOS.MachExc,
   Crash.Android.Symbols,
@@ -419,6 +420,31 @@ uses
   Posix.Errno,
   {$ENDIF}
   System.SysUtils;
+
+function CrashModuleSizeForBase(const ABase: UInt64;
+  out ASize: UInt64): Boolean;
+var
+  Modules: TModuleInfoArray;
+  M: TModuleInfo;
+begin
+  Result := False;
+  ASize := 0;
+  if ABase = 0 then
+    Exit(False);
+  Modules := CrashEnumerateModules;
+  for M in Modules do
+    if M.BaseAddr = ABase then
+    begin
+      ASize := M.Size;
+      Exit(ASize <> 0);
+    end;
+end;
+
+function CrashCurrentMainImage(out ABase, ASize: UInt64): Boolean;
+begin
+  ABase := UInt64(TCrashCapture.MainModuleAddress);
+  Result := CrashModuleSizeForBase(ABase, ASize);
+end;
 
 type
   TCrashUploadWorkerProc = reference to function(const AUrl, AFieldName,
@@ -1334,6 +1360,11 @@ begin
 end;
 
 procedure TCrashReporterImpl.Install(const AConfig: TCrashConfig);
+var
+  ImageBase, ImageSize: UInt64;
+  AndroidModuleBase: UInt64;
+  AndroidImageID: TCrashAndroidBuildID;
+  RawImageID: TCrashRawImageID;
 begin
   // A live runtime is strictly idempotent: a repeated Init never mutates only
   // half of the configuration. Reconfigure is Shutdown + a fresh Init.
@@ -1357,6 +1388,22 @@ begin
   if FConfig.FreezeDetection then
     InstallFreezeDetector;
 
+  { Recovery must see the symbol tables before it tries to symbolize a V2 raw
+    address. On Android this also gives us the exact ELF build-id used to gate
+    ASLR rebasing; elsewhere the call is a no-op. }
+  FillChar(RawImageID, SizeOf(RawImageID), 0);
+  if CrashAndroidGetBuildID(AndroidImageID) then
+    Move(AndroidImageID, RawImageID, SizeOf(RawImageID));
+  AndroidModuleBase := UInt64(CrashAndroidModuleBase);
+  if AndroidModuleBase <> 0 then
+  begin
+    ImageBase := AndroidModuleBase;
+    if not CrashModuleSizeForBase(ImageBase, ImageSize) then
+      ImageSize := 0;
+  end
+  else if not CrashCurrentMainImage(ImageBase, ImageSize) then
+    ImageSize := 0;
+
   // Convert committed slots from previous processes before opening this
   // process's own preallocated files. Recovered .el files then flow through the
   // ordinary surface/upload scan below.
@@ -1367,6 +1414,7 @@ begin
   // delivery are both disabled.
   CrashRawPrepare(EffectiveReportDir, EffectiveScanPrefix, FConfig.AppName,
     FConfig.AppVersion, FConfig.CompilationTime, GetExeBaseName,
+    ImageBase, ImageSize, RawImageID,
     FConfig.SaveToFile or FConfig.UploadEnabled);
 
   // Boot-recovery: pick up crash files from previous runs. Done after wiring the
@@ -1810,7 +1858,13 @@ var
   Ctx: TCrashELContext;
   Text, Path: String;
   IP, FaultAddr, ThreadID: UInt64;
+  CurrentImageBase, CurrentImageSize: UInt64;
+  AndroidModuleBase: UInt64;
+  RebasedIP, ModuleOffset, RoutineOffset, CapturedImageEnd: UInt64;
   SignalNum, SignalCode: Integer;
+  Rebased: Boolean;
+  AndroidImageID: TCrashAndroidBuildID;
+  CurrentImageID: TCrashRawImageID;
   Address: array[0..0] of UIntPtr;
 begin
   Result := False;
@@ -1840,9 +1894,49 @@ begin
     'Committed raw fallback recovered signal %d (code=%d, fault=%s)',
     [SignalNum, SignalCode, IntToHex(FaultAddr, SizeOf(Pointer) * 2)]);
   Report.Source := csFatalProc;
-  Address[0] := UIntPtr(IP);
+  AndroidModuleBase := UInt64(CrashAndroidModuleBase);
+  if AndroidModuleBase <> 0 then
+  begin
+    CurrentImageBase := AndroidModuleBase;
+    if not CrashModuleSizeForBase(CurrentImageBase, CurrentImageSize) then
+      CurrentImageSize := 0;
+  end
+  else if not CrashCurrentMainImage(CurrentImageBase, CurrentImageSize) then
+    CurrentImageSize := 0;
+  FillChar(CurrentImageID, SizeOf(CurrentImageID), 0);
+  if CrashAndroidGetBuildID(AndroidImageID) then
+    Move(AndroidImageID, CurrentImageID, SizeOf(CurrentImageID));
+  Rebased := CrashRawTryRebaseAddress(ARaw, IP, CurrentImageBase,
+    CurrentImageSize, CurrentImageID, FConfig.CompilationTime,
+    RebasedIP, ModuleOffset);
+  if Rebased then
+    Address[0] := UIntPtr(RebasedIP)
+  else
+    Address[0] := UIntPtr(IP);
   if IP <> 0 then
     Report.CallStack := TCrashCapture.SymbolizeAddressList(Address);
+  if Rebased and (Length(Report.CallStack) > 0) and
+     (UInt64(Report.CallStack[0].ModuleAddress) = CurrentImageBase) then
+  begin
+    { Resolution ran in this process, but the report must retain addresses from
+      the crashed process. Keep names/source/line and translate the resolved
+      module/routine addresses back to the captured ASLR range. }
+    Report.CallStack[0].CodeAddress := UIntPtr(IP);
+    Report.CallStack[0].ModuleAddress := UIntPtr(ARaw.ImageBase);
+    if UInt64(Report.CallStack[0].RoutineAddress) >= CurrentImageBase then
+    begin
+      RoutineOffset := UInt64(Report.CallStack[0].RoutineAddress) -
+        CurrentImageBase;
+      if (RoutineOffset < ARaw.ImageSize) and
+         (ARaw.ImageBase <= High(UInt64) - RoutineOffset) then
+        Report.CallStack[0].RoutineAddress :=
+          UIntPtr(ARaw.ImageBase + RoutineOffset)
+      else
+        Report.CallStack[0].RoutineAddress := 0;
+    end
+    else
+      Report.CallStack[0].RoutineAddress := 0;
+  end;
   if Length(Report.CallStack) > 0 then
     Report.ExceptionLocation := Report.CallStack[0]
   else
@@ -1872,6 +1966,24 @@ begin
   Ctx.ThreadName := 'RAW';
   Ctx.DisabledSections := FConfig.DisabledSections;
   CrashFormatRecoveredRaw(ARaw, Ctx.CpuSnapshot, Ctx.SignalInfoSection);
+  Ctx.SignalInfoSection := Ctx.SignalInfoSection + #13#10 +
+    '  Raw Format : v' + IntToStr(ARaw.FormatVersion);
+  if ARaw.FormatVersion >= CRASH_RAW_VERSION then
+  begin
+    if ARaw.ImageBase <= High(UInt64) - ARaw.ImageSize then
+      CapturedImageEnd := ARaw.ImageBase + ARaw.ImageSize
+    else
+      CapturedImageEnd := High(UInt64);
+    Ctx.SignalInfoSection := Ctx.SignalInfoSection + #13#10 +
+      '  Image Range: ' + IntToHex(ARaw.ImageBase, SizeOf(Pointer) * 2) +
+      '..' + IntToHex(CapturedImageEnd, SizeOf(Pointer) * 2);
+  end;
+  if Rebased then
+    Ctx.SignalInfoSection := Ctx.SignalInfoSection + #13#10 +
+      '  Rebased    : module offset ' +
+      IntToHex(ModuleOffset, SizeOf(Pointer) * 2) + ', current base ' +
+      IntToHex(CurrentImageBase, SizeOf(Pointer) * 2) + ', current size ' +
+      IntToHex(CurrentImageSize, SizeOf(Pointer) * 2);
   CrashCollectELModules(Ctx);
   Text := CrashBuildELReportText(Report, Ctx);
 

@@ -12,8 +12,12 @@ uses
   System.SysUtils;
 
 const
-  CRASH_RAW_VERSION = 1;
-  CRASH_RAW_PAYLOAD_BYTES = 1024;
+  CRASH_RAW_VERSION_V1 = 1;
+  CRASH_RAW_VERSION = 2;
+  CRASH_RAW_V1_PAYLOAD_BYTES = 1024;
+  { V2 appends the crashed image range and a 16-byte image identity while
+    keeping the whole disk block byte-for-byte the same size as V1. }
+  CRASH_RAW_PAYLOAD_BYTES = CRASH_RAW_V1_PAYLOAD_BYTES - 32;
   CRASH_RAW_STACK_BYTES = 256;
   CRASH_RAW_SLOT_PRIMARY = 0;
   CRASH_RAW_SLOT_CONCURRENT = 1;
@@ -23,6 +27,8 @@ const
   CRASH_RAW_STALE_DAYS = 7;
 
 type
+  TCrashRawImageID = array[0..15] of Byte;
+
   TCrashRawSnapshotKind = (
     skNone,
     skLinuxX64,
@@ -31,7 +37,7 @@ type
     skLinuxArm64
   );
 
-  { This is both the live preallocated signal slot and the v1 raw payload.
+  { This is both the live preallocated signal slot and the raw payload.
     Keep packed and version the outer block before changing its layout. }
   TCrashRawPrimarySnapshot = packed record
     Claimed: Integer;
@@ -97,6 +103,40 @@ type
   TCrashRawDiskBlockV1 = packed record
     Stage: Byte;
     Header: TCrashRawHeaderV1;
+    Payload: array[0..CRASH_RAW_V1_PAYLOAD_BYTES - 1] of Byte;
+    Commit: Byte;
+  end;
+
+  { V2 carries the crashed process's main-image range. The common prefix is
+    intentionally identical to TCrashRawHeaderV1 so old slots remain readable. }
+  TCrashRawHeaderV2 = packed record
+    Magic: array[0..7] of AnsiChar;
+    Version: UInt16;
+    HeaderSize: UInt16;
+    BlockSize: UInt32;
+    PayloadSize: UInt32;
+    PayloadKind: Byte;
+    SlotIndex: Byte;
+    Platform: Byte;
+    Architecture: Byte;
+    ProcessID: UInt64;
+    InitTick: UInt64;
+    InitUnixSeconds: Int64;
+    Generation: UInt32;
+    Reserved: UInt32;
+    CaptureKey: array[0..47] of AnsiChar;
+    AppName: array[0..63] of AnsiChar;
+    AppVersion: array[0..47] of AnsiChar;
+    CompilationTime: array[0..47] of AnsiChar;
+    ExeName: array[0..63] of AnsiChar;
+    ImageBase: UInt64;
+    ImageSize: UInt64;
+    ImageID: TCrashRawImageID;
+  end;
+
+  TCrashRawDiskBlockV2 = packed record
+    Stage: Byte;
+    Header: TCrashRawHeaderV2;
     Payload: array[0..CRASH_RAW_PAYLOAD_BYTES - 1] of Byte;
     Commit: Byte;
   end;
@@ -112,6 +152,10 @@ type
     InitTick: UInt64;
     InitUnixSeconds: Int64;
     Generation: UInt32;
+    FormatVersion: UInt16;
+    ImageBase: UInt64;
+    ImageSize: UInt64;
+    ImageID: TCrashRawImageID;
     PayloadKind: TCrashRawPayloadKind;
     Primary: TCrashRawPrimarySnapshot;
     Concurrent: TCrashRawConcurrentSnapshot;
@@ -122,6 +166,8 @@ function CrashRawSupported: Boolean;
 { Calm-path lifecycle. AEnabled should be SaveToFile or UploadEnabled. }
 function CrashRawPrepare(const AReportDir, AScanPrefix, AAppName,
   AAppVersion, ACompilationTime, AExeName: String;
+  const AImageBase, AImageSize: UInt64;
+  const AImageID: TCrashRawImageID;
   const AEnabled: Boolean): Boolean;
 procedure CrashRawRotate(const ADeleteCurrentFiles: Boolean);
 procedure CrashRawShutdown(const ADeleteCurrentFiles: Boolean);
@@ -160,6 +206,15 @@ procedure CrashRawDeleteUntouchedSibling(const ARaw: TCrashRawRecord);
 function CrashRawPrimaryIP(const APrimary: TCrashRawPrimarySnapshot): UInt64;
 function CrashRawPrimarySP(const APrimary: TCrashRawPrimarySnapshot): UInt64;
 function CrashRawPrimaryFP(const APrimary: TCrashRawPrimarySnapshot): UInt64;
+{ Translates an address captured in a V2 main image to the same offset in the
+  current image. A stored binary image ID is the preferred build-identity gate;
+  exact non-empty CompilationTime equality is the fallback on platforms without
+  such an ID. A wrong symbol is worse than an unresolved one. }
+function CrashRawTryRebaseAddress(const ARaw: TCrashRawRecord;
+  const AAddress, ACurrentImageBase, ACurrentImageSize: UInt64;
+  const ACurrentImageID: TCrashRawImageID;
+  const ACurrentCompilationTime: String;
+  out ARebasedAddress, AModuleOffset: UInt64): Boolean;
 
 {$IFDEF AUTOTESTS}
 type
@@ -168,6 +223,9 @@ type
 
 function CrashRawAutoTestWriteBlock(const AFilePath, ACaptureKey: String;
   const APayloadKind: TCrashRawPayloadKind;
+  const ACommitted: Boolean): Boolean;
+function CrashRawAutoTestWriteLegacyV1Block(const AFilePath,
+  ACaptureKey: String; const APayloadKind: TCrashRawPayloadKind;
   const ACommitted: Boolean): Boolean;
 { Slot as CrashRawPrepare leaves it: valid header, zero stage/commit.
   AProcessID = 0 stamps the current process. }
@@ -213,7 +271,7 @@ const
 
 var
   GRawFD: array[0..CRASH_RAW_SLOT_COUNT - 1] of Integer;
-  GRawBlocks: array[0..CRASH_RAW_SLOT_COUNT - 1] of TCrashRawDiskBlockV1;
+  GRawBlocks: array[0..CRASH_RAW_SLOT_COUNT - 1] of TCrashRawDiskBlockV2;
   GRawEntered: array[0..CRASH_RAW_SLOT_COUNT - 1] of Integer;
   GRawCommitted: array[0..CRASH_RAW_SLOT_COUNT - 1] of Integer;
   GRawPaths: array[0..CRASH_RAW_SLOT_COUNT - 1] of String;
@@ -224,6 +282,9 @@ var
   GRawAppVersion: String;
   GRawCompilationTime: String;
   GRawExeName: String;
+  GRawImageBase: UInt64;
+  GRawImageSize: UInt64;
+  GRawImageID: TCrashRawImageID;
   GRawEnabled: Boolean;
   GRawInitTick: UInt64;
   GRawInitUnixSeconds: Int64;
@@ -304,7 +365,7 @@ function CrashRawBuildKey(const AGeneration: UInt32;
   const ASlot: Integer): String;
 begin
   {$IF not Defined(MSWINDOWS)}
-  Result := 'R1-' + IntToHex(UInt64(getpid), 8) + '-' +
+  Result := 'R2-' + IntToHex(UInt64(getpid), 8) + '-' +
     IntToHex(GRawInitTick, 16) + '-' + IntToHex(AGeneration, 8) + '-' +
     IntToStr(ASlot);
   {$ELSE}
@@ -331,8 +392,8 @@ begin
     PayloadSize := SizeOf(TCrashRawConcurrentSnapshot);
   end;
   GRawBlocks[ASlot].Header.Version := CRASH_RAW_VERSION;
-  GRawBlocks[ASlot].Header.HeaderSize := SizeOf(TCrashRawHeaderV1);
-  GRawBlocks[ASlot].Header.BlockSize := SizeOf(TCrashRawDiskBlockV1);
+  GRawBlocks[ASlot].Header.HeaderSize := SizeOf(TCrashRawHeaderV2);
+  GRawBlocks[ASlot].Header.BlockSize := SizeOf(TCrashRawDiskBlockV2);
   GRawBlocks[ASlot].Header.PayloadSize := PayloadSize;
   GRawBlocks[ASlot].Header.PayloadKind := PayloadKind;
   GRawBlocks[ASlot].Header.SlotIndex := ASlot;
@@ -355,6 +416,9 @@ begin
     SizeOf(GRawBlocks[ASlot].Header.CompilationTime));
   CopyFixedUtf8(GRawExeName, @GRawBlocks[ASlot].Header.ExeName[0],
     SizeOf(GRawBlocks[ASlot].Header.ExeName));
+  GRawBlocks[ASlot].Header.ImageBase := GRawImageBase;
+  GRawBlocks[ASlot].Header.ImageSize := GRawImageSize;
+  GRawBlocks[ASlot].Header.ImageID := GRawImageID;
 end;
 
 {$IF not Defined(MSWINDOWS)}
@@ -375,7 +439,7 @@ begin
   Attempt := 0;
   repeat
     Inc(Attempt);
-    if ftruncate(Result, SizeOf(TCrashRawDiskBlockV1)) = 0 then
+    if ftruncate(Result, SizeOf(TCrashRawDiskBlockV2)) = 0 then
       Exit;
   until (errno <> EINTR) or (Attempt >= 4);
   __close(Result);
@@ -516,6 +580,8 @@ end;
 
 function CrashRawPrepare(const AReportDir, AScanPrefix, AAppName,
   AAppVersion, ACompilationTime, AExeName: String;
+  const AImageBase, AImageSize: UInt64;
+  const AImageID: TCrashRawImageID;
   const AEnabled: Boolean): Boolean;
 begin
   CrashRawShutdown(True);
@@ -526,6 +592,9 @@ begin
   GRawAppVersion := AAppVersion;
   GRawCompilationTime := ACompilationTime;
   GRawExeName := AExeName;
+  GRawImageBase := AImageBase;
+  GRawImageSize := AImageSize;
+  GRawImageID := AImageID;
   GRawInitTick := TThread.GetTickCount64;
   GRawInitUnixSeconds := DateTimeToUnix(Now, False);
   GRawGeneration := 0;
@@ -580,7 +649,7 @@ begin
     Exit;
   Move(APayload^, GRawBlocks[ASlot].Payload[0], APayloadSize);
   if not CrashRawWriteAll(GRawFD[ASlot], @GRawBlocks[ASlot].Header,
-       SizeOf(TCrashRawDiskBlockV1) - 2) then
+       SizeOf(TCrashRawDiskBlockV2) - 2) then
     Exit;
   if not CrashRawFsync(GRawFD[ASlot]) then
     Exit;
@@ -668,7 +737,7 @@ begin
   try
     Stream := TFileStream.Create(AFilePath, fmOpenRead or fmShareDenyNone);
     try
-      if Stream.Size <> SizeOf(TCrashRawDiskBlockV1) then
+      if Stream.Size <> SizeOf(TCrashRawDiskBlockV2) then
         Exit;
       Stream.ReadBuffer(AStage, 1);
       Stream.Position := Stream.Size - 1;
@@ -684,7 +753,10 @@ end;
 function CrashRawReadBlock(const AFilePath: String;
   out ARecord: TCrashRawRecord): Boolean;
 var
-  Block: TCrashRawDiskBlockV1;
+  Block: TCrashRawDiskBlockV2;
+  Header: TCrashRawHeaderV1;
+  Payload: PByte;
+  PayloadCapacity: Integer;
   Stream: TFileStream;
   Key: String;
 begin
@@ -703,41 +775,63 @@ begin
   except
     Exit;
   end;
+  { V1 and V2 have the same total size and the same common header prefix.
+    Payload starts 32 bytes later in V2 because those bytes moved into the
+    appended image-range and image-identity fields. }
+  Move(Block.Header, Header, SizeOf(Header));
   if (Block.Stage <> CRASH_RAW_STAGE_ENTERED) or
      (Block.Commit <> CRASH_RAW_COMMIT) or
-     (not CompareMem(@Block.Header.Magic[0], @CRASH_RAW_MAGIC[0],
+     (not CompareMem(@Header.Magic[0], @CRASH_RAW_MAGIC[0],
        SizeOf(CRASH_RAW_MAGIC))) or
-     (Block.Header.Version <> CRASH_RAW_VERSION) or
-     (Block.Header.HeaderSize <> SizeOf(TCrashRawHeaderV1)) or
-     (Block.Header.BlockSize <> SizeOf(TCrashRawDiskBlockV1)) or
-     (Block.Header.Platform <> CrashRawPlatform) or
-     (Block.Header.Architecture <> CrashRawArchitecture) or
-     (Block.Header.SlotIndex >= CRASH_RAW_SLOT_COUNT) or
-     (Integer(Block.Header.PayloadKind) < Ord(rpkPrimary)) or
-     (Integer(Block.Header.PayloadKind) > Ord(rpkConcurrent)) then
+     (Header.Platform <> CrashRawPlatform) or
+     (Header.Architecture <> CrashRawArchitecture) or
+     (Header.SlotIndex >= CRASH_RAW_SLOT_COUNT) or
+     (Integer(Header.PayloadKind) < Ord(rpkPrimary)) or
+     (Integer(Header.PayloadKind) > Ord(rpkConcurrent)) then
     Exit;
-  Key := FixedUtf8ToString(Block.Header.CaptureKey,
-    SizeOf(Block.Header.CaptureKey));
+  case Header.Version of
+    CRASH_RAW_VERSION_V1:
+      begin
+        if (Header.HeaderSize <> SizeOf(TCrashRawHeaderV1)) or
+           (Header.BlockSize <> SizeOf(TCrashRawDiskBlockV1)) then
+          Exit;
+        Payload := PByte(@Block) + 1 + SizeOf(TCrashRawHeaderV1);
+        PayloadCapacity := CRASH_RAW_V1_PAYLOAD_BYTES;
+      end;
+    CRASH_RAW_VERSION:
+      begin
+        if (Header.HeaderSize <> SizeOf(TCrashRawHeaderV2)) or
+           (Header.BlockSize <> SizeOf(TCrashRawDiskBlockV2)) then
+          Exit;
+        Payload := @Block.Payload[0];
+        PayloadCapacity := CRASH_RAW_PAYLOAD_BYTES;
+      end;
+  else
+    Exit;
+  end;
+  if Header.PayloadSize > UInt32(PayloadCapacity) then
+    Exit;
+  Key := FixedUtf8ToString(Header.CaptureKey,
+    SizeOf(Header.CaptureKey));
   if Key = '' then
     Exit;
-  case TCrashRawPayloadKind(Block.Header.PayloadKind) of
+  case TCrashRawPayloadKind(Header.PayloadKind) of
     rpkPrimary:
       begin
-        if (Block.Header.SlotIndex <> CRASH_RAW_SLOT_PRIMARY) or
-           (Block.Header.PayloadSize <> SizeOf(TCrashRawPrimarySnapshot)) then
+        if (Header.SlotIndex <> CRASH_RAW_SLOT_PRIMARY) or
+           (Header.PayloadSize <> SizeOf(TCrashRawPrimarySnapshot)) then
           Exit;
-        Move(Block.Payload[0], ARecord.Primary, SizeOf(ARecord.Primary));
+        Move(Payload^, ARecord.Primary, SizeOf(ARecord.Primary));
         if (ARecord.Primary.Captured <> 1) or
            (ARecord.Primary.SignalNum <= 0) then
           Exit;
       end;
     rpkConcurrent:
       begin
-        if (Block.Header.SlotIndex <> CRASH_RAW_SLOT_CONCURRENT) or
-           (Block.Header.PayloadSize <> SizeOf(TCrashRawConcurrentSnapshot)) then
+        if (Header.SlotIndex <> CRASH_RAW_SLOT_CONCURRENT) or
+           (Header.PayloadSize <> SizeOf(TCrashRawConcurrentSnapshot)) then
           Exit;
-        Move(Block.Payload[0], ARecord.Concurrent,
-          SizeOf(ARecord.Concurrent));
+        Move(Payload^, ARecord.Concurrent, SizeOf(ARecord.Concurrent));
         if (ARecord.Concurrent.Captured <> 1) or
            (ARecord.Concurrent.SignalNum <= 0) then
           Exit;
@@ -747,19 +841,26 @@ begin
   end;
   ARecord.FilePath := AFilePath;
   ARecord.CaptureKey := Key;
-  ARecord.AppName := FixedUtf8ToString(Block.Header.AppName,
-    SizeOf(Block.Header.AppName));
-  ARecord.AppVersion := FixedUtf8ToString(Block.Header.AppVersion,
-    SizeOf(Block.Header.AppVersion));
+  ARecord.AppName := FixedUtf8ToString(Header.AppName,
+    SizeOf(Header.AppName));
+  ARecord.AppVersion := FixedUtf8ToString(Header.AppVersion,
+    SizeOf(Header.AppVersion));
   ARecord.CompilationTime := FixedUtf8ToString(
-    Block.Header.CompilationTime, SizeOf(Block.Header.CompilationTime));
-  ARecord.ExeName := FixedUtf8ToString(Block.Header.ExeName,
-    SizeOf(Block.Header.ExeName));
-  ARecord.ProcessID := Block.Header.ProcessID;
-  ARecord.InitTick := Block.Header.InitTick;
-  ARecord.InitUnixSeconds := Block.Header.InitUnixSeconds;
-  ARecord.Generation := Block.Header.Generation;
-  ARecord.PayloadKind := TCrashRawPayloadKind(Block.Header.PayloadKind);
+    Header.CompilationTime, SizeOf(Header.CompilationTime));
+  ARecord.ExeName := FixedUtf8ToString(Header.ExeName,
+    SizeOf(Header.ExeName));
+  ARecord.ProcessID := Header.ProcessID;
+  ARecord.InitTick := Header.InitTick;
+  ARecord.InitUnixSeconds := Header.InitUnixSeconds;
+  ARecord.Generation := Header.Generation;
+  ARecord.FormatVersion := Header.Version;
+  if Header.Version = CRASH_RAW_VERSION then
+  begin
+    ARecord.ImageBase := Block.Header.ImageBase;
+    ARecord.ImageSize := Block.Header.ImageSize;
+    ARecord.ImageID := Block.Header.ImageID;
+  end;
+  ARecord.PayloadKind := TCrashRawPayloadKind(Header.PayloadKind);
   Result := True;
 end;
 
@@ -809,7 +910,8 @@ var
   Start, At: Integer;
 begin
   Result := 0;
-  if Copy(ACaptureKey, 1, 3) <> 'R1-' then
+  if (Copy(ACaptureKey, 1, 3) <> 'R1-') and
+     (Copy(ACaptureKey, 1, 3) <> 'R2-') then
     Exit;
   Start := 4;
   At := Start;
@@ -822,7 +924,8 @@ end;
 
 function CrashRawFileIsAbandoned(const AFilePath: String): Boolean;
 var
-  Block: TCrashRawDiskBlockV1;
+  Block: TCrashRawDiskBlockV2;
+  Header: TCrashRawHeaderV1;
   Stream: TFileStream;
   OwnerID: UInt64;
 begin
@@ -840,12 +943,14 @@ begin
   except
     Exit;
   end;
+  Move(Block.Header, Header, SizeOf(Header));
   if (Block.Stage <> 0) or (Block.Commit <> 0) then
     Exit;
-  if CompareMem(@Block.Header.Magic[0], @CRASH_RAW_MAGIC[0],
+  if CompareMem(@Header.Magic[0], @CRASH_RAW_MAGIC[0],
        SizeOf(CRASH_RAW_MAGIC)) and
-     (Block.Header.Version = CRASH_RAW_VERSION) then
-    OwnerID := Block.Header.ProcessID
+     ((Header.Version = CRASH_RAW_VERSION_V1) or
+      (Header.Version = CRASH_RAW_VERSION)) then
+    OwnerID := Header.ProcessID
   else
   begin
     // Preallocated and never written: ftruncate leaves the whole block zeroed,
@@ -923,23 +1028,70 @@ begin
   {$ENDIF}
 end;
 
+function CrashRawImageIDPresent(const AImageID: TCrashRawImageID): Boolean;
+var
+  I: Integer;
+begin
+  for I := Low(AImageID) to High(AImageID) do
+    if AImageID[I] <> 0 then
+      Exit(True);
+  Result := False;
+end;
+
+function CrashRawTryRebaseAddress(const ARaw: TCrashRawRecord;
+  const AAddress, ACurrentImageBase, ACurrentImageSize: UInt64;
+  const ACurrentImageID: TCrashRawImageID;
+  const ACurrentCompilationTime: String;
+  out ARebasedAddress, AModuleOffset: UInt64): Boolean;
+begin
+  Result := False;
+  ARebasedAddress := 0;
+  AModuleOffset := 0;
+  if (ARaw.FormatVersion < CRASH_RAW_VERSION) or
+     (ARaw.ImageBase = 0) or (ARaw.ImageSize = 0) or
+     (ACurrentImageBase = 0) or (ACurrentImageSize = 0) or
+     (AAddress < ARaw.ImageBase) then
+    Exit;
+  if CrashRawImageIDPresent(ARaw.ImageID) then
+  begin
+    if (not CrashRawImageIDPresent(ACurrentImageID)) or
+       (not CompareMem(@ARaw.ImageID[0], @ACurrentImageID[0],
+         SizeOf(ARaw.ImageID))) then
+      Exit;
+  end
+  else if (ARaw.CompilationTime = '') or (ACurrentCompilationTime = '') or
+          (ARaw.CompilationTime <> ACurrentCompilationTime) then
+    Exit;
+  AModuleOffset := AAddress - ARaw.ImageBase;
+  if (AModuleOffset >= ARaw.ImageSize) or
+     (AModuleOffset >= ACurrentImageSize) or
+     (ACurrentImageBase > High(UInt64) - AModuleOffset) then
+  begin
+    AModuleOffset := 0;
+    Exit;
+  end;
+  ARebasedAddress := ACurrentImageBase + AModuleOffset;
+  Result := True;
+end;
+
 {$IFDEF AUTOTESTS}
 function CrashRawAutoTestWriteBlock(const AFilePath, ACaptureKey: String;
   const APayloadKind: TCrashRawPayloadKind;
   const ACommitted: Boolean): Boolean;
 var
-  Block: TCrashRawDiskBlockV1;
+  Block: TCrashRawDiskBlockV2;
   Primary: TCrashRawPrimarySnapshot;
   Concurrent: TCrashRawConcurrentSnapshot;
   Stream: TFileStream;
+  I: Integer;
 begin
   Result := False;
   FillChar(Block, SizeOf(Block), 0);
   Move(CRASH_RAW_MAGIC[0], Block.Header.Magic[0], SizeOf(CRASH_RAW_MAGIC));
   Block.Stage := CRASH_RAW_STAGE_ENTERED;
   Block.Header.Version := CRASH_RAW_VERSION;
-  Block.Header.HeaderSize := SizeOf(TCrashRawHeaderV1);
-  Block.Header.BlockSize := SizeOf(TCrashRawDiskBlockV1);
+  Block.Header.HeaderSize := SizeOf(TCrashRawHeaderV2);
+  Block.Header.BlockSize := SizeOf(TCrashRawDiskBlockV2);
   Block.Header.PayloadKind := Ord(APayloadKind);
   Block.Header.Platform := CrashRawPlatform;
   Block.Header.Architecture := CrashRawArchitecture;
@@ -957,6 +1109,10 @@ begin
     SizeOf(Block.Header.CompilationTime));
   CopyFixedUtf8('fixture-exe', @Block.Header.ExeName[0],
     SizeOf(Block.Header.ExeName));
+  Block.Header.ImageBase := $0000007100000000;
+  Block.Header.ImageSize := $02000000;
+  for I := Low(Block.Header.ImageID) to High(Block.Header.ImageID) do
+    Block.Header.ImageID[I] := Byte(I + 1);
   if APayloadKind = rpkPrimary then
   begin
     Block.Header.SlotIndex := CRASH_RAW_SLOT_PRIMARY;
@@ -1013,19 +1169,59 @@ begin
   end;
 end;
 
+function CrashRawAutoTestWriteLegacyV1Block(const AFilePath,
+  ACaptureKey: String; const APayloadKind: TCrashRawPayloadKind;
+  const ACommitted: Boolean): Boolean;
+var
+  Current: TCrashRawDiskBlockV2;
+  Legacy: TCrashRawDiskBlockV1;
+  Stream: TFileStream;
+begin
+  Result := False;
+  if not CrashRawAutoTestWriteBlock(AFilePath, ACaptureKey, APayloadKind,
+       ACommitted) then
+    Exit;
+  FillChar(Current, SizeOf(Current), 0);
+  FillChar(Legacy, SizeOf(Legacy), 0);
+  try
+    Stream := TFileStream.Create(AFilePath, fmOpenRead or fmShareDenyNone);
+    try
+      Stream.ReadBuffer(Current, SizeOf(Current));
+    finally
+      Stream.Free;
+    end;
+    Legacy.Stage := Current.Stage;
+    Move(Current.Header, Legacy.Header, SizeOf(Legacy.Header));
+    Legacy.Header.Version := CRASH_RAW_VERSION_V1;
+    Legacy.Header.HeaderSize := SizeOf(TCrashRawHeaderV1);
+    Legacy.Header.BlockSize := SizeOf(TCrashRawDiskBlockV1);
+    Move(Current.Payload[0], Legacy.Payload[0], Current.Header.PayloadSize);
+    Legacy.Commit := Current.Commit;
+    Stream := TFileStream.Create(AFilePath, fmCreate or fmShareDenyNone);
+    try
+      Stream.WriteBuffer(Legacy, SizeOf(Legacy));
+      Result := True;
+    finally
+      Stream.Free;
+    end;
+  except
+    Result := False;
+  end;
+end;
+
 function CrashRawAutoTestWritePristineBlock(const AFilePath,
   ACaptureKey: String; const APayloadKind: TCrashRawPayloadKind;
   const AProcessID: UInt64): Boolean;
 var
-  Block: TCrashRawDiskBlockV1;
+  Block: TCrashRawDiskBlockV2;
   Stream: TFileStream;
 begin
   Result := False;
   FillChar(Block, SizeOf(Block), 0);
   Move(CRASH_RAW_MAGIC[0], Block.Header.Magic[0], SizeOf(CRASH_RAW_MAGIC));
   Block.Header.Version := CRASH_RAW_VERSION;
-  Block.Header.HeaderSize := SizeOf(TCrashRawHeaderV1);
-  Block.Header.BlockSize := SizeOf(TCrashRawDiskBlockV1);
+  Block.Header.HeaderSize := SizeOf(TCrashRawHeaderV2);
+  Block.Header.BlockSize := SizeOf(TCrashRawDiskBlockV2);
   Block.Header.PayloadKind := Ord(APayloadKind);
   Block.Header.Platform := CrashRawPlatform;
   Block.Header.Architecture := CrashRawArchitecture;
@@ -1051,6 +1247,8 @@ begin
     SizeOf(Block.Header.CaptureKey));
   CopyFixedUtf8('RawFixture', @Block.Header.AppName[0],
     SizeOf(Block.Header.AppName));
+  Block.Header.ImageBase := $0000007100000000;
+  Block.Header.ImageSize := $02000000;
   try
     Stream := TFileStream.Create(AFilePath, fmCreate or fmShareDenyNone);
     try
@@ -1065,7 +1263,7 @@ end;
 
 function CrashRawAutoTestWriteZeroBlock(const AFilePath: String): Boolean;
 var
-  Block: TCrashRawDiskBlockV1;
+  Block: TCrashRawDiskBlockV2;
   Stream: TFileStream;
 begin
   Result := False;
