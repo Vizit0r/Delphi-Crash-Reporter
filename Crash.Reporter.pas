@@ -146,6 +146,9 @@ type
       never aborted. The host must call TCrashFreeze.Ping from the watched
       (main) loop, otherwise detection stays dormant. }
     FreezeDetection: Boolean;
+    { Capture registered application threads in addition to the exception/frozen
+      thread. Default False in the standalone library; the host opts in. }
+    ExtendedThreads: Boolean;
     { No-heartbeat threshold before a freeze report is captured. Default 30000. }
     FreezeTimeoutMS: Integer;
     { Restart the process after a freeze report: a fresh instance is spawned
@@ -196,6 +199,8 @@ type
     Active: Boolean;
     SignalHandlersInstalled: Boolean;
     FreezeDetectorActive: Boolean;
+    ExtendedThreadsEnabled: Boolean;
+    ExtendedThreadsAvailable: Boolean;
     RegisteredThreadCount: Integer;
     MainThread: TCrashThreadCoverage;
     CurrentThread: TCrashThreadCoverage;
@@ -258,6 +263,12 @@ function CrashAutoTestTemplateScanPrefix(const ATemplate, AApp: String): String;
 function CrashAutoTestAcceptInitialConfig(var AInstalled: Boolean;
   var ACurrent: TCrashConfig; const AIncoming: TCrashConfig): Boolean;
 function CrashAutoTestOperationLifetimeGate: Boolean;
+function CrashAutoTestSanitizeThreadName(const AName: String): String;
+function CrashAutoTestSetExtendedCaptureOverride(
+  const AEnabled: Boolean): Boolean;
+function CrashAutoTestCaptureExtendedThreads(const APrimaryThreadID: UInt64;
+  out AThreads: TArray<TCrashThreadStack>; out AOmitted: Integer;
+  out ATotalMS, AMaxThreadMS: UInt64): Boolean;
 {$ENDIF}
 
 {$IF not Defined(MSWINDOWS)}
@@ -405,6 +416,7 @@ uses
   Crash.Breadcrumbs,
   Crash.Pending,
   Crash.RawFallback,
+  Crash.ThreadCapture,
   {$IF Defined(MSWINDOWS)}
   Winapi.Windows,
   {$ENDIF}
@@ -482,6 +494,7 @@ begin
   Result.AllowRestart := True;
   Result.BreadcrumbCapacity := CRASH_BREADCRUMB_DEFAULT_CAPACITY;
   Result.FreezeDetection := False; // opt in - see the field comment
+  Result.ExtendedThreads := False; // standalone library is conservative
   Result.FreezeTimeoutMS := 30000;
   Result.RestartOnFreeze := False; // opt in - see the field comment
 end;
@@ -787,6 +800,23 @@ begin
 end;
 
 type
+  TCrashThreadRegistration = class
+  public
+    Coverage: TCrashThreadCoverage;
+    NativeIdentity: TCrashThreadNativeIdentity;
+    Sequence: UInt64;
+    Closing: Boolean;
+    UnregisterWaiting: Boolean;
+    CaptureLeaseCount: Integer;
+    CaptureHandle: TCrashThreadCaptureHandle;
+  end;
+
+  TCrashThreadCandidate = record
+    ThreadID: UInt64;
+    Name: String;
+    Sequence: UInt64;
+  end;
+
   TCrashReporterImpl = class
   private
     FConfig: TCrashConfig;
@@ -802,7 +832,9 @@ type
     FWasFreezeRestarted: Boolean; // loop-guard flag: this run WAS spawned by RestartOnFreeze (survives TakeRestartNotice)
     FMachMainThreadCovered: Boolean; // Init-time Mach registration verdict (main thread only; NOT a live watcher status)
     FMainThreadCoverage: TCrashThreadCoverage;
-    FThreadCoverages: TDictionary<UInt64, TCrashThreadCoverage>;
+    FThreadRegistrations: TObjectList<TCrashThreadRegistration>;
+    FRegistrationSequence: UInt64;
+    FExtendedCaptureOwned: Boolean;
     FBreadcrumbs: TCrashBreadcrumbStore;
     FOperationLifetime: ICrashOperationLifetime;
     FInstanceID: UInt64;
@@ -823,6 +855,18 @@ type
     procedure ResetAlreadyReported;
     procedure HandleReport(const AReport: TCrashReport);
     procedure DoHandleReport(const AReport: TCrashReport);
+    function TryEnterRegistry(const ATimeoutMS: Integer): Boolean;
+    function EnterRegistryForCapture(const ABounded: Boolean): Boolean;
+    function FindRegistrationLocked(const AThreadID,
+      ASequence: UInt64): TCrashThreadRegistration;
+    procedure SweepClosedRegistrationsLocked;
+    function ExtendedCaptureOperational: Boolean;
+    function RegisteredThreadName(const AThreadID: UInt64;
+      const AFallback: String): String;
+    function CaptureExtendedThreads(var AReport: TCrashReport;
+      const APrimaryThreadID: UInt64;
+      const ABoundedRegistry: Boolean): Integer;
+    procedure ExtendFreezeReport(var AReport: TCrashReport);
     procedure InstallFreezeDetector;
     procedure HandleFreezeCapture(const AReport: TCrashReport;
       const AFrozenForMS: Int64);
@@ -839,16 +883,22 @@ type
 var
   GReporter: TCrashReporterImpl;
   GReporterInstanceSeq: Int64;
+  {$IFDEF AUTOTESTS}
+  GAutoTestExtendedCaptureEnabled: Integer;
+  GAutoTestExtendedCaptureOwned: Boolean;
+  GAutoTestExtendedMaxThreadMS: UInt64;
+  {$ENDIF}
 
 threadvar
   GCoverageReporter: Pointer;
   GCoverageReporterInstanceID: UInt64;
+  GCoverageRegistration: Pointer;
 
 constructor TCrashReporterImpl.Create;
 begin
   inherited Create;
   FLock := TCriticalSection.Create;
-  FThreadCoverages := TDictionary<UInt64, TCrashThreadCoverage>.Create;
+  FThreadRegistrations := TObjectList<TCrashThreadRegistration>.Create(True);
   FInstanceID := UInt64(TInterlocked.Increment(GReporterInstanceSeq));
   FMachMainThreadCovered := True; // no verdict yet - only Init's registration may flip it
   FAppStartTime := Now; // "close enough to process start"
@@ -863,6 +913,7 @@ begin
   // Stop the freeze watchdog BEFORE the singleton goes away: its capture and
   // suppress hooks are closures over Self.
   TCrashFreeze.Shutdown;
+  TCrashFreeze.OnExtendCapture := nil;
   TCrashFreeze.OnCapture := nil;
   TCrashFreeze.OnExternalSuppress := nil;
   TCrashCapture.OnReport := nil;
@@ -874,7 +925,12 @@ begin
   FConfig.OnFreezeReport := nil;
   FreeAndNil(FBreadcrumbs);
   FOperationLifetime := nil;
-  FreeAndNil(FThreadCoverages);
+  FreeAndNil(FThreadRegistrations);
+  if FExtendedCaptureOwned then
+  begin
+    CrashThreadCaptureRelease;
+    FExtendedCaptureOwned := False;
+  end;
   FreeAndNil(FLock);
   inherited;
 end;
@@ -898,6 +954,342 @@ begin
   {$ELSE}
   Result := cmsNotRequired;
   {$ENDIF}
+end;
+
+const
+  CRASH_EXTENDED_MAX_THREADS = 32;
+  CRASH_EXTENDED_THREAD_WAIT_MS = 100;
+  CRASH_EXTENDED_TOTAL_BUDGET_MS = 1000;
+  CRASH_EXTENDED_MIN_WAIT_MS = 2;
+  CRASH_EXTENDED_LOCK_BUDGET_MS = 10;
+  CRASH_EXTENDED_NAME_MAX_CHARS = 128;
+
+function CrashSanitizeThreadName(const AName: String): String;
+begin
+  Result := StringReplace(AName, ';', '.', [rfReplaceAll]);
+  Result := StringReplace(Result, #13, ' ', [rfReplaceAll]);
+  Result := StringReplace(Result, #10, ' ', [rfReplaceAll]);
+  Result := StringReplace(Result, #9, ' ', [rfReplaceAll]);
+  Result := StringReplace(Result, '|', ' ', [rfReplaceAll]);
+  Result := StringReplace(Result, '=', ' ', [rfReplaceAll]);
+  if Length(Result) > CRASH_EXTENDED_NAME_MAX_CHARS then
+    SetLength(Result, CRASH_EXTENDED_NAME_MAX_CHARS);
+  if Trim(Result) = '' then
+    Result := 'Worker';
+end;
+
+{$IFDEF AUTOTESTS}
+function CrashAutoTestSanitizeThreadName(const AName: String): String;
+begin
+  Result := CrashSanitizeThreadName(AName);
+end;
+
+function CrashAutoTestSetExtendedCaptureOverride(
+  const AEnabled: Boolean): Boolean;
+begin
+  if AEnabled then
+  begin
+    if TInterlocked.CompareExchange(
+      GAutoTestExtendedCaptureEnabled, 0, 0) <> 0 then
+      Exit(GAutoTestExtendedCaptureOwned and CrashThreadCaptureAvailable);
+    GAutoTestExtendedCaptureOwned := CrashThreadCaptureAcquire;
+    if GAutoTestExtendedCaptureOwned then
+      TInterlocked.Exchange(GAutoTestExtendedCaptureEnabled, 1);
+    Exit(GAutoTestExtendedCaptureOwned);
+  end;
+
+  TInterlocked.Exchange(GAutoTestExtendedCaptureEnabled, 0);
+  if GAutoTestExtendedCaptureOwned then
+  begin
+    CrashThreadCaptureRelease;
+    GAutoTestExtendedCaptureOwned := False;
+  end;
+  Result := True;
+end;
+
+function CrashAutoTestCaptureExtendedThreads(const APrimaryThreadID: UInt64;
+  out AThreads: TArray<TCrashThreadStack>; out AOmitted: Integer;
+  out ATotalMS, AMaxThreadMS: UInt64): Boolean;
+var
+  Reporter: TCrashReporterImpl;
+  Report: TCrashReport;
+  Started: UInt64;
+begin
+  AThreads := nil;
+  AOmitted := 0;
+  ATotalMS := 0;
+  AMaxThreadMS := 0;
+  Reporter := GReporter;
+  Result := (Reporter <> nil) and Reporter.FInstalled and
+    (TInterlocked.CompareExchange(
+      GAutoTestExtendedCaptureEnabled, 0, 0) <> 0) and
+    GAutoTestExtendedCaptureOwned;
+  if not Result then
+    Exit;
+
+  Report := Default(TCrashReport);
+  GAutoTestExtendedMaxThreadMS := 0;
+  Started := TThread.GetTickCount64;
+  AOmitted := Reporter.CaptureExtendedThreads(Report, APrimaryThreadID, False);
+  ATotalMS := TThread.GetTickCount64 - Started;
+  AMaxThreadMS := GAutoTestExtendedMaxThreadMS;
+  AThreads := Report.ExtendedThreads;
+end;
+{$ENDIF}
+
+function TCrashReporterImpl.TryEnterRegistry(
+  const ATimeoutMS: Integer): Boolean;
+var
+  Deadline: UInt64;
+begin
+  Deadline := TThread.GetTickCount64 + UInt64(ATimeoutMS);
+  repeat
+    if FLock.TryEnter then
+      Exit(True);
+    if TThread.GetTickCount64 >= Deadline then
+      Exit(False);
+    TThread.Sleep(1);
+  until False;
+end;
+
+function TCrashReporterImpl.EnterRegistryForCapture(
+  const ABounded: Boolean): Boolean;
+begin
+  if ABounded then
+    Exit(TryEnterRegistry(CRASH_EXTENDED_LOCK_BUDGET_MS));
+  FLock.Enter;
+  Result := True;
+end;
+
+function TCrashReporterImpl.FindRegistrationLocked(const AThreadID,
+  ASequence: UInt64): TCrashThreadRegistration;
+var
+  Registration: TCrashThreadRegistration;
+begin
+  for Registration in FThreadRegistrations do
+    if (Registration.Coverage.ThreadID = AThreadID) and
+       (Registration.Sequence = ASequence) then
+      Exit(Registration);
+  Result := nil;
+end;
+
+procedure TCrashReporterImpl.SweepClosedRegistrationsLocked;
+var
+  I: Integer;
+begin
+  for I := FThreadRegistrations.Count - 1 downto 0 do
+    if FThreadRegistrations[I].Closing and
+       (not FThreadRegistrations[I].UnregisterWaiting) and
+       (FThreadRegistrations[I].CaptureLeaseCount = 0) then
+      FThreadRegistrations.Delete(I);
+end;
+
+function TCrashReporterImpl.ExtendedCaptureOperational: Boolean;
+begin
+  Result := FConfig.ExtendedThreads and FExtendedCaptureOwned;
+  {$IFDEF AUTOTESTS}
+  if not Result then
+    Result := (TInterlocked.CompareExchange(
+      GAutoTestExtendedCaptureEnabled, 0, 0) <> 0) and
+      GAutoTestExtendedCaptureOwned;
+  {$ENDIF}
+  Result := Result and CrashThreadCaptureAvailable;
+end;
+
+function TCrashReporterImpl.RegisteredThreadName(const AThreadID: UInt64;
+  const AFallback: String): String;
+var
+  I: Integer;
+begin
+  Result := AFallback;
+  if not TryEnterRegistry(CRASH_EXTENDED_LOCK_BUDGET_MS) then
+    Exit;
+  try
+    for I := FThreadRegistrations.Count - 1 downto 0 do
+      if (not FThreadRegistrations[I].Closing) and
+         (FThreadRegistrations[I].Coverage.ThreadID = AThreadID) then
+        Exit(FThreadRegistrations[I].Coverage.Name);
+  finally
+    FLock.Leave;
+  end;
+end;
+
+function TCrashReporterImpl.CaptureExtendedThreads(var AReport: TCrashReport;
+  const APrimaryThreadID: UInt64;
+  const ABoundedRegistry: Boolean): Integer;
+var
+  Candidates: array [0..CRASH_EXTENDED_MAX_THREADS - 1] of
+    TCrashThreadCandidate;
+  CandidateCount, EligibleCount, I, WaitMS, MaxDepth: Integer;
+  Candidate: TCrashThreadCandidate;
+  Registration, CurrentRegistration: TCrashThreadRegistration;
+  Handle: TCrashThreadCaptureHandle;
+  Trace: TCrashThreadRawTrace;
+  Outcome: TCrashThreadCaptureOutcome;
+  Deadline, NowTick, Remaining: UInt64;
+  LeaseHeld, StillOwned: Boolean;
+  {$IFDEF AUTOTESTS}
+  CaptureStart, CaptureElapsed: UInt64;
+  {$ENDIF}
+begin
+  Result := 0;
+  AReport.ExtendedThreads := nil;
+  AReport.ExtendedThreadsOmitted := 0;
+  if not ExtendedCaptureOperational then
+    Exit;
+
+  CandidateCount := 0;
+  EligibleCount := 0;
+  if not EnterRegistryForCapture(ABoundedRegistry) then
+    Exit;
+  try
+    // TObjectList insertion order is registration order. Sequence is copied as
+    // the stale-result guard and deliberately remains the authoritative key.
+    for Registration in FThreadRegistrations do
+      if (not Registration.Closing) and
+         (Registration.Coverage.ThreadID <> APrimaryThreadID) then
+      begin
+        Inc(EligibleCount);
+        if CandidateCount < CRASH_EXTENDED_MAX_THREADS then
+        begin
+          Candidates[CandidateCount].ThreadID :=
+            Registration.Coverage.ThreadID;
+          Candidates[CandidateCount].Name := Registration.Coverage.Name;
+          Candidates[CandidateCount].Sequence := Registration.Sequence;
+          Inc(CandidateCount);
+        end;
+      end;
+  finally
+    FLock.Leave;
+  end;
+  if EligibleCount > CandidateCount then
+    Result := EligibleCount - CandidateCount;
+  AReport.ExtendedThreadsOmitted := Result;
+  if CandidateCount = 0 then
+    Exit;
+
+  SetLength(AReport.ExtendedThreads, CandidateCount);
+  Deadline := TThread.GetTickCount64 + CRASH_EXTENDED_TOTAL_BUDGET_MS;
+  for I := 0 to CandidateCount - 1 do
+  begin
+    Candidate := Candidates[I];
+    AReport.ExtendedThreads[I].ThreadID := Candidate.ThreadID;
+    AReport.ExtendedThreads[I].Name := Candidate.Name;
+    AReport.ExtendedThreads[I].State := ctcsCaptureFailed;
+    AReport.ExtendedThreads[I].CallStack := nil;
+    Handle := nil;
+    LeaseHeld := False;
+
+    NowTick := TThread.GetTickCount64;
+    if NowTick >= Deadline then
+    begin
+      AReport.ExtendedThreads[I].State := ctcsBudgetExceeded;
+      Continue;
+    end;
+
+    if not EnterRegistryForCapture(ABoundedRegistry) then
+      Continue;
+    try
+      Registration := FindRegistrationLocked(Candidate.ThreadID,
+        Candidate.Sequence);
+      if (Registration = nil) or Registration.Closing then
+        AReport.ExtendedThreads[I].State := ctcsThreadGone
+      else if Registration.CaptureHandle = nil then
+        AReport.ExtendedThreads[I].State := ctcsSignalUnavailable
+      else
+      begin
+        Inc(Registration.CaptureLeaseCount);
+        Handle := Registration.CaptureHandle;
+        LeaseHeld := True;
+      end;
+    finally
+      FLock.Leave;
+    end;
+    if not LeaseHeld then
+      Continue;
+
+    try
+      NowTick := TThread.GetTickCount64;
+      if NowTick >= Deadline then
+      begin
+        AReport.ExtendedThreads[I].State := ctcsBudgetExceeded;
+        Continue;
+      end;
+      Remaining := Deadline - NowTick;
+      if Remaining < CRASH_EXTENDED_MIN_WAIT_MS then
+      begin
+        AReport.ExtendedThreads[I].State := ctcsBudgetExceeded;
+        Continue;
+      end;
+      WaitMS := CRASH_EXTENDED_THREAD_WAIT_MS;
+      if Remaining < UInt64(WaitMS) then
+        WaitMS := Integer(Remaining);
+      {$IFDEF AUTOTESTS}
+      CaptureStart := TThread.GetTickCount64;
+      {$ENDIF}
+      Outcome := CrashThreadCaptureCapture(Handle, WaitMS, Trace);
+      {$IFDEF AUTOTESTS}
+      CaptureElapsed := TThread.GetTickCount64 - CaptureStart;
+      if CaptureElapsed > GAutoTestExtendedMaxThreadMS then
+        GAutoTestExtendedMaxThreadMS := CaptureElapsed;
+      {$ENDIF}
+    finally
+      // The lease protects only the raw request/result hand-off. Release it
+      // before symbolization so unregister never waits on resolver work.
+      FLock.Enter;
+      try
+        CurrentRegistration := FindRegistrationLocked(Candidate.ThreadID,
+          Candidate.Sequence);
+        StillOwned := (CurrentRegistration <> nil) and
+          (CurrentRegistration = Registration);
+        if Registration.CaptureLeaseCount > 0 then
+          Dec(Registration.CaptureLeaseCount);
+        if not StillOwned then
+        begin
+          AReport.ExtendedThreads[I].State := ctcsThreadGone;
+          AReport.ExtendedThreads[I].CallStack := nil;
+          Trace := Default(TCrashThreadRawTrace);
+        end;
+        SweepClosedRegistrationsLocked;
+      finally
+        FLock.Leave;
+      end;
+    end;
+    if not StillOwned then
+      Continue;
+
+    case Outcome of
+      tcoCaptured:
+        begin
+          MaxDepth := TCrashCapture.MaxCallStackDepth;
+          if MaxDepth < 0 then
+            MaxDepth := 0;
+          if Length(Trace.Addresses) > MaxDepth then
+            SetLength(Trace.Addresses, MaxDepth);
+          try
+            AReport.ExtendedThreads[I].CallStack :=
+              TCrashCapture.SymbolizeAddressList(Trace.Addresses);
+            AReport.ExtendedThreads[I].State := ctcsCaptured;
+          except
+            AReport.ExtendedThreads[I].CallStack := nil;
+            AReport.ExtendedThreads[I].State := ctcsCaptureFailed;
+          end;
+        end;
+      tcoTimedOut:
+        AReport.ExtendedThreads[I].State := ctcsTimedOut;
+      tcoThreadGone:
+        AReport.ExtendedThreads[I].State := ctcsThreadGone;
+      tcoUnavailable:
+        AReport.ExtendedThreads[I].State := ctcsSignalUnavailable;
+    else
+      AReport.ExtendedThreads[I].State := ctcsCaptureFailed;
+    end;
+  end;
+end;
+
+procedure TCrashReporterImpl.ExtendFreezeReport(var AReport: TCrashReport);
+begin
+  CaptureExtendedThreads(AReport, FMainThreadCoverage.ThreadID, True);
 end;
 
 function TCrashReporterImpl.EffectiveFileNamePrefix: String;
@@ -1159,6 +1551,7 @@ procedure TCrashReporterImpl.DoHandleReport(const AReport: TCrashReport);
 var
   Text: String;
   Ctx: TCrashELContext;
+  Report: TCrashReport;
   IsFatal: Boolean;
   ReportPersisted: Boolean;
   LocalDialogProc: TCrashShowDialogProc;
@@ -1203,6 +1596,8 @@ begin
     end;
   end;
 
+  Report := AReport;
+  CaptureExtendedThreads(Report, CrashCurrentThreadIdentity, False);
   IsFatal := AReport.Source = csFatalProc;
   // ExceptionLocation.CodeAddress keys the snapshot<->exception correlation in
   // CrashTakeAndFormatSnapshots (see Crash.Signals) - a snapshot left behind by
@@ -1229,9 +1624,9 @@ begin
   // NameThreadForDebugging), so worker threads get a generic label - the real
   // TID is shown on the "*Exception Thread: ID=..." line above.
   if TThread.CurrentThread.ThreadID = MainThreadID then
-    Ctx.ThreadName := 'MAIN'
+    Ctx.ThreadName := RegisteredThreadName(CrashCurrentThreadIdentity, 'MAIN')
   else
-    Ctx.ThreadName := 'Worker';
+    Ctx.ThreadName := RegisteredThreadName(CrashCurrentThreadIdentity, 'Worker');
   // Optional extra-context section provided by the host.
   if Assigned(FConfig.OnCollectContext) then
   try
@@ -1245,6 +1640,14 @@ begin
   except
     // A faulty context provider must not break reporting.
   end;
+  if Report.ExtendedThreadsOmitted > 0 then
+  begin
+    if Ctx.SignalInfoSection <> '' then
+      Ctx.SignalInfoSection := Ctx.SignalInfoSection + #13#10;
+    Ctx.SignalInfoSection := Ctx.SignalInfoSection + Format(
+      'Extended threads omitted by limit: %d',
+      [Report.ExtendedThreadsOmitted]);
+  end;
   // macOS x86-64 whose Init (main-thread) Mach registration failed: state WHY
   // the Registers section is absent - but only in MAIN-thread reports; the
   // stored verdict says nothing about other threads' coverage.
@@ -1257,12 +1660,12 @@ begin
       'Mach registration for the Init (main) thread failed - hardware-fault registers are unavailable in this report';
   end;
   CrashCollectELModules(Ctx);
-  Text := CrashBuildELReportText(AReport, Ctx);
+  Text := CrashBuildELReportText(Report, Ctx);
 
   // The .el file name uses the exception's EL-style BugID as its token (see
   // BuildCrashFilePath). Compute it here, where AReport is in hand, before
   // WriteToFile builds the path.
-  FExceptionID := CrashGenerateExceptionID(AReport);
+  FExceptionID := CrashGenerateExceptionID(Report);
 
   ReportPersisted := False;
   if FConfig.SaveToFile then
@@ -1372,6 +1775,8 @@ begin
     Exit;
   FOperationLifetime := TCrashOperationLifetime.Create;
   FBreadcrumbs := TCrashBreadcrumbStore.Create(FConfig.BreadcrumbCapacity);
+  if FConfig.ExtendedThreads then
+    FExtendedCaptureOwned := CrashThreadCaptureAcquire;
 
   // TCrashCapture is created in Crash.CallStack's initialization (it installs
   // ExceptProc / ExceptionAcquired / GetExceptionStackInfoProc). Here we just
@@ -1435,6 +1840,7 @@ begin
       Result := FAlreadyReported;
     end;
   TCrashFreeze.OnCapture := HandleFreezeCapture;
+  TCrashFreeze.OnExtendCapture := ExtendFreezeReport;
   TCrashFreeze.Install(FConfig.FreezeTimeoutMS);
 end;
 
@@ -1478,7 +1884,7 @@ begin
   end;
   // The report describes the frozen MAIN thread, not the watchdog.
   Ctx.ThreadID := Cardinal(MainThreadID);
-  Ctx.ThreadName := 'MAIN';
+  Ctx.ThreadName := RegisteredThreadName(FMainThreadCoverage.ThreadID, 'MAIN');
   FreezeNote :=
     'Freeze Info:' + #13#10 +
     '-------------' + #13#10 +
@@ -1495,6 +1901,10 @@ begin
     Ctx.SignalInfoSection := FreezeNote + #13#10 + Ctx.SignalInfoSection
   else
     Ctx.SignalInfoSection := FreezeNote;
+  if AReport.ExtendedThreadsOmitted > 0 then
+    Ctx.SignalInfoSection := Ctx.SignalInfoSection + #13#10 + Format(
+      'Extended threads omitted by limit: %d',
+      [AReport.ExtendedThreadsOmitted]);
 
   CrashCollectELModules(Ctx);
   Text := CrashBuildELReportText(AReport, Ctx);
@@ -2209,6 +2619,9 @@ begin
   Reporter := GReporter;
   if Reporter = nil then
     Exit;
+  if (GCoverageReporter = Pointer(Reporter)) and
+     (GCoverageReporterInstanceID = Reporter.FInstanceID) then
+    UnregisterCurrentThread;
   GReporter := nil;
   Reporter.Free;
 end;
@@ -2251,7 +2664,9 @@ class function TCrashReporter.RegisterCurrentThread(
   const AName: String): TCrashThreadCoverage;
 var
   Reporter: TCrashReporterImpl;
-  Existing: TCrashThreadCoverage;
+  Registration, Existing: TCrashThreadRegistration;
+  NativeIdentity: TCrashThreadNativeIdentity;
+  CaptureHandle: TCrashThreadCaptureHandle;
 begin
   Result := Default(TCrashThreadCoverage);
   Reporter := GReporter;
@@ -2259,62 +2674,128 @@ begin
     Exit;
 
   Result.ThreadID := CrashCurrentThreadIdentity;
-  // Fast idempotent path. The TLS owner prevents a stale dictionary entry from
-  // an abnormally exited old thread with a recycled OS identity being trusted.
+  // Fast idempotent path. The TLS owner prevents an abandoned registration with
+  // a recycled native identity being mistaken for this caller.
   if (GCoverageReporter = Pointer(Reporter)) and
-     (GCoverageReporterInstanceID = Reporter.FInstanceID) then
+     (GCoverageReporterInstanceID = Reporter.FInstanceID) and
+     (GCoverageRegistration <> nil) then
   begin
     Reporter.FLock.Enter;
     try
-      if Reporter.FThreadCoverages.TryGetValue(Result.ThreadID, Existing) then
-        Exit(Existing);
+      Existing := TCrashThreadRegistration(GCoverageRegistration);
+      if (Reporter.FThreadRegistrations.IndexOf(Existing) >= 0) and
+         (not Existing.Closing) then
+        Exit(Existing.Coverage);
     finally
       Reporter.FLock.Leave;
     end;
   end;
 
   Result.Registered := True;
-  Result.Name := AName;
+  Result.Name := CrashSanitizeThreadName(AName);
   Result.AltStack := CrashRegisterAltStackForCurrentThread;
   Result.MachHandler := CrashRegisterMachForCurrentThread;
+  NativeIdentity := CrashCurrentThreadNativeIdentity;
+  CaptureHandle := nil;
+  if Reporter.ExtendedCaptureOperational then
+    CrashThreadCaptureRegisterCurrentThread(CaptureHandle);
+
+  Registration := TCrashThreadRegistration.Create;
+  Registration.Coverage := Result;
+  Registration.NativeIdentity := NativeIdentity;
+  Registration.CaptureHandle := CaptureHandle;
   Reporter.FLock.Enter;
   try
-    Reporter.FThreadCoverages.AddOrSetValue(Result.ThreadID, Result);
+    // A dead owner can leave a calm-path record behind. The capture service has
+    // already resolved a pthread_t collision using the second kernel identity;
+    // invalidate the reporter record so a lease result cannot inherit its name.
+    for Existing in Reporter.FThreadRegistrations do
+      if (not Existing.Closing) and
+         ((Existing.Coverage.ThreadID = Result.ThreadID) or
+          ((NativeIdentity.PThread <> 0) and
+           (Existing.NativeIdentity.PThread = NativeIdentity.PThread))) then
+      begin
+        Existing.Closing := True;
+        Existing.CaptureHandle := nil;
+      end;
+    Reporter.SweepClosedRegistrationsLocked;
+    Inc(Reporter.FRegistrationSequence);
+    Registration.Sequence := Reporter.FRegistrationSequence;
+    Reporter.FThreadRegistrations.Add(Registration);
   finally
     Reporter.FLock.Leave;
   end;
   GCoverageReporter := Pointer(Reporter);
   GCoverageReporterInstanceID := Reporter.FInstanceID;
+  GCoverageRegistration := Registration;
 end;
 
 class procedure TCrashReporter.UnregisterCurrentThread;
 var
   Reporter: TCrashReporterImpl;
-  ThreadID: UInt64;
+  Registration: TCrashThreadRegistration;
+  CaptureHandle: TCrashThreadCaptureHandle;
+  Leases: Integer;
+  Found: Boolean;
 begin
   Reporter := TCrashReporterImpl(GCoverageReporter);
-  ThreadID := CrashCurrentThreadIdentity;
+  Registration := TCrashThreadRegistration(GCoverageRegistration);
+  CaptureHandle := nil;
+  Found := False;
   if (Reporter <> nil) and (Reporter = GReporter) and
-     (GCoverageReporterInstanceID = Reporter.FInstanceID) then
+     (GCoverageReporterInstanceID = Reporter.FInstanceID) and
+     (Registration <> nil) then
   begin
     Reporter.FLock.Enter;
     try
-      Reporter.FThreadCoverages.Remove(ThreadID);
+      if Reporter.FThreadRegistrations.IndexOf(Registration) >= 0 then
+      begin
+        Found := True;
+        Registration.Closing := True;
+        Registration.UnregisterWaiting := True;
+        CaptureHandle := Registration.CaptureHandle;
+      end;
     finally
       Reporter.FLock.Leave;
+    end;
+
+    if Found then
+    begin
+      // At most the currently running bounded capture holds a lease. Do not free
+      // its owned record/slot until the coordinator has published its verdict.
+      repeat
+        Reporter.FLock.Enter;
+        try
+          Leases := Registration.CaptureLeaseCount;
+        finally
+          Reporter.FLock.Leave;
+        end;
+        if Leases = 0 then
+          Break;
+        TThread.Sleep(1);
+      until False;
+
+      if CaptureHandle <> nil then
+        CrashThreadCaptureUnregisterCurrentThread(CaptureHandle);
+      Reporter.FLock.Enter;
+      try
+        Reporter.FThreadRegistrations.Remove(Registration);
+      finally
+        Reporter.FLock.Leave;
+      end;
     end;
   end;
   GCoverageReporter := nil;
   GCoverageReporterInstanceID := 0;
+  GCoverageRegistration := nil;
   CrashUnregisterAltStackForCurrentThread;
 end;
 
 class function TCrashReporter.GetStatus: TCrashStatus;
 var
   Reporter: TCrashReporterImpl;
-  Coverage: TCrashThreadCoverage;
+  Registration: TCrashThreadRegistration;
   I: Integer;
-  CurrentID: UInt64;
 begin
   Result := Default(TCrashStatus);
   Reporter := GReporter;
@@ -2323,21 +2804,31 @@ begin
   Result.Active := Reporter.FInstalled;
   Result.SignalHandlersInstalled := CrashSignalHandlersInstalled;
   Result.FreezeDetectorActive := TCrashFreeze.Active;
-  CurrentID := CrashCurrentThreadIdentity;
+  Result.ExtendedThreadsEnabled := Reporter.FConfig.ExtendedThreads;
+  Result.ExtendedThreadsAvailable := Reporter.FConfig.ExtendedThreads and
+    Reporter.FExtendedCaptureOwned and CrashThreadCaptureAvailable;
   Reporter.FLock.Enter;
   try
-    Result.RegisteredThreadCount := Reporter.FThreadCoverages.Count;
     Result.MainThread := Reporter.FMainThreadCoverage;
+    Result.RegisteredThreadCount := 0;
+    for Registration in Reporter.FThreadRegistrations do
+      if not Registration.Closing then
+        Inc(Result.RegisteredThreadCount);
     SetLength(Result.Threads, Result.RegisteredThreadCount);
     I := 0;
-    for Coverage in Reporter.FThreadCoverages.Values do
-    begin
-      Result.Threads[I] := Coverage;
-      Inc(I);
-    end;
+    for Registration in Reporter.FThreadRegistrations do
+      if not Registration.Closing then
+      begin
+        Result.Threads[I] := Registration.Coverage;
+        Inc(I);
+      end;
     if (GCoverageReporter = Pointer(Reporter)) and
-       (GCoverageReporterInstanceID = Reporter.FInstanceID) then
-      Reporter.FThreadCoverages.TryGetValue(CurrentID, Result.CurrentThread);
+       (GCoverageReporterInstanceID = Reporter.FInstanceID) and
+       (GCoverageRegistration <> nil) and
+       (Reporter.FThreadRegistrations.IndexOf(
+          TCrashThreadRegistration(GCoverageRegistration)) >= 0) then
+      Result.CurrentThread :=
+        TCrashThreadRegistration(GCoverageRegistration).Coverage;
   finally
     Reporter.FLock.Leave;
   end;

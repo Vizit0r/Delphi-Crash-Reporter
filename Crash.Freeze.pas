@@ -75,6 +75,11 @@ type
   TCrashFreezeCaptureEvent = reference to procedure(const AReport: TCrashReport;
     const AFrozenForMS: Int64);
 
+  { Extends the already-symbolized primary report while the report gate is still
+    held. Crash.Reporter uses it for optional registered-thread capture. }
+  TCrashFreezeExtendCaptureEvent = reference to procedure(
+    var AReport: TCrashReport);
+
 type
   { Freeze detector facade. All methods are class (static) methods over a
     single process-wide watchdog. Inactive until Install is called. }
@@ -82,6 +87,7 @@ type
   {$REGION 'Internal Declarations'}
   private class var
     FOnCapture: TCrashFreezeCaptureEvent;
+    FOnExtendCapture: TCrashFreezeExtendCaptureEvent;
     FOnExternalSuppress: TFunc<Boolean>;
   {$ENDREGION 'Internal Declarations'}
   public
@@ -120,6 +126,9 @@ type
 
     { Receives the captured report (watchdog thread). Set by Crash.Reporter. }
     class property OnCapture: TCrashFreezeCaptureEvent read FOnCapture write FOnCapture;
+
+    class property OnExtendCapture: TCrashFreezeExtendCaptureEvent
+      read FOnExtendCapture write FOnExtendCapture;
 
     { Extra suppression probe polled by the watchdog (True = mute detection).
       Crash.Reporter points it at its report-in-flight flag so a crash
@@ -213,6 +222,13 @@ begin
     end
     else if Length(Report.CallStack) > 0 then
       Report.ExceptionLocation := Report.CallStack[0];
+    if Assigned(TCrashFreeze.OnExtendCapture) then
+    try
+      TCrashFreeze.OnExtendCapture(Report);
+    except
+      // Extended diagnostics are optional and must not lose the primary freeze.
+      Report.ExtendedThreads := nil;
+    end;
   finally
     TCrashCapture.LeaveReportGate;
   end;

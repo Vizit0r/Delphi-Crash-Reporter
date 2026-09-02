@@ -325,6 +325,7 @@ type
     Methods, Details, Stack, Address, Module, Offset,
     Source, AUnit, AClass, AProcedure, Line: String;
   end;
+  TRenderedStack = TArray<TRenderedFrame>;
 
 function RenderFrame(const AEntry: TCrashStackEntry; AIndex, ATotal: Integer): TRenderedFrame;
 var
@@ -577,13 +578,83 @@ var
   UpSecs: Int64;
   Loc: TCrashStackEntry;
   Stack: TCrashStack;
-  Rendered: TArray<TRenderedFrame>;
-  I: Integer;
+  RenderedStacks: TArray<TRenderedStack>;
+  I, J: Integer;
   MaxMethods, MaxDetails, MaxStack, MaxAddress, MaxModule, MaxOffset: Integer;
   MaxSource, MaxUnit, MaxClass, MaxProc, MaxLine: Integer;
   TotalRowLen: Integer;
   ContentWidth: Integer;
+  RequiredContentWidth, CurrentContentWidth: Integer;
   ThreadIDStr: String;
+
+  procedure RenderAndNormalizeStack(const AStack: TCrashStack;
+    var ARendered: TRenderedStack);
+  const
+    FakeNameThreshold = 3;
+  var
+    NameCounts: TDictionary<String, Integer>;
+    SeenAddrs: TDictionary<String, Boolean>;
+    Cnt, K: Integer;
+    Key: String;
+  begin
+    SetLength(ARendered, Length(AStack));
+    for K := 0 to High(AStack) do
+      ARendered[K] := RenderFrame(AStack[K], K, Length(AStack));
+    if Length(ARendered) < FakeNameThreshold then
+      Exit;
+
+    // Anti-fake-symbol is deliberately scoped to one thread. The same genuine
+    // routine appearing in several independent stacks is not dladdr clamping.
+    NameCounts := TDictionary<String, Integer>.Create;
+    SeenAddrs := TDictionary<String, Boolean>.Create;
+    try
+      for K := 0 to High(ARendered) do
+        if (ARendered[K].AProcedure <> '') and
+           (not AStack[K].NameTrusted) then
+        begin
+          Key := ARendered[K].AUnit + '|' + ARendered[K].AClass + '|' +
+            ARendered[K].AProcedure;
+          if SeenAddrs.TryAdd(Key + '|' + ARendered[K].Address, True) then
+          begin
+            if NameCounts.TryGetValue(Key, Cnt) then
+              NameCounts[Key] := Cnt + 1
+            else
+              NameCounts.Add(Key, 1);
+          end;
+        end;
+      for K := 0 to High(ARendered) do
+      begin
+        if (ARendered[K].AProcedure = '') or AStack[K].NameTrusted then
+          Continue;
+        Key := ARendered[K].AUnit + '|' + ARendered[K].AClass + '|' +
+          ARendered[K].AProcedure;
+        if NameCounts[Key] >= FakeNameThreshold then
+        begin
+          ARendered[K].Source := '';
+          ARendered[K].AUnit := '';
+          ARendered[K].AClass := '';
+          ARendered[K].AProcedure := '';
+          ARendered[K].Line := '';
+        end;
+      end;
+    finally
+      SeenAddrs.Free;
+      NameCounts.Free;
+    end;
+  end;
+
+  function ThreadStateComment(const AState: TCrashThreadCaptureState): String;
+  begin
+    case AState of
+      ctcsTimedOut: Result := 'Extended capture timed out';
+      ctcsThreadGone: Result := 'Thread exited during extended capture';
+      ctcsSignalUnavailable: Result := 'Extended capture signal unavailable';
+      ctcsBudgetExceeded: Result := 'Extended capture budget exceeded';
+      ctcsCaptureFailed: Result := 'Extended capture failed';
+    else
+      Result := '';
+    end;
+  end;
 
   procedure UpdateMax(var AMax: Integer; const S: String);
   begin
@@ -720,69 +791,14 @@ begin
     // Viewer treats the first "-<CRLF>|" table as the report's structural anchor
     // (ELogManager ParseBuffer / GetItem_Generals); without it the file fails the
     // load gate and the remaining tabs mis-parse.
-    // Pre-render each frame to compute max widths over the real data.
+    // Pre-render every thread before sizing: the EL table has one shared set of
+    // column widths, while anti-fake-symbol normalization stays per stack.
+    SetLength(RenderedStacks, Length(AReport.ExtendedThreads) + 1);
     Stack := AReport.CallStack;
-    SetLength(Rendered, Length(Stack));
-    for I := 0 to High(Stack) do
-      Rendered[I] := RenderFrame(Stack[I], I, Length(Stack));
-
-    // ===== Anti-fake-symbol pass (macOS Mach-O dladdr clamping) =====
-    // On macOS dladdr returns the nearest exported symbol even if it is far away
-    // - Mach-O default exports are narrow (SignalConverter/_main/@DbgExcNotify/...).
-    // The same routine name on N frames is a clear sign of clamping: those
-    // "names" are lies. We clear Source/Unit/Class/Procedure for clamped frames
-    // so they aren't mistaken for real ones. Module + Offset stay - they resolve
-    // via `atos -o <exe> 0x<addr>` on a dev machine.
-    //
-    // Threshold: 3 DISTINCT code addresses per full symbol identity
-    // (unit|class|procedure - TFoo.Create and TBar.Create stay apart). Genuine
-    // recursion repeats the same return address (1-2 distinct entries), while
-    // dladdr clamping spreads one export name over many unrelated addresses -
-    // only the latter is fake. Trusted names (NameTrusted: LC_SYMTAB / .gosym)
-    // are exempt entirely - genuine recursion must keep its name.
-    const FakeNameThreshold = 3;
-    if Length(Rendered) >= FakeNameThreshold then
-    begin
-      var NameCounts := TDictionary<String, Integer>.Create;
-      var SeenAddrs := TDictionary<String, Boolean>.Create;
-      try
-        var Cnt: Integer;
-        var Key: String;
-        for I := 0 to High(Rendered) do
-          if (Rendered[I].AProcedure <> '') and (not Stack[I].NameTrusted) then
-          begin
-            Key := Rendered[I].AUnit + '|' + Rendered[I].AClass + '|' +
-              Rendered[I].AProcedure;
-            if SeenAddrs.TryAdd(Key + '|' + Rendered[I].Address, True) then
-            begin
-              if NameCounts.TryGetValue(Key, Cnt) then
-                NameCounts[Key] := Cnt + 1
-              else
-                NameCounts.Add(Key, 1);
-            end;
-          end;
-        for I := 0 to High(Rendered) do
-        begin
-          if (Rendered[I].AProcedure = '') or Stack[I].NameTrusted then Continue;
-          Key := Rendered[I].AUnit + '|' + Rendered[I].AClass + '|' +
-            Rendered[I].AProcedure;
-          if NameCounts[Key] >= FakeNameThreshold then
-          begin
-            Rendered[I].Source     := '';
-            Rendered[I].AUnit      := '';
-            Rendered[I].AClass     := '';
-            Rendered[I].AProcedure := '';
-            // Line holds the routine-offset proxy "+$N" on Linux/Windows when
-            // there is no real LineNumber. Without AProcedure that delta is
-            // meaningless too - the base address is already wrong.
-            Rendered[I].Line       := '';
-          end;
-        end;
-      finally
-        SeenAddrs.Free;
-        NameCounts.Free;
-      end;
-    end;
+    RenderAndNormalizeStack(Stack, RenderedStacks[0]);
+    for I := 0 to High(AReport.ExtendedThreads) do
+      RenderAndNormalizeStack(AReport.ExtendedThreads[I].CallStack,
+        RenderedStacks[I + 1]);
 
     // Init max widths from captions (like EL CalculateLengths).
     MaxMethods   := Length(CapMethods);
@@ -803,20 +819,50 @@ begin
     MaxLine      := Length(CapLine);
 
     // Grow by data.
-    for I := 0 to High(Rendered) do
+    for J := 0 to High(RenderedStacks) do
+      for I := 0 to High(RenderedStacks[J]) do
+      begin
+        UpdateMax(MaxMethods, RenderedStacks[J][I].Methods);
+        UpdateMax(MaxDetails, RenderedStacks[J][I].Details);
+        UpdateMax(MaxStack,   RenderedStacks[J][I].Stack);
+        UpdateMax(MaxAddress, RenderedStacks[J][I].Address);
+        UpdateMax(MaxModule,  RenderedStacks[J][I].Module);
+        UpdateMax(MaxOffset,  RenderedStacks[J][I].Offset);
+        UpdateMax(MaxSource,  RenderedStacks[J][I].Source);
+        UpdateMax(MaxUnit,    RenderedStacks[J][I].AUnit);
+        UpdateMax(MaxClass,   RenderedStacks[J][I].AClass);
+        UpdateMax(MaxProc,    RenderedStacks[J][I].AProcedure);
+        UpdateMax(MaxLine,    RenderedStacks[J][I].Line);
+      end;
+
+    RequiredContentWidth := Length('*Exception Thread: ID=' +
+      IntToStr(ACtx.ThreadID) + '; Parent=0; Priority=0');
+    if Length('Class=; Name=' + ACtx.ThreadName) > RequiredContentWidth then
+      RequiredContentWidth := Length('Class=; Name=' + ACtx.ThreadName);
+    for I := 0 to High(AReport.ExtendedThreads) do
     begin
-      UpdateMax(MaxMethods, Rendered[I].Methods);
-      UpdateMax(MaxDetails, Rendered[I].Details);
-      UpdateMax(MaxStack,   Rendered[I].Stack);
-      UpdateMax(MaxAddress, Rendered[I].Address);
-      UpdateMax(MaxModule,  Rendered[I].Module);
-      UpdateMax(MaxOffset,  Rendered[I].Offset);
-      UpdateMax(MaxSource,  Rendered[I].Source);
-      UpdateMax(MaxUnit,    Rendered[I].AUnit);
-      UpdateMax(MaxClass,   Rendered[I].AClass);
-      UpdateMax(MaxProc,    Rendered[I].AProcedure);
-      UpdateMax(MaxLine,    Rendered[I].Line);
+      if Length('Running Thread: ID=' +
+           UIntToStr(Cardinal(AReport.ExtendedThreads[I].ThreadID)) +
+           '; Parent=0; Priority=0') > RequiredContentWidth then
+        RequiredContentWidth := Length('Running Thread: ID=' +
+          UIntToStr(Cardinal(AReport.ExtendedThreads[I].ThreadID)) +
+          '; Parent=0; Priority=0');
+      if Length('Class=; Name=' + AReport.ExtendedThreads[I].Name) >
+         RequiredContentWidth then
+        RequiredContentWidth := Length('Class=; Name=' +
+          AReport.ExtendedThreads[I].Name);
+      if Length('Comment=' +
+           ThreadStateComment(AReport.ExtendedThreads[I].State)) >
+         RequiredContentWidth then
+        RequiredContentWidth := Length('Comment=' +
+          ThreadStateComment(AReport.ExtendedThreads[I].State));
     end;
+
+    CurrentContentWidth := MaxMethods + MaxDetails + MaxStack + MaxAddress +
+      MaxModule + MaxOffset + MaxSource + MaxUnit + MaxClass + MaxProc +
+      MaxLine + 10;
+    if RequiredContentWidth > CurrentContentWidth then
+      Inc(MaxProc, RequiredContentWidth - CurrentContentWidth);
 
     // Full row width = sum(widths) + 12 pipes (1 leading + 10 between + 1 trailing).
     TotalRowLen := MaxMethods + MaxDetails + MaxStack + MaxAddress + MaxModule +
@@ -843,7 +889,8 @@ begin
     SB.Append(CRLF);
     SB.Append(StringOfChar('-', TotalRowLen)); SB.Append(CRLF);
 
-    // Per-thread block. We have one thread - the one where the raise happened.
+    // Primary thread stays byte-for-byte compatible with the single-thread
+    // format. Optional running-thread blocks follow in registration order.
     ThreadIDStr := IntToStr(ACtx.ThreadID);
     AppendFullWidthLine(SB, '*Exception Thread: ID=' + ThreadIDStr + '; Parent=0; Priority=0');
     AppendFullWidthLine(SB, 'Class=; Name=' + ACtx.ThreadName);
@@ -852,13 +899,36 @@ begin
     // Internal thread separator: `|<dashes>|`
     SB.Append('|'); SB.Append(StringOfChar('-', ContentWidth)); SB.Append('|'); SB.Append(CRLF);
     // Data rows.
-    for I := 0 to High(Rendered) do
+    for I := 0 to High(RenderedStacks[0]) do
     begin
-      SB.Append(FormatRow(Rendered[I]));
+      SB.Append(FormatRow(RenderedStacks[0][I]));
       SB.Append(CRLF);
     end;
     // Thread-block closing separator (with pipes - inside the thread block).
     SB.Append('|'); SB.Append(StringOfChar('-', ContentWidth)); SB.Append('|'); SB.Append(CRLF);
+    for J := 0 to High(AReport.ExtendedThreads) do
+    begin
+      // EL's multi-thread layout separates blocks with a real full-width blank
+      // row. Do not use a bare CRLF: the Viewer still considers us in-table.
+      AppendFullWidthLine(SB, '');
+      AppendFullWidthLine(SB, 'Running Thread: ID=' +
+        UIntToStr(Cardinal(AReport.ExtendedThreads[J].ThreadID)) +
+        '; Parent=0; Priority=0');
+      AppendFullWidthLine(SB, 'Class=; Name=' +
+        AReport.ExtendedThreads[J].Name);
+      AppendFullWidthLine(SB, 'DeadLock=0; Wait Chain=');
+      AppendFullWidthLine(SB, 'Comment=' +
+        ThreadStateComment(AReport.ExtendedThreads[J].State));
+      SB.Append('|'); SB.Append(StringOfChar('-', ContentWidth));
+      SB.Append('|'); SB.Append(CRLF);
+      for I := 0 to High(RenderedStacks[J + 1]) do
+      begin
+        SB.Append(FormatRow(RenderedStacks[J + 1][I]));
+        SB.Append(CRLF);
+      end;
+      SB.Append('|'); SB.Append(StringOfChar('-', ContentWidth));
+      SB.Append('|'); SB.Append(CRLF);
+    end;
     // Table-end separator: dashes WITHOUT pipes, length = TotalRowLen. The EL
     // Viewer looks for exactly this pattern to detect "Call Stack finished".
     // Without it the Viewer tries to parse the next section as a continuation of

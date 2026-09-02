@@ -20,6 +20,7 @@
 uses
   System.SysUtils,
   System.Classes,
+  System.SyncObjs,
   {$IF Defined(LINUX)}
   Posix.SysMman,
   {$ENDIF}
@@ -31,6 +32,39 @@ uses
 var
   { Process start, for the 'fpe' divisor below. }
   GProcessStart: TDateTime;
+  GExtendedWorkerReady: Integer;
+  GExtendedWorkerStop: Integer;
+
+function StartExtendedWorker: TThread;
+begin
+  TInterlocked.Exchange(GExtendedWorkerReady, 0);
+  TInterlocked.Exchange(GExtendedWorkerStop, 0);
+  Result := TThread.CreateAnonymousThread(
+    procedure
+    begin
+      TCrashReporter.RegisterCurrentThread('ExtendedDemoWorker');
+      TInterlocked.Exchange(GExtendedWorkerReady, 1);
+      try
+        while TInterlocked.CompareExchange(GExtendedWorkerStop, 0, 0) = 0 do
+          TThread.Sleep(10);
+      finally
+        TCrashReporter.UnregisterCurrentThread;
+      end;
+    end);
+  Result.FreeOnTerminate := False;
+  Result.Start;
+  while TInterlocked.CompareExchange(GExtendedWorkerReady, 0, 0) = 0 do
+    TThread.Sleep(1);
+end;
+
+procedure StopExtendedWorker(var AWorker: TThread);
+begin
+  if AWorker = nil then
+    Exit;
+  TInterlocked.Exchange(GExtendedWorkerStop, 1);
+  AWorker.WaitFor;
+  FreeAndNil(AWorker);
+end;
 
 function BurnStack(N: Integer): Integer;
 // Unbounded recursion with a fat frame (4 KB) - exhausts an 8 MB stack in ~2000
@@ -169,6 +203,8 @@ var
   Filter:   String;
   DoWait:   Boolean;
   DoFreeze: Boolean;
+  DoExtended: Boolean;
+  ExtendedWorker: TThread;
   Arg:      String;
   I:        Integer;
   Notice:   TCrashRestartNotice;
@@ -179,6 +215,8 @@ begin
   Filter := '';
   DoWait := False;
   DoFreeze := False;
+  DoExtended := False;
+  ExtendedWorker := nil;
   for I := 1 to ParamCount do
   begin
     Arg := ParamStr(I);
@@ -191,7 +229,9 @@ begin
     else if Arg = '--wait' then
       DoWait := True
     else if Arg = '--freeze' then
-      DoFreeze := True;
+      DoFreeze := True
+    else if Arg = '--extended' then
+      DoExtended := True;
   end;
 
   Cfg := DefaultCrashConfig;
@@ -203,6 +243,7 @@ begin
   // delivery paths so marker/deferred-upload behavior can be smoke-tested.
   Cfg.UploadUrl       := GetEnvironmentVariable('CRASH_DEMO_UPLOAD_URL');
   Cfg.UploadEnabled   := Cfg.UploadUrl <> '';
+  Cfg.ExtendedThreads := DoExtended;
 
   if DoFreeze then
   begin
@@ -245,6 +286,16 @@ begin
 
   TCrashReporter.Init(Cfg);
   TCrashReporter.SurfacePendingToStderr;
+  if DoExtended then
+  begin
+    ExtendedWorker := StartExtendedWorker;
+    with TCrashReporter.GetStatus do
+      Writeln(ErrOutput, Format(
+        'CrashDemo: extended threads enabled=%s available=%s registered=%d',
+        [BoolToStr(ExtendedThreadsEnabled, True),
+         BoolToStr(ExtendedThreadsAvailable, True), RegisteredThreadCount]));
+    Flush(ErrOutput);
+  end;
 
   // Restart notice from a previous freeze-restarted run (any mode: the child
   // of a --freeze run comes back with the same argv).
@@ -297,7 +348,8 @@ begin
   begin
     Writeln('CrashDemo - Crash Reporter standalone smoke test.');
     Writeln('Usage: CrashDemo [--crash=segv|fpe|callbad|callhigh|stackoverflow|raise|stale|foreign]');
-    Writeln('                 [--filter=drop|byclass] [--wait] [--freeze]');
+    Writeln('                 [--filter=drop|byclass] [--wait] [--freeze] [--extended]');
     Writeln('Reporter Active = ', BoolToStr(TCrashReporter.Active, True));
   end;
+  StopExtendedWorker(ExtendedWorker);
 end.

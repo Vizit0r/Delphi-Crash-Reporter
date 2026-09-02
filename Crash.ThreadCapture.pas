@@ -72,6 +72,16 @@ function CrashThreadCaptureCurrentSignalBlocked: Boolean;
 function CrashThreadCaptureTestIdentityMatches(
   const AHandle: TCrashThreadCaptureHandle;
   const APThread, AKernelThread: UInt64): Boolean;
+function CrashThreadCaptureTestSetKernelIdentity(
+  const AHandle: TCrashThreadCaptureHandle;
+  const AKernelThread: UInt64): Boolean;
+function CrashThreadCaptureTestQuarantine(
+  const AHandle: TCrashThreadCaptureHandle): Boolean;
+function CrashThreadCaptureTestLiveSlotCount: Integer;
+function CrashThreadCaptureTestLiveSlotSummary: String;
+function CrashThreadCaptureTestResetQuarantined(
+  const AHandle: TCrashThreadCaptureHandle): Boolean;
+procedure CrashThreadCaptureTestResetAllQuarantined;
 {$ENDIF}
 
 implementation
@@ -122,7 +132,6 @@ type
     State: Integer;       // atomic SLOT_* state; published after identity fields
     Closing: Integer;     // atomic: no new request may arm this slot
     OwnerRefs: Integer;   // calm path, protected by GServiceLock
-    Generation: Integer;  // calm producer generation; not a late-signal token
     PThreadIdent: UInt64;
     KernelIdent: UInt64;
     InterruptedIP: UInt64;
@@ -277,7 +286,6 @@ begin
   TInterlocked.Exchange(ASlot.State, SLOT_FREE);
   ASlot.Closing := 0;
   ASlot.OwnerRefs := 0;
-  ASlot.Generation := 0;
   ASlot.PThreadIdent := 0;
   ASlot.KernelIdent := 0;
   ASlot.InterruptedIP := 0;
@@ -421,6 +429,16 @@ begin
   end;
 end;
 
+function HasLiveSlots: Boolean;
+var
+  I: Integer;
+begin
+  for I := 0 to High(GSlots) do
+    if SlotState(@GSlots[I]) <> SLOT_FREE then
+      Exit(True);
+  Result := False;
+end;
+
 function CrashThreadCaptureAcquire: Boolean;
 var
   Action: sigaction_t;
@@ -436,6 +454,23 @@ begin
       begin
         Inc(GAcquireCount);
         Exit(TInterlocked.CompareExchange(GActive, 0, 0) <> 0);
+      end;
+
+      // A contract-violating release with live/quarantined slots deliberately
+      // keeps our disposition installed: a delayed pending RT signal must not
+      // hit SIG_DFL. A later acquire reuses that retained handler instead of
+      // saving our own action as the "previous" disposition.
+      if GHavePrevAction and (GCaptureSignal >= 0) then
+      begin
+        FillChar(Action, SizeOf(Action), 0);
+        if (sigaction(GCaptureSignal, nil, @Action) = 0) and
+           ActionIsOurs(Action) then
+        begin
+          GAcquireCount := 1;
+          TInterlocked.Exchange(GActive, 1);
+          Exit(True);
+        end;
+        Exit;
       end;
 
       Sig := ChooseCaptureSignal;
@@ -468,6 +503,7 @@ procedure CrashThreadCaptureRelease;
 var
   Current: sigaction_t;
   Refresh: TCrashThreadCaptureSignalRefreshProc;
+  LiveSlots: Boolean;
 begin
   GCoordinatorLock.Enter;
   try
@@ -479,7 +515,8 @@ begin
       if GAcquireCount > 0 then
         Exit;
 
-      if GHavePrevAction then
+      LiveSlots := HasLiveSlots;
+      if GHavePrevAction and (not LiveSlots) then
       begin
         GHavePrevAction := False;
         FillChar(Current, SizeOf(Current), 0);
@@ -488,7 +525,8 @@ begin
           sigaction(GCaptureSignal, @GPrevAction, nil);
       end;
       TInterlocked.Exchange(GActive, 0);
-      GCaptureSignal := -1;
+      if not LiveSlots then
+        GCaptureSignal := -1;
       Refresh := GRefreshProc;
     finally
       GServiceLock.Leave;
@@ -567,12 +605,17 @@ function CrashThreadCaptureRegisterCurrentThread(
   out AHandle: TCrashThreadCaptureHandle): Boolean;
 var
   Identity: TCrashThreadNativeIdentity;
-  Collision, Slot: PCrashThreadCaptureSlot;
-  I: Integer;
+  Collisions: array [0..CRASH_THREAD_CAPTURE_SLOT_COUNT - 1] of
+    PCrashThreadCaptureSlot;
+  Existing, Slot: PCrashThreadCaptureSlot;
+  CollisionCount, I, J: Integer;
   Drained: Boolean;
+  WasCollision, ExistingQuarantined: Boolean;
 begin
   Result := False;
   AHandle := nil;
+  Drained := False;
+  ExistingQuarantined := False;
   if not CrashThreadCaptureAvailable then
     Exit;
   Identity := CrashCurrentThreadNativeIdentity;
@@ -581,7 +624,8 @@ begin
 
   GCoordinatorLock.Enter;
   try
-    Collision := nil;
+    Existing := nil;
+    CollisionCount := 0;
     GServiceLock.Enter;
     try
       for I := 0 to High(GSlots) do
@@ -590,29 +634,62 @@ begin
         begin
           if GSlots[I].KernelIdent = Identity.KernelThread then
           begin
-            Inc(GSlots[I].OwnerRefs);
-            AHandle := @GSlots[I];
-            Exit(True);
+            Existing := @GSlots[I];
+            ExistingQuarantined :=
+              SlotState(Existing) = SLOT_QUARANTINED;
+            Continue;
           end;
-          Collision := @GSlots[I];
-          TInterlocked.Exchange(Collision.Closing, 1);
-          TInterlocked.Exchange(Collision.State, SLOT_QUARANTINED);
-          Break;
+          Collisions[CollisionCount] := @GSlots[I];
+          Inc(CollisionCount);
+          TInterlocked.Exchange(GSlots[I].Closing, 1);
+          TInterlocked.Exchange(GSlots[I].State, SLOT_QUARANTINED);
         end;
+      if Existing <> nil then
+        Inc(Existing.OwnerRefs);
     finally
       GServiceLock.Leave;
     end;
 
-    if Collision <> nil then
+    if CollisionCount > 0 then
     begin
       Drained := DrainCurrentPendingSignal(CrashThreadCaptureSignalNumber);
       GServiceLock.Enter;
       try
         if Drained then
-          ResetSlot(Collision);
+          for I := 0 to CollisionCount - 1 do
+            ResetSlot(Collisions[I]);
       finally
         GServiceLock.Leave;
       end;
+    end;
+
+    if ExistingQuarantined then
+    begin
+      // A repeated registration is made by the same verified owner. It can
+      // safely drain its own late signal and make a fail-safe quarantined slot
+      // eligible again without changing the stable handle or owner refs.
+      if DrainCurrentPendingSignal(CrashThreadCaptureSignalNumber) then
+      begin
+        GServiceLock.Enter;
+        try
+          if (SlotState(Existing) = SLOT_QUARANTINED) and
+             SlotMatchesIdentity(Existing, Identity) then
+          begin
+            TInterlocked.Exchange(Existing.Closing, 0);
+            Existing.InterruptedIP := 0;
+            Existing.Count := 0;
+            TInterlocked.Exchange(Existing.State, SLOT_IDLE);
+          end;
+        finally
+          GServiceLock.Leave;
+        end;
+      end;
+    end;
+
+    if Existing <> nil then
+    begin
+      AHandle := Existing;
+      Exit(True);
     end;
 
     GServiceLock.Enter;
@@ -623,14 +700,28 @@ begin
       for I := 0 to High(GSlots) do
         if SlotState(@GSlots[I]) = SLOT_FREE then
         begin
-          Slot := @GSlots[I];
-          Break;
+          WasCollision := False;
+          for J := 0 to CollisionCount - 1 do
+            if Collisions[J] = @GSlots[I] then
+            begin
+              WasCollision := True;
+              Break;
+            end;
+          if not WasCollision then
+          begin
+            Slot := @GSlots[I];
+            Break;
+          end;
         end;
+      // Under complete slot pressure, reusing a safely drained collision is
+      // preferable to failing registration. Normally a collision gets a
+      // distinct handle, which also makes stale-handle bugs observable.
+      if (Slot = nil) and (CollisionCount > 0) and Drained then
+        Slot := Collisions[0];
       if Slot = nil then
         Exit;
       Slot.Closing := 0;
       Slot.OwnerRefs := 1;
-      Slot.Generation := 0;
       Slot.PThreadIdent := Identity.PThread;
       Slot.KernelIdent := Identity.KernelThread;
       Slot.InterruptedIP := 0;
@@ -777,7 +868,6 @@ begin
     if State <> SLOT_IDLE then
       Exit(tcoFailed);
 
-    Inc(Slot.Generation);
     Slot.InterruptedIP := 0;
     Slot.Count := 0;
     TInterlocked.Exchange(Slot.State, SLOT_ARMED);
@@ -863,6 +953,137 @@ begin
   Result := (Slot <> nil) and (SlotState(Slot) <> SLOT_FREE) and
     SlotMatchesIdentity(Slot, Identity);
 end;
+
+function CrashThreadCaptureTestSetKernelIdentity(
+  const AHandle: TCrashThreadCaptureHandle;
+  const AKernelThread: UInt64): Boolean;
+var
+  Slot: PCrashThreadCaptureSlot;
+begin
+  Result := False;
+  GCoordinatorLock.Enter;
+  try
+    GServiceLock.Enter;
+    try
+      Slot := SlotFromHandle(AHandle);
+      if (Slot = nil) or (SlotState(Slot) = SLOT_FREE) then
+        Exit;
+      Slot.KernelIdent := AKernelThread;
+      Result := True;
+    finally
+      GServiceLock.Leave;
+    end;
+  finally
+    GCoordinatorLock.Leave;
+  end;
+end;
+
+function CrashThreadCaptureTestQuarantine(
+  const AHandle: TCrashThreadCaptureHandle): Boolean;
+var
+  Slot: PCrashThreadCaptureSlot;
+begin
+  Result := False;
+  GCoordinatorLock.Enter;
+  try
+    GServiceLock.Enter;
+    try
+      Slot := SlotFromHandle(AHandle);
+      if (Slot = nil) or (SlotState(Slot) = SLOT_FREE) then
+        Exit;
+      TInterlocked.Exchange(Slot.Closing, 1);
+      TInterlocked.Exchange(Slot.State, SLOT_QUARANTINED);
+      Result := True;
+    finally
+      GServiceLock.Leave;
+    end;
+  finally
+    GCoordinatorLock.Leave;
+  end;
+end;
+
+function CrashThreadCaptureTestLiveSlotCount: Integer;
+var
+  I: Integer;
+begin
+  Result := 0;
+  GServiceLock.Enter;
+  try
+    for I := 0 to High(GSlots) do
+      if SlotState(@GSlots[I]) <> SLOT_FREE then
+        Inc(Result);
+  finally
+    GServiceLock.Leave;
+  end;
+end;
+
+function CrashThreadCaptureTestLiveSlotSummary: String;
+var
+  I: Integer;
+begin
+  Result := '';
+  GServiceLock.Enter;
+  try
+    for I := 0 to High(GSlots) do
+      if SlotState(@GSlots[I]) <> SLOT_FREE then
+      begin
+        if Result <> '' then
+          Result := Result + '; ';
+        Result := Result + Format('%d=state%d/ref%d/p%x/k%x',
+          [I, SlotState(@GSlots[I]), GSlots[I].OwnerRefs,
+           GSlots[I].PThreadIdent, GSlots[I].KernelIdent]);
+      end;
+  finally
+    GServiceLock.Leave;
+  end;
+end;
+
+function CrashThreadCaptureTestResetQuarantined(
+  const AHandle: TCrashThreadCaptureHandle): Boolean;
+var
+  Slot: PCrashThreadCaptureSlot;
+begin
+  Result := False;
+  GCoordinatorLock.Enter;
+  try
+    GServiceLock.Enter;
+    try
+      Slot := SlotFromHandle(AHandle);
+      if Slot = nil then
+        Exit;
+      if SlotState(Slot) = SLOT_FREE then
+        Exit(True);
+      if (SlotState(Slot) <> SLOT_QUARANTINED) or
+         (TInterlocked.CompareExchange(Slot.Closing, 0, 0) = 0) then
+        Exit;
+      ResetSlot(Slot);
+      Result := True;
+    finally
+      GServiceLock.Leave;
+    end;
+  finally
+    GCoordinatorLock.Leave;
+  end;
+end;
+
+procedure CrashThreadCaptureTestResetAllQuarantined;
+var
+  I: Integer;
+begin
+  GCoordinatorLock.Enter;
+  try
+    GServiceLock.Enter;
+    try
+      for I := 0 to High(GSlots) do
+        if SlotState(@GSlots[I]) = SLOT_QUARANTINED then
+          ResetSlot(@GSlots[I]);
+    finally
+      GServiceLock.Leave;
+    end;
+  finally
+    GCoordinatorLock.Leave;
+  end;
+end;
 {$ENDIF}
 
 procedure ForceShutdown;
@@ -873,7 +1094,7 @@ begin
   try
     GServiceLock.Enter;
     try
-      if GHavePrevAction then
+      if GHavePrevAction and (not HasLiveSlots) then
       begin
         GHavePrevAction := False;
         FillChar(Current, SizeOf(Current), 0);
@@ -948,6 +1169,33 @@ function CrashThreadCaptureTestIdentityMatches(
   const APThread, AKernelThread: UInt64): Boolean;
 begin
   Result := False;
+end;
+function CrashThreadCaptureTestSetKernelIdentity(
+  const AHandle: TCrashThreadCaptureHandle;
+  const AKernelThread: UInt64): Boolean;
+begin
+  Result := False;
+end;
+function CrashThreadCaptureTestQuarantine(
+  const AHandle: TCrashThreadCaptureHandle): Boolean;
+begin
+  Result := False;
+end;
+function CrashThreadCaptureTestLiveSlotCount: Integer;
+begin
+  Result := 0;
+end;
+function CrashThreadCaptureTestLiveSlotSummary: String;
+begin
+  Result := '';
+end;
+function CrashThreadCaptureTestResetQuarantined(
+  const AHandle: TCrashThreadCaptureHandle): Boolean;
+begin
+  Result := False;
+end;
+procedure CrashThreadCaptureTestResetAllQuarantined;
+begin
 end;
 {$ENDIF}
 

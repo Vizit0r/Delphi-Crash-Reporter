@@ -94,6 +94,24 @@ type
   );
 
 type
+  TCrashThreadCaptureState = (
+    ctcsCaptured,
+    ctcsTimedOut,
+    ctcsThreadGone,
+    ctcsSignalUnavailable,
+    ctcsBudgetExceeded,
+    ctcsCaptureFailed
+  );
+
+  { One optional application-thread block appended to the EL call-stack table.
+    Failure states are explicit and keep CallStack empty. }
+  TCrashThreadStack = record
+    ThreadID: UInt64;
+    Name: String;
+    State: TCrashThreadCaptureState;
+    CallStack: TCrashStack;
+  end;
+
   { A captured exception report: message, fault location, full call stack, and
     which hook fired. A plain value type - no interface, no refcounting. }
   TCrashReport = record
@@ -101,6 +119,8 @@ type
     ExceptionClassName: String;
     ExceptionLocation: TCrashStackEntry;
     CallStack: TCrashStack;
+    ExtendedThreads: TArray<TCrashThreadStack>;
+    ExtendedThreadsOmitted: Integer;
     Source: TCrashSource;
     { Freeze-watchdog report (Crash.Freeze): the stack is a SAMPLE of a running
       thread, not a raise point - BugID generation uses the freeze
