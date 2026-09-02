@@ -14,6 +14,7 @@ uses
   Crash.Breadcrumbs in '..\..\Crash.Breadcrumbs.pas',
   Crash.RawFallback in '..\..\Crash.RawFallback.pas',
   Crash.Signals in '..\..\Crash.Signals.pas',
+  Crash.ThreadCapture in '..\..\Crash.ThreadCapture.pas',
   Crash.ELFormat in '..\..\Crash.ELFormat.pas',
   Crash.CallStack in '..\..\Crash.CallStack.pas',
   Crash.Freeze in '..\..\Crash.Freeze.pas',

@@ -12,11 +12,10 @@ unit Crash.Freeze;
       monotonic time since the last ping against the configured timeout.
       Detection arms only after the FIRST ping, so a long cold start (data
       files, script compilation) can never count as a freeze.
-    - On timeout the watchdog captures the frozen thread's stack IN PLACE:
-      pthread_kill with a dedicated realtime signal; the handler runs ON the
-      frozen thread, walks the stack with _Unwind_Backtrace into a
-      pre-allocated slot (no allocations inside the handler) and publishes it
-      atomically. The watchdog symbolizes the addresses and hands a ready
+    - On timeout the watchdog asks Crash.ThreadCapture to capture the frozen
+      thread's stack IN PLACE. Its process-global signal handler runs ON the
+      frozen thread, walks the stack into a pre-allocated per-thread slot and
+      publishes it atomically. The watchdog symbolizes the addresses and hands a ready
       TCrashReport (class EFrozenApplication) to OnCapture - wired by
       Crash.Reporter, which formats/writes/uploads the .el on the WATCHDOG
       thread (a healthy thread: no async-signal-safety constraints there).
@@ -136,192 +135,37 @@ implementation
   {$DEFINE CRASH_FREEZECAP}
 {$ENDIF}
 
-// bionic shares glibc's realtime-signal probes and sigaction union layout -
-// the platform branches below select on this combined symbol (macOS keeps
-// its own branches). Mirrors CRASH_LINUXLIKE in Crash.Signals.
-{$IF Defined(LINUX) or Defined(ANDROID)}
-  {$DEFINE CRASH_FREEZE_LINUXLIKE}
-{$ENDIF}
-
 {$IF Defined(CRASH_FREEZECAP)}
 
 uses
   System.Classes,
   System.SyncObjs,
   System.Math,
-  Posix.Base,
-  Posix.SysTypes, // pthread_t
-  Posix.Signal,
-  Posix.Pthread,
-  Crash.Signals; // CrashContextInstructionPointer
+  Crash.ThreadCapture;
 
 const
-  FREEZE_MAX_FRAMES    = 64;   // raw unwind slots (handler/trampoline frames included)
   CAPTURE_WAIT_MS      = 2000; // how long the watchdog waits for the handler to publish
   CHECK_QUANTUM_MS     = 250;  // watchdog poll period (detection latency <= timeout + quantum)
   MIN_TIMEOUT_MS       = 1000;
   MAX_EPISODES_PER_RUN = 5;    // report-noise cap; later episodes are detected but silent
 
-{ In-handler stack walk, per platform - same choices as Crash.CallStack
-  (glibc's backtrace() emits garbage IPs for deep stacks, so Linux goes over
-  libgcc; Android64 links the NDK libunwind; macOS backtrace is fine).
-  Declarations duplicated here because they are implementation-local there
-  and this handler needs a NO-ALLOCATION variant writing into a
-  pre-allocated slot. }
-{$IF Defined(MACOS)}
-
-const
-  libSystem = '/usr/lib/libSystem.dylib';
-
-function backtrace(buffer: PPointer; size: Integer): Integer; cdecl;
-  external libSystem name 'backtrace';
-
-{$ELSE} // Linux x64 / Android64: _Unwind_Backtrace
-
-type
-  _PUnwind_Context = Pointer;
-  _Unwind_Ptr = UIntPtr;
-  _Unwind_Reason_code = Integer;
-
-const
-  _URC_NO_REASON    = 0;
-  _URC_END_OF_STACK = 5;
-  {$IF Defined(LINUX)}
-  LIB_UNWIND = 'libgcc_s.so.1';
-  {$ELSE}
-  LIB_UNWIND = 'libunwind.a';
-  {$ENDIF}
-
-type
-  _Unwind_Trace_Fn = function(context: _PUnwind_Context; userdata: Pointer): _Unwind_Reason_code; cdecl;
-
-procedure _Unwind_Backtrace(fn: _Unwind_Trace_Fn; userdata: Pointer); cdecl;
-  external LIB_UNWIND name '_Unwind_Backtrace';
-function _Unwind_GetIP(context: _PUnwind_Context): _Unwind_Ptr; cdecl;
-  external LIB_UNWIND name '_Unwind_GetIP';
-
-{$ENDIF}
-
-{$IF Defined(CRASH_FREEZE_LINUXLIKE)}
-{ glibc/bionic reserve the first few kernel RT signals for the runtime; the
-  usable range starts at __libc_current_sigrtmin. Raw SIGRTMIN constants
-  would collide. }
-function __libc_current_sigrtmin: Integer; cdecl;
-  external libc name _PU + '__libc_current_sigrtmin';
-function __libc_current_sigrtmax: Integer; cdecl;
-  external libc name _PU + '__libc_current_sigrtmax';
-{$ENDIF}
-
-type
-  { Capture slot, pre-allocated. Claimed/Captured follow the same atomic
-    claim-fill-publish protocol as Crash.Signals.TSignalSnapshot; the watchdog
-    is the sole consumer and re-opens the slot before each probe. }
-  TFreezeTrace = record
-    Claimed:       Integer; // atomic claim: the handler wins the slot, fills, THEN publishes
-    Captured:      Integer; // atomic publish flag: 0=empty, 1=complete (set LAST)
-    InterruptedIP: UInt64;  // exact frozen instruction (ucontext RIP)
-    Count:         Integer;
-    Addrs:         array [0..FREEZE_MAX_FRAMES - 1] of UIntPtr;
-  end;
-
 var
-  GTrace:         TFreezeTrace;
-  GWatchedThread: pthread_t;
+  GWatchedCapture: TCrashThreadCaptureHandle = nil;
   GTimeoutMS:     Int64 = 0;
   GLastPingMS:    Int64 = 0;   // TThread.GetTickCount64 (CLOCK_MONOTONIC: excludes system suspend)
   GSuppress:      Integer = 0;
   GSuspended:     Integer = 0; // host-suspended flag (see SetSuspended); separate from the nestable GSuppress
-  GFreezeSignal:  Integer = -1;
   GInstalled:     Boolean = False;
   GWatchdog:      TThread = nil;
-  GPrevAction:    sigaction_t;     // disposition before Install; Shutdown restores it (see below)
-  GHavePrevAction: Boolean = False;
-
-{$IF not Defined(MACOS)}
-function FreezeUnwindCallback(AContext: _PUnwind_Context; AUserData: Pointer): _Unwind_Reason_code; cdecl;
-begin
-  if GTrace.Count >= FREEZE_MAX_FRAMES then
-    Exit(_URC_END_OF_STACK);
-  GTrace.Addrs[GTrace.Count] := UIntPtr(_Unwind_GetIP(AContext));
-  Inc(GTrace.Count);
-  Result := _URC_NO_REASON;
-end;
-{$ENDIF}
-
-procedure CrashFreezeSignalHandler(SigNum: Integer; SigInfo: Psiginfo_t;
-  Context: Pointer); cdecl;
-// Runs ON the frozen thread, on its normal stack. Async-signal-safety: atomic
-// flag writes, a ucontext read and a stack walk into a pre-allocated slot -
-// no allocations, no formatting. The walk is the same one the exception path
-// performs in (post-)signal context on each target; it crosses the kernel
-// signal frame via its unwind info, so the trace continues into the
-// interrupted (frozen) chain - and if it does not, the watchdog still has
-// the exact interrupted IP from the ucontext (see BuildAddressList).
-begin
-  if TInterlocked.CompareExchange(GTrace.Claimed, 1, 0) <> 0 then
-    Exit;
-  GTrace.InterruptedIP := CrashContextInstructionPointer(Context);
-  {$IF Defined(MACOS)}
-  GTrace.Count := backtrace(PPointer(@GTrace.Addrs[0]), FREEZE_MAX_FRAMES);
-  if GTrace.Count < 0 then
-    GTrace.Count := 0;
-  {$ELSE}
-  GTrace.Count := 0;
-  _Unwind_Backtrace(FreezeUnwindCallback, @GTrace);
-  {$ENDIF}
-  TInterlocked.Exchange(GTrace.Captured, 1);
-end;
 
 type
   TFreezeWatchdog = class(TThread)
   private
     FEpisodes: Integer;
-    function BuildAddressList(out AInterruptedIP: UIntPtr): TArray<UIntPtr>;
     function CaptureAndReport(const AFrozenForMS: Int64): Boolean;
   protected
     procedure Execute; override;
   end;
-
-function TFreezeWatchdog.BuildAddressList(out AInterruptedIP: UIntPtr): TArray<UIntPtr>;
-// Trim our own capture frames from the published slot. The unwind starts
-// inside the signal handler: [handler .. libc trampoline] and then - after
-// crossing the signal frame - the frozen chain, whose first entry is exactly
-// the interrupted RIP from the ucontext. Keep from that match; if the
-// unwinder did not cross the signal frame (no match), prepend the RIP to the
-// raw trace so the report at least names the frozen instruction.
-var
-  I, N, StartIdx: Integer;
-begin
-  AInterruptedIP := UIntPtr(GTrace.InterruptedIP);
-  N := Min(GTrace.Count, FREEZE_MAX_FRAMES);
-  StartIdx := -1;
-  if AInterruptedIP <> 0 then
-    for I := 0 to N - 1 do
-      if GTrace.Addrs[I] = AInterruptedIP then
-      begin
-        StartIdx := I;
-        Break;
-      end;
-  if StartIdx >= 0 then
-  begin
-    SetLength(Result, N - StartIdx);
-    for I := StartIdx to N - 1 do
-      Result[I - StartIdx] := GTrace.Addrs[I];
-  end
-  else if AInterruptedIP <> 0 then
-  begin
-    SetLength(Result, N + 1);
-    Result[0] := AInterruptedIP;
-    for I := 0 to N - 1 do
-      Result[I + 1] := GTrace.Addrs[I];
-  end
-  else
-  begin
-    SetLength(Result, N);
-    for I := 0 to N - 1 do
-      Result[I] := GTrace.Addrs[I];
-  end;
-end;
 
 function TFreezeWatchdog.CaptureAndReport(const AFrozenForMS: Int64): Boolean;
 // False = the report gate is busy (an exception report is in flight) - the
@@ -331,7 +175,7 @@ var
   IP: UIntPtr;
   Report: TCrashReport;
   LocList: TCrashStack;
-  Deadline: UInt64;
+  Trace: TCrashThreadRawTrace;
 begin
   // Cross-thread report gate (the exception path's single-flight flag): never
   // race a crashing thread's resolver state (module readers, line caches).
@@ -343,21 +187,13 @@ begin
   if not Result then
     Exit;
   try
-    // Re-open the slot (this thread is the sole consumer).
-    TInterlocked.Exchange(GTrace.Captured, 0);
-    TInterlocked.Exchange(GTrace.Claimed, 0);
     Addrs := nil;
     IP := 0;
-    if pthread_kill(GWatchedThread, GFreezeSignal) = 0 then
+    if CrashThreadCaptureCapture(GWatchedCapture, CAPTURE_WAIT_MS,
+         Trace) = tcoCaptured then
     begin
-      // Bounded wait: a thread parked in uninterruptible (D) state never runs
-      // the handler - report without a stack rather than hang the watchdog.
-      Deadline := TThread.GetTickCount64 + CAPTURE_WAIT_MS;
-      while (TInterlocked.CompareExchange(GTrace.Captured, 0, 0) <> 1) and
-            (TThread.GetTickCount64 < Deadline) do
-        TThread.Sleep(5);
-      if TInterlocked.CompareExchange(GTrace.Captured, 0, 0) = 1 then
-        Addrs := BuildAddressList(IP);
+      Addrs := Trace.Addresses;
+      IP := Trace.InterruptedIP;
     end;
 
     Report := Default(TCrashReport);
@@ -459,90 +295,35 @@ end;
 
 { TCrashFreeze }
 
-function FreezeSignalIsFree(const ASig: Integer): Boolean;
-// Takeable = the current disposition is SIG_DFL. SIG_IGN counts as OWNED:
-// someone set it deliberately, and stealing the number would re-enable
-// delivery behind their back.
-var
-  Cur: sigaction_t;
-begin
-  if sigaction(ASig, nil, @Cur) <> 0 then
-    Exit(False);
-  {$IF Defined(CRASH_FREEZE_LINUXLIKE)}
-  Result := not Assigned(Cur._u.sa_handler);
-  {$ELSE}
-  Result := not Assigned(Cur.__sigaction_handler.sa_handler);
-  {$ENDIF}
-end;
-
 class procedure TCrashFreeze.Install(const ATimeoutMS: Integer);
-var
-  Act: sigaction_t;
-  {$IF Defined(CRASH_FREEZE_LINUXLIKE)}
-  RtMin, RtMax, Sig: Integer;
-  {$ENDIF}
 begin
   if GInstalled then
   begin
     GTimeoutMS := Max(Int64(MIN_TIMEOUT_MS), Int64(ATimeoutMS));
     Exit;
   end;
-  // A process-wide signal already claimed by the host is never stolen - a
-  // detector that silently disables someone's handler for its whole lifetime
-  // is worse than a detector that stays off.
-  {$IF Defined(CRASH_FREEZE_LINUXLIKE)}
-  // Start at rtmin+5: clear of the runtime-reserved range (below RtMin) and
-  // of common RT users at RtMin+0..1; walk up to the first free signal.
-  GFreezeSignal := -1;
-  RtMin := __libc_current_sigrtmin;
-  RtMax := __libc_current_sigrtmax;
-  if RtMin > 0 then
-    for Sig := RtMin + 5 to RtMax do
-      if FreezeSignalIsFree(Sig) then
-      begin
-        GFreezeSignal := Sig;
-        Break;
-      end;
-  if GFreezeSignal < 0 then
-    Exit; // no free realtime signal - the detector stays inactive
-  {$ELSE}
-  // macOS has no realtime signals and hardware faults go through Mach
-  // exception ports - SIGUSR2 is the only candidate. Host owns it = stay off.
-  if not FreezeSignalIsFree(SIGUSR2) then
+  if not CrashThreadCaptureAcquire then
     Exit;
-  GFreezeSignal := SIGUSR2;
-  {$ENDIF}
-
-  GWatchedThread := pthread_self; // Install runs on the thread to be watched
+  if not CrashThreadCaptureRegisterCurrentThread(GWatchedCapture) then
+  begin
+    CrashThreadCaptureRelease;
+    Exit;
+  end;
   GTimeoutMS := Max(Int64(MIN_TIMEOUT_MS), Int64(ATimeoutMS));
   TInterlocked.Exchange(GLastPingMS, 0);
-  FillChar(GTrace, SizeOf(GTrace), 0);
-
-  FillChar(Act, SizeOf(Act), 0);
-  // The handler union field has different names on Linux-like vs macOS.
-  {$IF Defined(CRASH_FREEZE_LINUXLIKE)}
-  Act._u.sa_sigaction := CrashFreezeSignalHandler;
-  {$ELSE}
-  Act.__sigaction_handler.sa_sigaction := CrashFreezeSignalHandler;
-  {$ENDIF}
-  // SA_RESTART: see the unit header. No SA_ONSTACK: not a stack-overflow
-  // scenario, and the process-wide alternate stack belongs to the crash
-  // handlers (Crash.Signals).
-  Act.sa_flags := SA_SIGINFO or SA_RESTART;
-  sigemptyset(Act.sa_mask);
-  FillChar(GPrevAction, SizeOf(GPrevAction), 0);
-  if sigaction(GFreezeSignal, @Act, @GPrevAction) <> 0 then
+  try
+    GWatchdog := TFreezeWatchdog.Create(False);
+  except
+    CrashThreadCaptureUnregisterCurrentThread(GWatchedCapture);
+    CrashThreadCaptureRelease;
     Exit;
-  GHavePrevAction := True;
-
-  GWatchdog := TFreezeWatchdog.Create(False);
+  end;
   GInstalled := True;
 end;
 
 class procedure TCrashFreeze.Shutdown;
 var
   W: TThread;
-  Cur: sigaction_t;
 begin
   W := GWatchdog;
   GWatchdog := nil;
@@ -553,19 +334,10 @@ begin
     W.WaitFor; // returns within one CHECK_QUANTUM_MS (plus a pending capture wait)
     W.Free;
   end;
-  // Give the process-wide signal back: restore the pre-Install disposition -
-  // but only while the current handler is still ours; a host that re-claimed
-  // the signal after Install keeps its ownership.
-  if GHavePrevAction then
+  if GWatchedCapture <> nil then
   begin
-    GHavePrevAction := False;
-    if (sigaction(GFreezeSignal, nil, @Cur) = 0) and
-       {$IF Defined(CRASH_FREEZE_LINUXLIKE)}
-       (@Cur._u.sa_sigaction = @CrashFreezeSignalHandler)
-       {$ELSE}
-       (@Cur.__sigaction_handler.sa_sigaction = @CrashFreezeSignalHandler)
-       {$ENDIF} then
-      sigaction(GFreezeSignal, @GPrevAction, nil);
+    CrashThreadCaptureUnregisterCurrentThread(GWatchedCapture);
+    CrashThreadCaptureRelease;
   end;
 end;
 

@@ -165,7 +165,8 @@ uses
   Posix.Signal,
   Posix.Pthread,
   Posix.String_,
-  Posix.Unistd;
+  Posix.Unistd,
+  Crash.ThreadCapture;
 
 const
   STACK_DUMP_BYTES = CRASH_RAW_STACK_BYTES;
@@ -302,7 +303,7 @@ function CurrentThreadIdent: UInt64; inline;
 // the NativeUInt cast normalizes it; both sides of the comparison (handler and
 // report) go through this same function, so the width always matches.
 begin
-  Result := UInt64(NativeUInt(pthread_self));
+  Result := CrashCurrentPThreadIdent;
 end;
 
 function ExtractIPFromContext(Ctx: Pointer): UInt64;
@@ -326,7 +327,7 @@ end;
 
 function CrashContextInstructionPointer(AContext: Pointer): UInt64;
 begin
-  Result := ExtractIPFromContext(AContext);
+  Result := CrashThreadCaptureContextInstructionPointer(AContext);
 end;
 
 procedure CaptureFromUContext(Ctx: Pointer);
@@ -556,6 +557,7 @@ end;
 procedure InstallOne(SigNum: Integer);
 var
   Act, Prev: sigaction_t;
+  CaptureSignal: Integer;
 begin
   if (SigNum < Low(GOldHandlers)) or (SigNum > High(GOldHandlers)) then Exit;
   FillChar(Act, SizeOf(Act), 0);
@@ -565,6 +567,12 @@ begin
   // - without one the handler could not even start on a stack-overflow fault.
   Act.sa_flags := SA_SIGINFO or SA_ONSTACK;
   sigemptyset(Act.sa_mask);
+  // A late Crash.ThreadCapture acquire (for example EnableFreezeDetection
+  // after reporter Init) refreshes all fault actions through the centralized
+  // callback below. Never maintain per-signal masks at the call sites.
+  CaptureSignal := CrashThreadCaptureSignalNumber;
+  if (CaptureSignal > 0) and (CaptureSignal <> SigNum) then
+    sigaddset(Act.sa_mask, CaptureSignal);
   sigaction(SigNum, @Act, @Prev);
   // Save prev only if it is NOT ourselves (guard against the re-install chain)
   // AND if nothing has been saved yet. The FIRST install catches the Pascal RTL
@@ -1242,6 +1250,18 @@ begin
     CrashRawCommitConcurrent(GConcurrentSignal);
   end;
 end;
+
+procedure RefreshFaultSignalMasks;
+begin
+  if GInstalled then
+    CrashInstallSignalHandlers;
+end;
+
+initialization
+  CrashThreadCaptureSetSignalRefresh(RefreshFaultSignalMasks);
+
+finalization
+  CrashThreadCaptureSetSignalRefresh(nil);
 
 {$ELSE}  // not CRASH_SIGCAP -> no-op stubs
 

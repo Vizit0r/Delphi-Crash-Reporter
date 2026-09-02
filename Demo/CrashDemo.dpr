@@ -23,6 +23,7 @@ uses
   {$IF Defined(LINUX)}
   Posix.SysMman,
   {$ENDIF}
+  Crash.ThreadCapture,
   Crash.Reporter,
   Crash.Freeze,
   Crash.CallStack;
