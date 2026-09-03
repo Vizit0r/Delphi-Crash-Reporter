@@ -1869,6 +1869,8 @@ begin
       Slot.RawWordCount := 1;
       Slot.RawWords[0] := ReturnAddress;
       Slot.StopReason := tcsrEnd;
+      // Re-stamp the cache so BuildBoundedTrace keeps the synthetic ranges.
+      GExecutableRangesTick := TThread.GetTickCount64;
       BuildBoundedTrace(@Slot, Trace);
       Result := (Trace.StopReason = tcsrFrameInvalidCode) and
         (Trace.FPFrameCount = 0) and (Trace.RawFrameCount = 1) and
