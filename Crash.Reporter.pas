@@ -1114,6 +1114,32 @@ begin
   end;
 end;
 
+function FormatThreadCaptureDiagnostics(const AThreadID: UInt64;
+  const ATrace: TCrashThreadRawTrace): String;
+begin
+  Result := CrashThreadCaptureFormatDiagnostics(AThreadID, ATrace);
+end;
+
+procedure AppendSignalInfoLine(var ASection: String; const ALine: String);
+begin
+  if ALine = '' then
+    Exit;
+  if ASection <> '' then
+    ASection := ASection + #13#10;
+  ASection := ASection + ALine;
+end;
+
+procedure AppendExtendedCaptureDiagnostics(var ASection: String;
+  const AReport: TCrashReport);
+var
+  I: Integer;
+begin
+  AppendSignalInfoLine(ASection, AReport.PrimaryCaptureDiagnostics);
+  for I := 0 to High(AReport.ExtendedThreads) do
+    AppendSignalInfoLine(ASection,
+      AReport.ExtendedThreads[I].CaptureDiagnostics);
+end;
+
 function TCrashReporterImpl.CaptureExtendedThreads(var AReport: TCrashReport;
   const APrimaryThreadID: UInt64;
   const ABoundedRegistry: Boolean): Integer;
@@ -1177,6 +1203,7 @@ begin
     AReport.ExtendedThreads[I].Name := Candidate.Name;
     AReport.ExtendedThreads[I].State := ctcsCaptureFailed;
     AReport.ExtendedThreads[I].CallStack := nil;
+    AReport.ExtendedThreads[I].CaptureDiagnostics := '';
     Handle := nil;
     LeaseHeld := False;
 
@@ -1261,6 +1288,8 @@ begin
     case Outcome of
       tcoCaptured:
         begin
+          AReport.ExtendedThreads[I].CaptureDiagnostics :=
+            FormatThreadCaptureDiagnostics(Candidate.ThreadID, Trace);
           MaxDepth := TCrashCapture.MaxCallStackDepth;
           if MaxDepth < 0 then
             MaxDepth := 0;
@@ -1597,8 +1626,14 @@ begin
   end;
 
   Report := AReport;
-  CaptureExtendedThreads(Report, CrashCurrentThreadIdentity, False);
   IsFatal := AReport.Source = csFatalProc;
+  // Fatal handlers are one-shot. Re-arm before extending both normal and
+  // terminating reports so a real concurrent fault remains diagnosable. The
+  // current primary snapshot stays reserved by its Claimed CAS; a second fault
+  // therefore publishes into the concurrent slot instead of overwriting it.
+  if FConfig.ExtendedThreads then
+    CrashInstallSignalHandlers;
+  CaptureExtendedThreads(Report, CrashCurrentThreadIdentity, False);
   // ExceptionLocation.CodeAddress keys the snapshot<->exception correlation in
   // CrashTakeAndFormatSnapshots (see Crash.Signals) - a snapshot left behind by
   // a swallowed concurrent/earlier fault must not pose as this exception's
@@ -1640,6 +1675,7 @@ begin
   except
     // A faulty context provider must not break reporting.
   end;
+  AppendExtendedCaptureDiagnostics(Ctx.SignalInfoSection, Report);
   if Report.ExtendedThreadsOmitted > 0 then
   begin
     if Ctx.SignalInfoSection <> '' then
@@ -1695,15 +1731,11 @@ begin
   end;
 
   // Non-fatal: the process keeps running. Show the dialog if there is a handler.
-  // Re-arm: on Linux our signal handler is "one-shot" - after the snapshot it
-  // restored prev (Pascal RTL) and thereby removed itself from active. Without a
-  // re-install the NEXT hardware crash goes straight to the Pascal RTL, bypassing
-  // us -> later .el files would lack the "Registers:" section. This crash's
-  // snapshot was already consumed in CrashBuildELReportText above, so re-install
-  // is safe; GOldHandlers keeps the original Pascal RTL handler.
-  // The one-shot handler is about to be re-armed. Rotate its raw descriptors
-  // first: delete the old generation only after full .el persistence; otherwise
-  // preserve it for startup recovery and open a fresh generation.
+  // The early re-arm above already restored the one-shot fault handlers before
+  // extended capture. Rotate the raw descriptors now: delete the old generation
+  // only after full .el persistence; otherwise preserve it for startup recovery
+  // and open a fresh generation. The following second re-arm is idempotent and
+  // binds the handlers to that fresh raw generation.
   CrashRawRotate(ReportPersisted);
   CrashInstallSignalHandlers;
 
@@ -1901,6 +1933,7 @@ begin
     Ctx.SignalInfoSection := FreezeNote + #13#10 + Ctx.SignalInfoSection
   else
     Ctx.SignalInfoSection := FreezeNote;
+  AppendExtendedCaptureDiagnostics(Ctx.SignalInfoSection, AReport);
   if AReport.ExtendedThreadsOmitted > 0 then
     Ctx.SignalInfoSection := Ctx.SignalInfoSection + #13#10 + Format(
       'Extended threads omitted by limit: %d',

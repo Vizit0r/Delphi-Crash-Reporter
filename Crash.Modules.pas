@@ -35,7 +35,19 @@ type
   end;
   TModuleInfoArray = array of TModuleInfo;
 
+  { A currently readable executable mapping. Kept separate from TModuleInfo:
+    module rows deliberately merge mappings for EL display, while instruction
+    validation must preserve the kernel's per-segment access rights. }
+  TCrashExecutableRange = record
+    LowAddress: UIntPtr;   // inclusive
+    HighAddress: UIntPtr;  // exclusive
+  end;
+  TCrashExecutableRanges = TArray<TCrashExecutableRange>;
+
 function CrashEnumerateModules: TModuleInfoArray;
+function CrashEnumerateReadableExecutableRanges: TCrashExecutableRanges;
+function CrashTryReadProcessMemory(const AAddress: UIntPtr; ABuffer: Pointer;
+  const ASize: NativeUInt): Boolean;
 
 // EL-compatible Modules table body (without the "Modules:" caption header line -
 // caller adds that). Returns '' when AModules is empty.
@@ -46,7 +58,8 @@ implementation
 uses
   System.SysUtils
   {$IF Defined(LINUX) or Defined(ANDROID)}
-  , Posix.Fcntl, Posix.Unistd, Posix.Errno
+  , Posix.Base, Posix.Fcntl, Posix.Unistd, Posix.Errno, Posix.SysTypes,
+    Posix.SysUio
   {$ENDIF}
   ;
 
@@ -198,16 +211,16 @@ begin
 end;
 
 function ParseMapsLine(const Line: String;
-  out StartA, EndA: UInt64; out Path: String): Boolean;
+  out StartA, EndA: UInt64; out Perms, Path: String): Boolean;
 // "<hex_start>-<hex_end> <perms> <hex_offset> <dev> <inode> <pathname>"
-// Pathname optional (anonymous mmap) and may contain spaces. Skip pseudo-
-// paths like [stack], [heap], [vvar], [vdso] - not real modules.
+// Pathname is optional (anonymous mmap) and may contain spaces. Callers decide
+// whether pseudo-paths such as [stack]/[vdso] are useful for their purpose.
 var
-  P, LineLen, Field: Integer;
-  Dash:              Integer;
+  P, LineLen, Field, FieldStart: Integer;
+  Dash:                          Integer;
 begin
   Result := False;
-  StartA := 0; EndA := 0; Path := '';
+  StartA := 0; EndA := 0; Perms := ''; Path := '';
   LineLen := Length(Line);
   if LineLen < 16 then Exit;
 
@@ -219,19 +232,21 @@ begin
   while (P <= LineLen) and (Line[P] <> ' ') do Inc(P);
   EndA := ParseHex64(Copy(Line, Dash + 1, P - Dash - 1));
 
-  // Skip 4 fields: perms, offset, dev, inode.
-  for Field := 1 to 4 do
+  // Capture perms, then skip offset, dev and inode.
+  while (P <= LineLen) and (Line[P] = ' ') do Inc(P);
+  FieldStart := P;
+  while (P <= LineLen) and (Line[P] <> ' ') do Inc(P);
+  Perms := Copy(Line, FieldStart, P - FieldStart);
+  for Field := 1 to 3 do
   begin
     while (P <= LineLen) and (Line[P] = ' ') do Inc(P);
     while (P <= LineLen) and (Line[P] <> ' ') do Inc(P);
   end;
   while (P <= LineLen) and (Line[P] = ' ') do Inc(P);
-  if P > LineLen then Exit;
-  Path := Copy(Line, P, LineLen - P + 1);
-  if Path = '' then Exit;
-  if Path[1] = '[' then Exit;
+  if P <= LineLen then
+    Path := Copy(Line, P, LineLen - P + 1);
 
-  Result := True;
+  Result := (StartA < EndA) and (Perms <> '');
 end;
 
 function FindOrAdd(var Arr: TModuleInfoArray; const Path: String): Integer;
@@ -253,7 +268,7 @@ var
   Text, Line:             String;
   Cursor, NextLF, Stop:   Integer;
   StartA, EndA:           UInt64;
-  Path:                   String;
+  Perms, Path:            String;
   Idx:                    Integer;
 begin
   Result := nil;
@@ -266,7 +281,8 @@ begin
     NextLF := Cursor;
     while (NextLF <= Stop) and (Text[NextLF] <> #10) do Inc(NextLF);
     Line := Copy(Text, Cursor, NextLF - Cursor);
-    if ParseMapsLine(Line, StartA, EndA, Path) then
+    if ParseMapsLine(Line, StartA, EndA, Perms, Path) and
+       (Path <> '') and (Path[1] <> '[') then
     begin
       Idx := FindOrAdd(Result, Path);
       if (Result[Idx].BaseAddr = 0) or (StartA < Result[Idx].BaseAddr) then
@@ -275,6 +291,72 @@ begin
         Result[Idx].Size := EndA - Result[Idx].BaseAddr;
     end;
     Cursor := NextLF + 1;
+  end;
+end;
+
+function CrashEnumerateReadableExecutableRanges: TCrashExecutableRanges;
+var
+  Buf:                    TBytes;
+  Text, Line:             String;
+  Cursor, NextLF, Stop:   Integer;
+  StartA, EndA:           UInt64;
+  Perms, Path:            String;
+  Idx:                    Integer;
+begin
+  Result := nil;
+  if not ReadMapsFile(Buf) then
+    Exit;
+  Text := TEncoding.UTF8.GetString(Buf);
+  Cursor := 1;
+  Stop := Length(Text);
+  while Cursor <= Stop do
+  begin
+    NextLF := Cursor;
+    while (NextLF <= Stop) and (Text[NextLF] <> #10) do
+      Inc(NextLF);
+    Line := Copy(Text, Cursor, NextLF - Cursor);
+    if ParseMapsLine(Line, StartA, EndA, Perms, Path) and
+       (Length(Perms) >= 3) and (Perms[1] = 'r') and
+       (Perms[3] = 'x') then
+    begin
+      Idx := Length(Result);
+      SetLength(Result, Idx + 1);
+      Result[Idx].LowAddress := UIntPtr(StartA);
+      Result[Idx].HighAddress := UIntPtr(EndA);
+    end;
+    Cursor := NextLF + 1;
+  end;
+end;
+
+function crash_process_vm_readv(APid: pid_t; ALocalIOV: Piovec;
+  ALocalCount: NativeUInt; ARemoteIOV: Piovec; ARemoteCount: NativeUInt;
+  AFlags: NativeUInt): NativeInt; cdecl;
+  external libc name _PU + 'process_vm_readv';
+
+function CrashTryReadProcessMemory(const AAddress: UIntPtr; ABuffer: Pointer;
+  const ASize: NativeUInt): Boolean;
+var
+  LocalIOV, RemoteIOV: iovec;
+  ReadCount: NativeInt;
+  Attempt: Integer;
+begin
+  Result := ASize = 0;
+  if Result then
+    Exit;
+  if (AAddress = 0) or (ABuffer = nil) then
+    Exit(False);
+  LocalIOV.iov_base := ABuffer;
+  LocalIOV.iov_len := ASize;
+  RemoteIOV.iov_base := Pointer(AAddress);
+  RemoteIOV.iov_len := ASize;
+  for Attempt := 0 to 2 do
+  begin
+    ReadCount := crash_process_vm_readv(getpid, @LocalIOV, 1,
+      @RemoteIOV, 1, 0);
+    if ReadCount = NativeInt(ASize) then
+      Exit(True);
+    if (ReadCount >= 0) or (errno <> EINTR) then
+      Exit(False);
   end;
 end;
 
@@ -365,6 +447,17 @@ begin
   end;
 end;
 
+function CrashEnumerateReadableExecutableRanges: TCrashExecutableRanges;
+begin
+  Result := nil;
+end;
+
+function CrashTryReadProcessMemory(const AAddress: UIntPtr; ABuffer: Pointer;
+  const ASize: NativeUInt): Boolean;
+begin
+  Result := False;
+end;
+
 // =========================================================================
 //                              ELSE (Win, etc.)
 // =========================================================================
@@ -373,6 +466,17 @@ end;
 function CrashEnumerateModules: TModuleInfoArray;
 begin
   Result := nil;
+end;
+
+function CrashEnumerateReadableExecutableRanges: TCrashExecutableRanges;
+begin
+  Result := nil;
+end;
+
+function CrashTryReadProcessMemory(const AAddress: UIntPtr; ABuffer: Pointer;
+  const ASize: NativeUInt): Boolean;
+begin
+  Result := False;
 end;
 
 {$ENDIF}

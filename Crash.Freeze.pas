@@ -182,6 +182,7 @@ function TFreezeWatchdog.CaptureAndReport(const AFrozenForMS: Int64): Boolean;
 var
   Addrs: TArray<UIntPtr>;
   IP: UIntPtr;
+  MaxDepth: Integer;
   Report: TCrashReport;
   LocList: TCrashStack;
   Trace: TCrashThreadRawTrace;
@@ -212,6 +213,13 @@ begin
       'The application seems to be frozen: no heartbeat from the watched (main) thread for %d ms (timeout: %d ms)',
       [AFrozenForMS, GTimeoutMS]);
     Report.Source := csAcquired; // the process stays alive (report-only detector)
+    Report.PrimaryCaptureDiagnostics :=
+      CrashThreadCaptureFormatDiagnostics(UInt64(MainThreadID), Trace);
+    MaxDepth := TCrashCapture.MaxCallStackDepth;
+    if MaxDepth < 0 then
+      MaxDepth := 0;
+    if Length(Addrs) > MaxDepth then
+      SetLength(Addrs, MaxDepth);
     Report.CallStack := TCrashCapture.SymbolizeAddressList(Addrs);
     Report.ExceptionLocation.Clear;
     if IP <> 0 then

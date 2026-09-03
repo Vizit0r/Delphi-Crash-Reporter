@@ -20,6 +20,7 @@ uses
 
 const
   CRASH_THREAD_CAPTURE_MAX_FRAMES = 64;
+  CRASH_THREAD_CAPTURE_RAW_WORDS = 128;
   CRASH_THREAD_CAPTURE_SLOT_COUNT = 64;
 
 type
@@ -38,9 +39,27 @@ type
     tcoFailed
   );
 
+  TCrashThreadCaptureStopReason = (
+    tcsrNone,
+    tcsrEnd,
+    tcsrBoundsNone,
+    tcsrStackPointerOutside,
+    tcsrFramePointerZero,
+    tcsrFramePointerOutside,
+    tcsrFramePointerMisaligned,
+    tcsrFramePointerNonMonotonic,
+    tcsrFrameInvalidCode,
+    tcsrFrameLimit
+  );
+
   TCrashThreadRawTrace = record
     InterruptedIP: UIntPtr;
     Addresses: TArray<UIntPtr>;
+    BoundsAvailable: Boolean;
+    FPFrameCount: Integer;
+    RawFrameCount: Integer;
+    RawInnerFrameCount: Integer;
+    StopReason: TCrashThreadCaptureStopReason;
   end;
 
   { Calm-path callback used by Crash.Signals. A newly acquired/released capture
@@ -66,6 +85,10 @@ procedure CrashThreadCaptureUnregisterCurrentThread(
 function CrashThreadCaptureCapture(const AHandle: TCrashThreadCaptureHandle;
   const AWaitMS: Integer; out ATrace: TCrashThreadRawTrace):
   TCrashThreadCaptureOutcome;
+function CrashThreadCaptureStopReasonText(
+  const AReason: TCrashThreadCaptureStopReason): String;
+function CrashThreadCaptureFormatDiagnostics(const AThreadID: UInt64;
+  const ATrace: TCrashThreadRawTrace): String;
 
 {$IFDEF AUTOTESTS}
 function CrashThreadCaptureCurrentSignalBlocked: Boolean;
@@ -82,6 +105,19 @@ function CrashThreadCaptureTestLiveSlotSummary: String;
 function CrashThreadCaptureTestResetQuarantined(
   const AHandle: TCrashThreadCaptureHandle): Boolean;
 procedure CrashThreadCaptureTestResetAllQuarantined;
+procedure CrashThreadCaptureTestBoundedWalk(const AStackLow, AStackHigh,
+  AStackPointer, AFramePointer: UIntPtr; out AFPCount, ARawWordCount: Integer;
+  out ARawBase, AFirstRawWord: UIntPtr;
+  out AStopReason: TCrashThreadCaptureStopReason);
+function CrashThreadCaptureTestX86FFCall(const ABytes: TBytes): Boolean;
+function CrashThreadCaptureTestARM64Call(const AInstruction: UInt32): Boolean;
+function CrashThreadCaptureTestMergeRules: Boolean;
+function CrashThreadCaptureTestSetContextOverride(
+  const AHandle: TCrashThreadCaptureHandle; const AStackLow, AStackHigh,
+  AStackPointer, AFramePointer: UIntPtr): Boolean;
+function CrashThreadCaptureTestHandlerStackAddress(
+  const AHandle: TCrashThreadCaptureHandle): UIntPtr;
+function CrashThreadCaptureTestActionUsesAltStack: Boolean;
 {$ENDIF}
 
 implementation
@@ -103,6 +139,7 @@ uses
   System.Classes,
   System.Math,
   System.SyncObjs,
+  Crash.Modules,
   Posix.Base,
   Posix.Signal,
   Posix.Pthread,
@@ -127,6 +164,7 @@ const
   {$ENDIF}
 
 type
+  PCrashUIntPtr = ^UIntPtr;
   PCrashThreadCaptureSlot = ^TCrashThreadCaptureSlot;
   TCrashThreadCaptureSlot = record
     State: Integer;       // atomic SLOT_* state; published after identity fields
@@ -134,10 +172,33 @@ type
     OwnerRefs: Integer;   // calm path, protected by GServiceLock
     PThreadIdent: UInt64;
     KernelIdent: UInt64;
+    StackLow: UIntPtr;
+    StackHigh: UIntPtr;
+    StackBoundsOK: Integer;
     InterruptedIP: UInt64;
+    InterruptedSP: UIntPtr;
+    InterruptedFP: UIntPtr;
     Count: Integer;
     Addrs: array [0..CRASH_THREAD_CAPTURE_MAX_FRAMES - 1] of UIntPtr;
+    AddrStackPos: array [0..CRASH_THREAD_CAPTURE_MAX_FRAMES - 1] of UIntPtr;
+    RawBaseSP: UIntPtr;
+    RawWordCount: Integer;
+    RawWords: array [0..CRASH_THREAD_CAPTURE_RAW_WORDS - 1] of UIntPtr;
+    StopReason: TCrashThreadCaptureStopReason;
+    {$IFDEF AUTOTESTS}
+    TestContextOverride: Integer;
+    TestStackPointer: UIntPtr;
+    TestFramePointer: UIntPtr;
+    TestHandlerStackAddress: UIntPtr;
+    {$ENDIF}
   end;
+
+  TCrashTraceCandidate = record
+    StackPos: UIntPtr;
+    Address: UIntPtr;
+    IsRaw: Boolean;
+  end;
+  TCrashTraceCandidates = TArray<TCrashTraceCandidate>;
 
   TCrashTimespec = record
     tv_sec: Int64;
@@ -155,6 +216,8 @@ var
   GPrevAction: sigaction_t;
   GHavePrevAction: Boolean = False;
   GRefreshProc: TCrashThreadCaptureSignalRefreshProc = nil;
+  GExecutableRanges: TCrashExecutableRanges;
+  GExecutableRangesTick: UInt64 = 0;
 
 {$IF Defined(CRASH_THREADCAP_LINUXLIKE)}
 function __libc_current_sigrtmin: Integer; cdecl;
@@ -163,6 +226,9 @@ function __libc_current_sigrtmax: Integer; cdecl;
   external libc name _PU + '__libc_current_sigrtmax';
 function crash_syscall(ANumber: IntPtr): IntPtr; cdecl; varargs;
   external libc name _PU + 'syscall';
+function crash_pthread_getattr_np(AThread: pthread_t;
+  var AAttr: pthread_attr_t): Integer; cdecl;
+  external libc name _PU + 'pthread_getattr_np';
 {$ELSEIF Defined(MACOS)}
 function pthread_threadid_np(AThread: pthread_t; AThreadID: PUInt64): Integer; cdecl;
   external libc name _PU + 'pthread_threadid_np';
@@ -187,28 +253,6 @@ const
 
 function backtrace(ABuffer: PPointer; ASize: Integer): Integer; cdecl;
   external libSystem name 'backtrace';
-{$ELSE}
-type
-  _PUnwind_Context = Pointer;
-  _Unwind_Ptr = UIntPtr;
-  _Unwind_Reason_code = Integer;
-  _Unwind_Trace_Fn = function(AContext: _PUnwind_Context;
-    AUserData: Pointer): _Unwind_Reason_code; cdecl;
-
-const
-  _URC_NO_REASON = 0;
-  _URC_END_OF_STACK = 5;
-  {$IF Defined(LINUX)}
-  LIB_UNWIND = 'libgcc_s.so.1';
-  {$ELSE}
-  LIB_UNWIND = 'libunwind.a';
-  {$ENDIF}
-
-procedure _Unwind_Backtrace(AFn: _Unwind_Trace_Fn;
-  AUserData: Pointer); cdecl;
-  external LIB_UNWIND name '_Unwind_Backtrace';
-function _Unwind_GetIP(AContext: _PUnwind_Context): _Unwind_Ptr; cdecl;
-  external LIB_UNWIND name '_Unwind_GetIP';
 {$ENDIF}
 
 function CrashCurrentPThreadIdent: UInt64;
@@ -256,6 +300,124 @@ begin
   {$ENDIF}
 end;
 
+function CrashThreadCaptureContextStackPointer(AContext: Pointer): UIntPtr;
+begin
+  Result := 0;
+  if AContext = nil then
+    Exit;
+  {$IF Defined(LINUX) and Defined(CPUX64)}
+  Result := UIntPtr(Pucontext_t(AContext).uc_mcontext.gregs[REG_RSP]);
+  {$ELSEIF Defined(MACOS) and Defined(CPUX64)}
+  if Pucontext_t(AContext).uc_mcontext <> nil then
+    Result := UIntPtr(Pucontext_t(AContext).uc_mcontext^.__ss.__rsp);
+  {$ELSEIF Defined(MACOS) and Defined(CPUARM64)}
+  if Pucontext_t(AContext).uc_mcontext <> nil then
+    Result := UIntPtr(Pucontext_t(AContext).uc_mcontext^.__ss.__sp);
+  {$ELSEIF Defined(ANDROID) and Defined(CPUARM64)}
+  Result := UIntPtr(Pucontext_t(AContext).uc_mcontext.arm_sp);
+  {$ENDIF}
+end;
+
+function CrashThreadCaptureContextFramePointer(AContext: Pointer): UIntPtr;
+begin
+  Result := 0;
+  if AContext = nil then
+    Exit;
+  {$IF Defined(LINUX) and Defined(CPUX64)}
+  Result := UIntPtr(Pucontext_t(AContext).uc_mcontext.gregs[REG_RBP]);
+  {$ELSEIF Defined(MACOS) and Defined(CPUX64)}
+  if Pucontext_t(AContext).uc_mcontext <> nil then
+    Result := UIntPtr(Pucontext_t(AContext).uc_mcontext^.__ss.__rbp);
+  {$ELSEIF Defined(MACOS) and Defined(CPUARM64)}
+  if Pucontext_t(AContext).uc_mcontext <> nil then
+    Result := UIntPtr(Pucontext_t(AContext).uc_mcontext^.__ss.__fp);
+  {$ELSEIF Defined(ANDROID) and Defined(CPUARM64)}
+  Result := UIntPtr(Pucontext_t(AContext).uc_mcontext.regs[29]);
+  {$ENDIF}
+end;
+
+function CrashThreadCaptureStopReasonText(
+  const AReason: TCrashThreadCaptureStopReason): String;
+begin
+  case AReason of
+    tcsrEnd: Result := 'end';
+    tcsrBoundsNone: Result := 'bounds-none';
+    tcsrStackPointerOutside: Result := 'sp-outside';
+    tcsrFramePointerZero: Result := 'fp-zero';
+    tcsrFramePointerOutside: Result := 'fp-outside';
+    tcsrFramePointerMisaligned: Result := 'fp-misaligned';
+    tcsrFramePointerNonMonotonic: Result := 'fp-nonmonotonic';
+    tcsrFrameInvalidCode: Result := 'fp-invalid-code';
+    tcsrFrameLimit: Result := 'frame-limit';
+  else
+    Result := 'none';
+  end;
+end;
+
+function CrashThreadCaptureFormatDiagnostics(const AThreadID: UInt64;
+  const ATrace: TCrashThreadRawTrace): String;
+var
+  BoundsText: String;
+begin
+  if (ATrace.StopReason = tcsrNone) and (not ATrace.BoundsAvailable) and
+     (ATrace.FPFrameCount = 0) and (ATrace.RawFrameCount = 0) then
+    Exit('');
+  if ATrace.BoundsAvailable then
+    BoundsText := 'ok'
+  else
+    BoundsText := 'none';
+  Result := 'thread ' + UIntToStr(Cardinal(AThreadID)) +
+    ': bounds=' + BoundsText +
+    ' fp-frames=' + IntToStr(ATrace.FPFrameCount) +
+    ' raw-frames=' + IntToStr(ATrace.RawFrameCount) +
+    ' raw-inner=' + IntToStr(ATrace.RawInnerFrameCount) +
+    ' stop=' + CrashThreadCaptureStopReasonText(ATrace.StopReason);
+end;
+
+function TryGetCurrentThreadStackBounds(out ALow, AHigh: UIntPtr): Boolean;
+{$IF Defined(CRASH_THREADCAP_LINUXLIKE)}
+var
+  Attr: pthread_attr_t;
+  StackBase: Pointer;
+  StackSize: size_t;
+  Marker: Byte;
+begin
+  Result := False;
+  ALow := 0;
+  AHigh := 0;
+  FillChar(Attr, SizeOf(Attr), 0);
+  if crash_pthread_getattr_np(pthread_self, Attr) <> 0 then
+    Exit;
+  try
+    StackBase := nil;
+    StackSize := 0;
+    if pthread_attr_getstack(Attr, StackBase, StackSize) <> 0 then
+      Exit;
+    if (StackBase = nil) or (StackSize < 2 * SizeOf(Pointer)) then
+      Exit;
+    ALow := UIntPtr(StackBase);
+    if UIntPtr(StackSize) > High(UIntPtr) - ALow then
+      Exit;
+    AHigh := ALow + UIntPtr(StackSize);
+    if (UIntPtr(@Marker) < ALow) or (UIntPtr(@Marker) >= AHigh) then
+    begin
+      ALow := 0;
+      AHigh := 0;
+      Exit;
+    end;
+    Result := True;
+  finally
+    pthread_attr_destroy(Attr);
+  end;
+end;
+{$ELSE}
+begin
+  ALow := 0;
+  AHigh := 0;
+  Result := False;
+end;
+{$ENDIF}
+
 function SlotState(const ASlot: PCrashThreadCaptureSlot): Integer;
 begin
   Result := TInterlocked.CompareExchange(ASlot.State, 0, 0);
@@ -288,24 +450,126 @@ begin
   ASlot.OwnerRefs := 0;
   ASlot.PThreadIdent := 0;
   ASlot.KernelIdent := 0;
+  ASlot.StackLow := 0;
+  ASlot.StackHigh := 0;
+  ASlot.StackBoundsOK := 0;
   ASlot.InterruptedIP := 0;
+  ASlot.InterruptedSP := 0;
+  ASlot.InterruptedFP := 0;
   ASlot.Count := 0;
+  ASlot.RawBaseSP := 0;
+  ASlot.RawWordCount := 0;
+  ASlot.StopReason := tcsrNone;
+  {$IFDEF AUTOTESTS}
+  ASlot.TestContextOverride := 0;
+  ASlot.TestStackPointer := 0;
+  ASlot.TestFramePointer := 0;
+  ASlot.TestHandlerStackAddress := 0;
+  {$ENDIF}
 end;
 
-{$IF not Defined(MACOS)}
-function CaptureUnwindCallback(AContext: _PUnwind_Context;
-  AUserData: Pointer): _Unwind_Reason_code; cdecl;
+procedure CaptureBoundedStack(const ASlot: PCrashThreadCaptureSlot;
+  const ASP, AFP: UIntPtr);
 var
-  Slot: PCrashThreadCaptureSlot;
+  AlignedSP, FP, PreviousFP, ReturnAddress, AvailableWords: UIntPtr;
+  I: Integer;
 begin
-  Slot := PCrashThreadCaptureSlot(AUserData);
-  if Slot.Count >= CRASH_THREAD_CAPTURE_MAX_FRAMES then
-    Exit(_URC_END_OF_STACK);
-  Slot.Addrs[Slot.Count] := UIntPtr(_Unwind_GetIP(AContext));
-  Inc(Slot.Count);
-  Result := _URC_NO_REASON;
+  ASlot.InterruptedSP := ASP;
+  ASlot.InterruptedFP := AFP;
+  ASlot.Count := 0;
+  ASlot.RawBaseSP := 0;
+  ASlot.RawWordCount := 0;
+  ASlot.StopReason := tcsrNone;
+
+  if ASlot.StackBoundsOK = 0 then
+  begin
+    ASlot.StopReason := tcsrBoundsNone;
+    Exit;
+  end;
+  if (ASlot.StackHigh <= ASlot.StackLow) or
+     (ASlot.StackHigh - ASlot.StackLow < 2 * SizeOf(Pointer)) then
+  begin
+    ASlot.StopReason := tcsrBoundsNone;
+    Exit;
+  end;
+  if (ASP < ASlot.StackLow) or (ASP >= ASlot.StackHigh) then
+  begin
+    ASlot.StopReason := tcsrStackPointerOutside;
+    Exit;
+  end;
+
+  if ASP > High(UIntPtr) - (SizeOf(Pointer) - 1) then
+    AlignedSP := ASlot.StackHigh
+  else
+    AlignedSP := (ASP + SizeOf(Pointer) - 1) and
+      not UIntPtr(SizeOf(Pointer) - 1);
+  if AlignedSP < ASlot.StackHigh then
+  begin
+    AvailableWords := (ASlot.StackHigh - AlignedSP) div SizeOf(Pointer);
+    if AvailableWords > CRASH_THREAD_CAPTURE_RAW_WORDS then
+      AvailableWords := CRASH_THREAD_CAPTURE_RAW_WORDS;
+    ASlot.RawBaseSP := AlignedSP;
+    ASlot.RawWordCount := Integer(AvailableWords);
+    for I := 0 to ASlot.RawWordCount - 1 do
+      ASlot.RawWords[I] := PCrashUIntPtr(AlignedSP +
+        UIntPtr(I) * SizeOf(Pointer))^;
+  end;
+
+  FP := AFP;
+  if FP = 0 then
+  begin
+    ASlot.StopReason := tcsrFramePointerZero;
+    Exit;
+  end;
+  while ASlot.Count < CRASH_THREAD_CAPTURE_MAX_FRAMES do
+  begin
+    if (FP < ASP) or (FP < ASlot.StackLow) or
+       (FP > ASlot.StackHigh - 2 * SizeOf(Pointer)) then
+    begin
+      ASlot.StopReason := tcsrFramePointerOutside;
+      Exit;
+    end;
+    if (FP and UIntPtr(SizeOf(Pointer) - 1)) <> 0 then
+    begin
+      ASlot.StopReason := tcsrFramePointerMisaligned;
+      Exit;
+    end;
+
+    PreviousFP := PCrashUIntPtr(FP)^;
+    ReturnAddress := PCrashUIntPtr(FP + SizeOf(Pointer))^;
+    if ReturnAddress = 0 then
+    begin
+      ASlot.StopReason := tcsrEnd;
+      Exit;
+    end;
+    ASlot.Addrs[ASlot.Count] := ReturnAddress;
+    ASlot.AddrStackPos[ASlot.Count] := FP + SizeOf(Pointer);
+    Inc(ASlot.Count);
+
+    if PreviousFP = 0 then
+    begin
+      ASlot.StopReason := tcsrEnd;
+      Exit;
+    end;
+    if PreviousFP <= FP then
+    begin
+      ASlot.StopReason := tcsrFramePointerNonMonotonic;
+      Exit;
+    end;
+    if (PreviousFP and UIntPtr(SizeOf(Pointer) - 1)) <> 0 then
+    begin
+      ASlot.StopReason := tcsrFramePointerMisaligned;
+      Exit;
+    end;
+    if PreviousFP > ASlot.StackHigh - 2 * SizeOf(Pointer) then
+    begin
+      ASlot.StopReason := tcsrFramePointerOutside;
+      Exit;
+    end;
+    FP := PreviousFP;
+  end;
+  ASlot.StopReason := tcsrFrameLimit;
 end;
-{$ENDIF}
 
 procedure CrashThreadCaptureSignalHandler(ASigNum: Integer;
   ASigInfo: Psiginfo_t; AContext: Pointer); cdecl;
@@ -345,14 +609,23 @@ begin
 
     Slot.InterruptedIP :=
       CrashThreadCaptureContextInstructionPointer(AContext);
+    {$IFDEF AUTOTESTS}
+    Slot.TestHandlerStackAddress := UIntPtr(@State);
+    {$ENDIF}
     {$IF Defined(MACOS)}
     Slot.Count := backtrace(PPointer(@Slot.Addrs[0]),
       CRASH_THREAD_CAPTURE_MAX_FRAMES);
     if Slot.Count < 0 then
       Slot.Count := 0;
     {$ELSE}
-    Slot.Count := 0;
-    _Unwind_Backtrace(CaptureUnwindCallback, Slot);
+    {$IFDEF AUTOTESTS}
+    if TInterlocked.CompareExchange(Slot.TestContextOverride, 0, 0) <> 0 then
+      CaptureBoundedStack(Slot, Slot.TestStackPointer, Slot.TestFramePointer)
+    else
+    {$ENDIF}
+      CaptureBoundedStack(Slot,
+        CrashThreadCaptureContextStackPointer(AContext),
+        CrashThreadCaptureContextFramePointer(AContext));
     {$ENDIF}
     TInterlocked.Exchange(Slot.State, SLOT_CAPTURED);
     Exit;
@@ -479,6 +752,9 @@ begin
       FillChar(Action, SizeOf(Action), 0);
       SetHandlerInAction(Action);
       Action.sa_flags := SA_SIGINFO or SA_RESTART;
+      {$IF Defined(CRASH_THREADCAP_LINUXLIKE)}
+      Action.sa_flags := Action.sa_flags or SA_ONSTACK;
+      {$ENDIF}
       sigemptyset(Action.sa_mask);
       FillChar(GPrevAction, SizeOf(GPrevAction), 0);
       if sigaction(Sig, @Action, @GPrevAction) <> 0 then
@@ -610,7 +886,8 @@ var
   Existing, Slot: PCrashThreadCaptureSlot;
   CollisionCount, I, J: Integer;
   Drained: Boolean;
-  WasCollision, ExistingQuarantined: Boolean;
+  WasCollision, ExistingQuarantined, BoundsOK: Boolean;
+  StackLow, StackHigh: UIntPtr;
 begin
   Result := False;
   AHandle := nil;
@@ -621,6 +898,7 @@ begin
   Identity := CrashCurrentThreadNativeIdentity;
   if (Identity.PThread = 0) or (Identity.KernelThread = 0) then
     Exit;
+  BoundsOK := TryGetCurrentThreadStackBounds(StackLow, StackHigh);
 
   GCoordinatorLock.Enter;
   try
@@ -645,7 +923,12 @@ begin
           TInterlocked.Exchange(GSlots[I].State, SLOT_QUARANTINED);
         end;
       if Existing <> nil then
+      begin
         Inc(Existing.OwnerRefs);
+        Existing.StackLow := StackLow;
+        Existing.StackHigh := StackHigh;
+        Existing.StackBoundsOK := Ord(BoundsOK);
+      end;
     finally
       GServiceLock.Leave;
     end;
@@ -677,7 +960,12 @@ begin
           begin
             TInterlocked.Exchange(Existing.Closing, 0);
             Existing.InterruptedIP := 0;
+            Existing.InterruptedSP := 0;
+            Existing.InterruptedFP := 0;
             Existing.Count := 0;
+            Existing.RawBaseSP := 0;
+            Existing.RawWordCount := 0;
+            Existing.StopReason := tcsrNone;
             TInterlocked.Exchange(Existing.State, SLOT_IDLE);
           end;
         finally
@@ -724,8 +1012,22 @@ begin
       Slot.OwnerRefs := 1;
       Slot.PThreadIdent := Identity.PThread;
       Slot.KernelIdent := Identity.KernelThread;
+      Slot.StackLow := StackLow;
+      Slot.StackHigh := StackHigh;
+      Slot.StackBoundsOK := Ord(BoundsOK);
       Slot.InterruptedIP := 0;
+      Slot.InterruptedSP := 0;
+      Slot.InterruptedFP := 0;
       Slot.Count := 0;
+      Slot.RawBaseSP := 0;
+      Slot.RawWordCount := 0;
+      Slot.StopReason := tcsrNone;
+      {$IFDEF AUTOTESTS}
+      Slot.TestContextOverride := 0;
+      Slot.TestStackPointer := 0;
+      Slot.TestFramePointer := 0;
+      Slot.TestHandlerStackAddress := 0;
+      {$ENDIF}
       TInterlocked.Exchange(Slot.State, SLOT_IDLE);
       AHandle := Slot;
       Result := True;
@@ -794,8 +1096,325 @@ begin
   end;
 end;
 
+{$IF Defined(CRASH_THREADCAP_LINUXLIKE)}
+type
+  TCrashInstructionBytes = array [0..7] of Byte;
+  PCrashInstructionBytes = ^TCrashInstructionBytes;
+
+procedure RefreshExecutableRanges;
+var
+  NowTick: UInt64;
+  Ranges: TCrashExecutableRanges;
+begin
+  NowTick := TThread.GetTickCount64;
+  if (Length(GExecutableRanges) > 0) and
+     (NowTick - GExecutableRangesTick < 1000) then
+    Exit;
+  Ranges := nil;
+  try
+    Ranges := CrashEnumerateReadableExecutableRanges;
+  except
+    Ranges := nil;
+  end;
+  GExecutableRanges := Ranges;
+  GExecutableRangesTick := NowTick;
+end;
+
+function FindExecutableRange(const AAddress: UIntPtr;
+  const ASize: NativeUInt): Integer;
+var
+  I: Integer;
+begin
+  Result := -1;
+  if ASize = 0 then
+    Exit;
+  for I := 0 to High(GExecutableRanges) do
+    if (AAddress >= GExecutableRanges[I].LowAddress) and
+       (AAddress < GExecutableRanges[I].HighAddress) and
+       (ASize <= GExecutableRanges[I].HighAddress - AAddress) then
+      Exit(I);
+end;
+
+function X86FFCallEndsAt(const ABytes: Pointer;
+  const ALength: Integer): Boolean;
+var
+  B: PCrashInstructionBytes;
+  I, ModRM, ModBits, RMBits, SIB, DispBytes: Integer;
+begin
+  Result := False;
+  if (ABytes = nil) or (ALength < 2) or (ALength > 8) then
+    Exit;
+  B := PCrashInstructionBytes(ABytes);
+  I := 0;
+  if (B^[I] >= $40) and (B^[I] <= $4F) then
+    Inc(I);
+  if (I >= ALength) or (B^[I] <> $FF) then
+    Exit;
+  Inc(I);
+  if I >= ALength then
+    Exit;
+  ModRM := B^[I];
+  Inc(I);
+  if ((ModRM shr 3) and 7) <> 2 then
+    Exit;
+  ModBits := ModRM shr 6;
+  RMBits := ModRM and 7;
+  DispBytes := 0;
+  if ModBits <> 3 then
+  begin
+    if RMBits = 4 then
+    begin
+      if I >= ALength then
+        Exit;
+      SIB := B^[I];
+      Inc(I);
+      if (ModBits = 0) and ((SIB and 7) = 5) then
+        DispBytes := 4;
+    end
+    else if (ModBits = 0) and (RMBits = 5) then
+      DispBytes := 4;
+    if ModBits = 1 then
+      DispBytes := 1
+    else if ModBits = 2 then
+      DispBytes := 4;
+  end;
+  Inc(I, DispBytes);
+  Result := I = ALength;
+end;
+
+function X86CallSiteIsValid(const AReturnAddress: UIntPtr): Boolean;
+var
+  Bytes: TCrashInstructionBytes;
+  RangeIndex, Available, Offset, InstructionLength: Integer;
+  ReadAddress, TargetAddress, DistanceFromRangeLow: UIntPtr;
+  RelativeTarget: Int32;
+begin
+  Result := False;
+  RangeIndex := FindExecutableRange(AReturnAddress, 1);
+  if RangeIndex < 0 then
+    Exit;
+  if AReturnAddress <= GExecutableRanges[RangeIndex].LowAddress then
+    Exit;
+  DistanceFromRangeLow := AReturnAddress -
+    GExecutableRanges[RangeIndex].LowAddress;
+  if DistanceFromRangeLow > SizeOf(Bytes) then
+    Available := SizeOf(Bytes)
+  else
+    Available := Integer(DistanceFromRangeLow);
+  if Available < 2 then
+    Exit;
+  ReadAddress := AReturnAddress - UIntPtr(Available);
+  FillChar(Bytes, SizeOf(Bytes), 0);
+  Offset := SizeOf(Bytes) - Available;
+  if not CrashTryReadProcessMemory(ReadAddress, @Bytes[Offset], Available) then
+    Exit;
+
+  if (Available >= 5) and (Bytes[SizeOf(Bytes) - 5] = $E8) then
+  begin
+    Move(Bytes[SizeOf(Bytes) - 4], RelativeTarget, SizeOf(RelativeTarget));
+    if RelativeTarget >= 0 then
+    begin
+      if UIntPtr(RelativeTarget) <= High(UIntPtr) - AReturnAddress then
+      begin
+        TargetAddress := AReturnAddress + UIntPtr(RelativeTarget);
+        if FindExecutableRange(TargetAddress, 1) >= 0 then
+          Exit(True);
+      end;
+    end;
+    if RelativeTarget < 0 then
+      if UIntPtr(-Int64(RelativeTarget)) <= AReturnAddress then
+      begin
+        TargetAddress := AReturnAddress - UIntPtr(-Int64(RelativeTarget));
+        if FindExecutableRange(TargetAddress, 1) >= 0 then
+          Exit(True);
+      end;
+  end;
+
+  for InstructionLength := 2 to Available do
+    if X86FFCallEndsAt(@Bytes[SizeOf(Bytes) - InstructionLength],
+         InstructionLength) then
+      Exit(True);
+end;
+
+function ARM64InstructionIsCall(const AInstruction: UInt32): Boolean;
+const
+  BL_MASK = $FC000000;
+  BL_VALUE = $94000000;
+  BLR_MASK = $FFFFFC1F;
+  BLR_VALUE = $D63F0000;
+begin
+  Result := ((AInstruction and BL_MASK) = BL_VALUE) or
+    ((AInstruction and BLR_MASK) = BLR_VALUE);
+end;
+
+function ARM64CallSiteIsValid(const AReturnAddress: UIntPtr): Boolean;
+var
+  InstructionAddress: UIntPtr;
+  Instruction: UInt32;
+begin
+  Result := False;
+  if (AReturnAddress < SizeOf(Instruction)) or
+     ((AReturnAddress and 3) <> 0) or
+     (FindExecutableRange(AReturnAddress, 1) < 0) then
+    Exit;
+  InstructionAddress := AReturnAddress - SizeOf(Instruction);
+  if FindExecutableRange(InstructionAddress, SizeOf(Instruction)) < 0 then
+    Exit;
+  Instruction := 0;
+  if not CrashTryReadProcessMemory(InstructionAddress, @Instruction,
+       SizeOf(Instruction)) then
+    Exit;
+  Result := ARM64InstructionIsCall(Instruction);
+end;
+
+function CallSiteIsValid(const AReturnAddress: UIntPtr): Boolean;
+begin
+  {$IF Defined(CPUX64)}
+  Result := X86CallSiteIsValid(AReturnAddress);
+  {$ELSEIF Defined(CPUARM64)}
+  Result := ARM64CallSiteIsValid(AReturnAddress);
+  {$ELSE}
+  Result := False;
+  {$ENDIF}
+end;
+
+function AddTraceCandidate(var ACandidates: TCrashTraceCandidates;
+  const AStackPos, AAddress: UIntPtr; const AIsRaw: Boolean): Boolean;
+var
+  I, InsertAt: Integer;
+begin
+  Result := False;
+  if (AStackPos = 0) or (AAddress = 0) then
+    Exit;
+  for I := 0 to High(ACandidates) do
+    if ACandidates[I].StackPos = AStackPos then
+    begin
+      if ACandidates[I].IsRaw and (not AIsRaw) then
+      begin
+        ACandidates[I].Address := AAddress;
+        ACandidates[I].IsRaw := False;
+      end;
+      Exit;
+    end;
+  InsertAt := Length(ACandidates);
+  for I := 0 to High(ACandidates) do
+    if AStackPos < ACandidates[I].StackPos then
+    begin
+      InsertAt := I;
+      Break;
+    end;
+  SetLength(ACandidates, Length(ACandidates) + 1);
+  for I := High(ACandidates) downto InsertAt + 1 do
+    ACandidates[I] := ACandidates[I - 1];
+  ACandidates[InsertAt].StackPos := AStackPos;
+  ACandidates[InsertAt].Address := AAddress;
+  ACandidates[InsertAt].IsRaw := AIsRaw;
+  Result := True;
+end;
+
+procedure CompactTraceCandidates(var ACandidates: TCrashTraceCandidates);
+var
+  I, OutIndex: Integer;
+begin
+  OutIndex := 0;
+  for I := 0 to High(ACandidates) do
+  begin
+    // The same saved return address may be found by both sources at adjacent
+    // stack positions. Preserve real recursion within one source, but remove
+    // a cross-source duplicate after the position-based merge.
+    if (OutIndex > 0) and
+       (ACandidates[I].Address = ACandidates[OutIndex - 1].Address) and
+       (ACandidates[I].IsRaw <> ACandidates[OutIndex - 1].IsRaw) then
+      Continue;
+    ACandidates[OutIndex] := ACandidates[I];
+    Inc(OutIndex);
+  end;
+  SetLength(ACandidates, OutIndex);
+end;
+
+procedure BuildBoundedTrace(const ASlot: PCrashThreadCaptureSlot;
+  out ATrace: TCrashThreadRawTrace);
+var
+  Candidates: TCrashTraceCandidates;
+  I, N, OutIndex: Integer;
+  Address, StackPos, FirstFPPos, LastFPPos: UIntPtr;
+begin
+  ATrace := Default(TCrashThreadRawTrace);
+  ATrace.InterruptedIP := UIntPtr(ASlot.InterruptedIP);
+  ATrace.BoundsAvailable := ASlot.StackBoundsOK <> 0;
+  ATrace.StopReason := ASlot.StopReason;
+  Candidates := nil;
+  RefreshExecutableRanges;
+
+  FirstFPPos := 0;
+  LastFPPos := 0;
+  N := Min(ASlot.Count, CRASH_THREAD_CAPTURE_MAX_FRAMES);
+  for I := 0 to N - 1 do
+  begin
+    Address := ASlot.Addrs[I];
+    StackPos := ASlot.AddrStackPos[I];
+    if not CallSiteIsValid(Address) then
+    begin
+      ATrace.StopReason := tcsrFrameInvalidCode;
+      Break;
+    end;
+    if AddTraceCandidate(Candidates, StackPos, Address, False) then
+    begin
+      if FirstFPPos = 0 then
+        FirstFPPos := StackPos;
+      LastFPPos := StackPos;
+    end;
+  end;
+
+  N := Min(ASlot.RawWordCount, CRASH_THREAD_CAPTURE_RAW_WORDS);
+  for I := 0 to N - 1 do
+  begin
+    Address := ASlot.RawWords[I];
+    if not CallSiteIsValid(Address) then
+      Continue;
+    StackPos := ASlot.RawBaseSP + UIntPtr(I) * SizeOf(Pointer);
+    AddTraceCandidate(Candidates, StackPos, Address, True);
+  end;
+
+  CompactTraceCandidates(Candidates);
+  SetLength(ATrace.Addresses, Length(Candidates) +
+    Ord(ATrace.InterruptedIP <> 0));
+  OutIndex := 0;
+  if ATrace.InterruptedIP <> 0 then
+  begin
+    ATrace.Addresses[0] := ATrace.InterruptedIP;
+    OutIndex := 1;
+  end;
+  for I := 0 to High(Candidates) do
+  begin
+    // Exact kernel IP is already the first frame. Avoid the common duplicate
+    // where the first saved return address happens to contain the same value.
+    if (OutIndex = 1) and (ATrace.InterruptedIP <> 0) and
+       (Candidates[I].Address = ATrace.InterruptedIP) then
+      Continue;
+    ATrace.Addresses[OutIndex] := Candidates[I].Address;
+    Inc(OutIndex);
+    if Candidates[I].IsRaw then
+    begin
+      Inc(ATrace.RawFrameCount);
+      if (FirstFPPos <> 0) and (Candidates[I].StackPos > FirstFPPos) and
+         (Candidates[I].StackPos < LastFPPos) then
+        Inc(ATrace.RawInnerFrameCount);
+    end
+    else
+      Inc(ATrace.FPFrameCount);
+  end;
+  SetLength(ATrace.Addresses, OutIndex);
+end;
+{$ENDIF}
+
 procedure BuildTrace(const ASlot: PCrashThreadCaptureSlot;
   out ATrace: TCrashThreadRawTrace);
+{$IF Defined(CRASH_THREADCAP_LINUXLIKE)}
+begin
+  BuildBoundedTrace(ASlot, ATrace);
+end;
+{$ELSE}
 var
   I, N, StartIndex: Integer;
 begin
@@ -830,6 +1449,7 @@ begin
       ATrace.Addresses[I] := ASlot.Addrs[I];
   end;
 end;
+{$ENDIF}
 
 function CrashThreadCaptureCapture(const AHandle: TCrashThreadCaptureHandle;
   const AWaitMS: Integer; out ATrace: TCrashThreadRawTrace):
@@ -869,7 +1489,15 @@ begin
       Exit(tcoFailed);
 
     Slot.InterruptedIP := 0;
+    Slot.InterruptedSP := 0;
+    Slot.InterruptedFP := 0;
     Slot.Count := 0;
+    Slot.RawBaseSP := 0;
+    Slot.RawWordCount := 0;
+    Slot.StopReason := tcsrNone;
+    {$IFDEF AUTOTESTS}
+    Slot.TestHandlerStackAddress := 0;
+    {$ENDIF}
     TInterlocked.Exchange(Slot.State, SLOT_ARMED);
     SigNum := CrashThreadCaptureSignalNumber;
     if SigNum < 0 then
@@ -1084,6 +1712,139 @@ begin
     GCoordinatorLock.Leave;
   end;
 end;
+
+procedure CrashThreadCaptureTestBoundedWalk(const AStackLow, AStackHigh,
+  AStackPointer, AFramePointer: UIntPtr; out AFPCount, ARawWordCount: Integer;
+  out ARawBase, AFirstRawWord: UIntPtr;
+  out AStopReason: TCrashThreadCaptureStopReason);
+var
+  Slot: TCrashThreadCaptureSlot;
+begin
+  FillChar(Slot, SizeOf(Slot), 0);
+  Slot.StackLow := AStackLow;
+  Slot.StackHigh := AStackHigh;
+  Slot.StackBoundsOK := Ord((AStackLow <> 0) and (AStackHigh > AStackLow));
+  CaptureBoundedStack(@Slot, AStackPointer, AFramePointer);
+  AFPCount := Slot.Count;
+  ARawWordCount := Slot.RawWordCount;
+  ARawBase := Slot.RawBaseSP;
+  if Slot.RawWordCount > 0 then
+    AFirstRawWord := Slot.RawWords[0]
+  else
+    AFirstRawWord := 0;
+  AStopReason := Slot.StopReason;
+end;
+
+function CrashThreadCaptureTestX86FFCall(const ABytes: TBytes): Boolean;
+begin
+  {$IF Defined(CRASH_THREADCAP_LINUXLIKE) and Defined(CPUX64)}
+  Result := (Length(ABytes) > 0) and (Length(ABytes) <= 8) and
+    X86FFCallEndsAt(@ABytes[0], Length(ABytes));
+  {$ELSE}
+  Result := False;
+  {$ENDIF}
+end;
+
+function CrashThreadCaptureTestARM64Call(const AInstruction: UInt32): Boolean;
+begin
+  {$IF Defined(CRASH_THREADCAP_LINUXLIKE)}
+  Result := ARM64InstructionIsCall(AInstruction);
+  {$ELSE}
+  Result := False;
+  {$ENDIF}
+end;
+
+function CrashThreadCaptureTestMergeRules: Boolean;
+{$IF Defined(CRASH_THREADCAP_LINUXLIKE)}
+var
+  Candidates: TCrashTraceCandidates;
+begin
+  Candidates := nil;
+  Result := AddTraceCandidate(Candidates, 32, $2000, False) and
+    (not AddTraceCandidate(Candidates, 32, $3000, True)) and
+    AddTraceCandidate(Candidates, 16, $1000, True) and
+    AddTraceCandidate(Candidates, 24, $2000, True) and
+    AddTraceCandidate(Candidates, 48, $4000, False);
+  if not Result then
+    Exit;
+  CompactTraceCandidates(Candidates);
+  Result := (Length(Candidates) = 3) and
+    (Candidates[0].StackPos = 16) and Candidates[0].IsRaw and
+    (Candidates[1].StackPos = 24) and Candidates[1].IsRaw and
+    (Candidates[2].StackPos = 48) and (not Candidates[2].IsRaw);
+end;
+{$ELSE}
+begin
+  Result := False;
+end;
+{$ENDIF}
+
+function CrashThreadCaptureTestSetContextOverride(
+  const AHandle: TCrashThreadCaptureHandle; const AStackLow, AStackHigh,
+  AStackPointer, AFramePointer: UIntPtr): Boolean;
+var
+  Slot: PCrashThreadCaptureSlot;
+begin
+  Result := False;
+  GCoordinatorLock.Enter;
+  try
+    GServiceLock.Enter;
+    try
+      Slot := SlotFromHandle(AHandle);
+      if (Slot = nil) or (SlotState(Slot) <> SLOT_IDLE) then
+        Exit;
+      TInterlocked.Exchange(Slot.TestContextOverride, 0);
+      Slot.StackLow := AStackLow;
+      Slot.StackHigh := AStackHigh;
+      Slot.StackBoundsOK := Ord((AStackLow <> 0) and
+        (AStackHigh > AStackLow));
+      Slot.TestStackPointer := AStackPointer;
+      Slot.TestFramePointer := AFramePointer;
+      TInterlocked.Exchange(Slot.TestContextOverride, 1);
+      Result := True;
+    finally
+      GServiceLock.Leave;
+    end;
+  finally
+    GCoordinatorLock.Leave;
+  end;
+end;
+
+function CrashThreadCaptureTestHandlerStackAddress(
+  const AHandle: TCrashThreadCaptureHandle): UIntPtr;
+var
+  Slot: PCrashThreadCaptureSlot;
+begin
+  Result := 0;
+  GServiceLock.Enter;
+  try
+    Slot := SlotFromHandle(AHandle);
+    if (Slot <> nil) and (SlotState(Slot) <> SLOT_FREE) then
+      Result := Slot.TestHandlerStackAddress;
+  finally
+    GServiceLock.Leave;
+  end;
+end;
+
+function CrashThreadCaptureTestActionUsesAltStack: Boolean;
+var
+  Action: sigaction_t;
+  SignalNumber: Integer;
+begin
+  Result := False;
+  SignalNumber := CrashThreadCaptureSignalNumber;
+  if SignalNumber < 0 then
+    Exit;
+  FillChar(Action, SizeOf(Action), 0);
+  if sigaction(SignalNumber, nil, @Action) <> 0 then
+    Exit;
+  {$IF Defined(CRASH_THREADCAP_LINUXLIKE)}
+  Result := ActionIsOurs(Action) and
+    ((Action.sa_flags and SA_ONSTACK) <> 0);
+  {$ELSE}
+  Result := ActionIsOurs(Action);
+  {$ENDIF}
+end;
 {$ENDIF}
 
 procedure ForceShutdown;
@@ -1106,6 +1867,8 @@ begin
       GCaptureSignal := -1;
       TInterlocked.Exchange(GActive, 0);
       GRefreshProc := nil;
+      GExecutableRanges := nil;
+      GExecutableRangesTick := 0;
     finally
       GServiceLock.Leave;
     end;
@@ -1159,6 +1922,16 @@ begin
   ATrace := Default(TCrashThreadRawTrace);
   Result := tcoUnavailable;
 end;
+function CrashThreadCaptureStopReasonText(
+  const AReason: TCrashThreadCaptureStopReason): String;
+begin
+  Result := 'none';
+end;
+function CrashThreadCaptureFormatDiagnostics(const AThreadID: UInt64;
+  const ATrace: TCrashThreadRawTrace): String;
+begin
+  Result := '';
+end;
 {$IFDEF AUTOTESTS}
 function CrashThreadCaptureCurrentSignalBlocked: Boolean;
 begin
@@ -1196,6 +1969,44 @@ begin
 end;
 procedure CrashThreadCaptureTestResetAllQuarantined;
 begin
+end;
+procedure CrashThreadCaptureTestBoundedWalk(const AStackLow, AStackHigh,
+  AStackPointer, AFramePointer: UIntPtr; out AFPCount, ARawWordCount: Integer;
+  out ARawBase, AFirstRawWord: UIntPtr;
+  out AStopReason: TCrashThreadCaptureStopReason);
+begin
+  AFPCount := 0;
+  ARawWordCount := 0;
+  ARawBase := 0;
+  AFirstRawWord := 0;
+  AStopReason := tcsrBoundsNone;
+end;
+function CrashThreadCaptureTestX86FFCall(const ABytes: TBytes): Boolean;
+begin
+  Result := False;
+end;
+function CrashThreadCaptureTestARM64Call(const AInstruction: UInt32): Boolean;
+begin
+  Result := False;
+end;
+function CrashThreadCaptureTestMergeRules: Boolean;
+begin
+  Result := False;
+end;
+function CrashThreadCaptureTestSetContextOverride(
+  const AHandle: TCrashThreadCaptureHandle; const AStackLow, AStackHigh,
+  AStackPointer, AFramePointer: UIntPtr): Boolean;
+begin
+  Result := False;
+end;
+function CrashThreadCaptureTestHandlerStackAddress(
+  const AHandle: TCrashThreadCaptureHandle): UIntPtr;
+begin
+  Result := 0;
+end;
+function CrashThreadCaptureTestActionUsesAltStack: Boolean;
+begin
+  Result := False;
 end;
 {$ENDIF}
 

@@ -110,6 +110,7 @@ type
     Name: String;
     State: TCrashThreadCaptureState;
     CallStack: TCrashStack;
+    CaptureDiagnostics: String;
   end;
 
   { A captured exception report: message, fault location, full call stack, and
@@ -121,6 +122,9 @@ type
     CallStack: TCrashStack;
     ExtendedThreads: TArray<TCrashThreadStack>;
     ExtendedThreadsOmitted: Integer;
+    { Free-text bounded-capture diagnostics for the primary sampled thread
+      (currently the watched thread in freeze reports). }
+    PrimaryCaptureDiagnostics: String;
     Source: TCrashSource;
     { Freeze-watchdog report (Crash.Freeze): the stack is a SAMPLE of a running
       thread, not a raise point - BugID generation uses the freeze
