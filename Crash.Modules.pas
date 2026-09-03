@@ -60,6 +60,8 @@ uses
   {$IF Defined(LINUX) or Defined(ANDROID)}
   , Posix.Base, Posix.Fcntl, Posix.Unistd, Posix.Errno, Posix.SysTypes,
     Posix.SysUio
+  {$ELSEIF Defined(MACOS)}
+  , Posix.Base, Macapi.Mach
   {$ENDIF}
   ;
 
@@ -374,6 +376,13 @@ function _dyld_get_image_name(image_index: UInt32): MarshaledAString; cdecl;
   external libdyld name '_dyld_get_image_name';
 function _dyld_get_image_header(image_index: UInt32): Pointer; cdecl;
   external libdyld name '_dyld_get_image_header';
+function _dyld_get_image_vmaddr_slide(image_index: UInt32): NativeInt; cdecl;
+  external libdyld name '_dyld_get_image_vmaddr_slide';
+
+function crash_vm_read_overwrite(target_task: vm_map_t;
+  address: vm_address_t; size: vm_size_t; data: vm_address_t;
+  var outsize: vm_size_t): kern_return_t; cdecl;
+  external libc name _PU + 'vm_read_overwrite';
 
 type
   Pmach_header_64 = ^Tmach_header_64;
@@ -397,6 +406,8 @@ type
 
 const
   LC_SEGMENT_64 = $19;
+  CRASH_VM_PROT_READ = 1;
+  CRASH_VM_PROT_EXECUTE = 4;
 
 function SumSegmentSizes(Header: Pmach_header_64): UInt64;
 var
@@ -448,14 +459,110 @@ begin
 end;
 
 function CrashEnumerateReadableExecutableRanges: TCrashExecutableRanges;
+var
+  Count, ImageIndex, CommandIndex: UInt32;
+  HeaderAddress, CommandAddress, CommandsSize, CommandOffset: UIntPtr;
+  RuntimeLow, RuntimeHigh, SlideMagnitude: UIntPtr;
+  Slide: NativeInt;
+  Header: Tmach_header_64;
+  Command: Tload_command;
+  Segment: Tsegment_command_64;
+  RangeIndex: Integer;
 begin
   Result := nil;
+  Count := _dyld_image_count;
+  if Count = 0 then
+    Exit;
+  for ImageIndex := 0 to Count - 1 do
+  begin
+    HeaderAddress := UIntPtr(_dyld_get_image_header(ImageIndex));
+    if (HeaderAddress = 0) or
+       (not CrashTryReadProcessMemory(HeaderAddress, @Header,
+         SizeOf(Header))) then
+      Continue;
+    CommandsSize := UIntPtr(Header.sizeofcmds);
+    if (CommandsSize = 0) or
+       (HeaderAddress > High(UIntPtr) - SizeOf(Header)) then
+      Continue;
+    CommandAddress := HeaderAddress + SizeOf(Header);
+    if CommandsSize > High(UIntPtr) - CommandAddress then
+      Continue;
+    CommandOffset := 0;
+    Slide := _dyld_get_image_vmaddr_slide(ImageIndex);
+    if Slide < 0 then
+      SlideMagnitude := UIntPtr(-(Slide + 1)) + 1
+    else
+      SlideMagnitude := UIntPtr(Slide);
+
+    if Header.ncmds = 0 then
+      Continue;
+    for CommandIndex := 0 to Header.ncmds - 1 do
+    begin
+      if (CommandOffset > CommandsSize) or
+         (CommandsSize - CommandOffset < SizeOf(Command)) or
+         (CommandOffset > High(UIntPtr) - CommandAddress) or
+         (not CrashTryReadProcessMemory(CommandAddress + CommandOffset,
+           @Command, SizeOf(Command))) then
+        Break;
+      if (Command.cmdsize < SizeOf(Command)) or
+         (UIntPtr(Command.cmdsize) > CommandsSize - CommandOffset) then
+        Break;
+
+      if (Command.cmd = LC_SEGMENT_64) and
+         (Command.cmdsize >= SizeOf(Segment)) and
+         CrashTryReadProcessMemory(CommandAddress + CommandOffset,
+           @Segment, SizeOf(Segment)) and
+         ((Segment.initprot and CRASH_VM_PROT_READ) <> 0) and
+         ((Segment.initprot and CRASH_VM_PROT_EXECUTE) <> 0) and
+         (Segment.vmsize > 0) then
+      begin
+        if Slide < 0 then
+        begin
+          if UInt64(SlideMagnitude) > Segment.vmaddr then
+          begin
+            Inc(CommandOffset, Command.cmdsize);
+            Continue;
+          end;
+          RuntimeLow := UIntPtr(Segment.vmaddr - UInt64(SlideMagnitude));
+        end
+        else
+        begin
+          if UInt64(SlideMagnitude) > High(UIntPtr) - Segment.vmaddr then
+          begin
+            Inc(CommandOffset, Command.cmdsize);
+            Continue;
+          end;
+          RuntimeLow := UIntPtr(Segment.vmaddr + UInt64(SlideMagnitude));
+        end;
+        if (Segment.vmsize <= High(UIntPtr) - RuntimeLow) then
+        begin
+          RuntimeHigh := RuntimeLow + UIntPtr(Segment.vmsize);
+          RangeIndex := Length(Result);
+          SetLength(Result, RangeIndex + 1);
+          Result[RangeIndex].LowAddress := RuntimeLow;
+          Result[RangeIndex].HighAddress := RuntimeHigh;
+        end;
+      end;
+      Inc(CommandOffset, Command.cmdsize);
+    end;
+  end;
 end;
 
 function CrashTryReadProcessMemory(const AAddress: UIntPtr; ABuffer: Pointer;
   const ASize: NativeUInt): Boolean;
+var
+  OutSize: vm_size_t;
 begin
-  Result := False;
+  Result := ASize = 0;
+  if Result then
+    Exit;
+  if (AAddress = 0) or (ABuffer = nil) then
+    Exit(False);
+  OutSize := 0;
+  Result := (crash_vm_read_overwrite(mach_task_self,
+    vm_address_t(AAddress), vm_size_t(ASize),
+    vm_address_t(UIntPtr(ABuffer)), OutSize) = KERN_SUCCESS) and
+    (OutSize = vm_size_t(ASize));
 end;
 
 // =========================================================================

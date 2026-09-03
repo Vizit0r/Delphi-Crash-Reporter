@@ -271,6 +271,9 @@ begin
      ((CurrentSS.ss_flags and ALT_SS_DISABLE) = 0) then
   begin
     FillChar(DisableSS, SizeOf(DisableSS), 0);
+    // Keep sp/size valid for SS_DISABLE: XNU checks the size.
+    DisableSS.ss_sp := Owned;
+    DisableSS.ss_size := ALT_STACK_BYTES;
     DisableSS.ss_flags := ALT_SS_DISABLE;
     if sigaltstack(@DisableSS, nil) <> 0 then
       Exit;

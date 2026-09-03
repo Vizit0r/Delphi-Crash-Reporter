@@ -34,7 +34,7 @@ Derived from [grijjy/JustAddCode](https://github.com/grijjy/JustAddCode)
 | EL-compatible `.el` output | ✅ | ✅ | ✅ | ⚠ compile-only | — |
 | Save / upload / dialog / restart | ✅ | ✅ | ✅ (no restart) | ⚠ compile-only, no restart | — |
 | Freeze (hang) watchdog + restart-on-freeze | ✅ (x64) | ✅ | ✅ (report-only) | — | — |
-| Extended thread stacks (registered threads) | ✅ (x64) | ✅ (cross-built; shares the freeze signal service) | ✅ (ARM64) | — | — (formatter only) |
+| Extended thread stacks (registered threads) | ✅ (x64) | ✅ (x64/ARM64; shares the freeze signal service) | ✅ (ARM64) | — | — (formatter only) |
 
 **iOS is experimental and compile-only.** Its ordinary Pascal-exception/report path is
 expected to work, but no device runtime has verified it. Hardware register/raw capture is
@@ -221,7 +221,7 @@ Core (framework-agnostic):
 - `Crash.Reporter` — public façade: `TCrashConfig`, `DefaultCrashConfig`, `TCrashReporter`.
 - `Crash.CallStack` — RTL exception hooks + stack capture; `TCrashCapture`, `TCrashReport`, `TCrashReportSection`.
 - `Crash.Signals` — POSIX `sigaction` CPU-register snapshot for hardware faults.
-- `Crash.ThreadCapture` — process-wide POSIX service that samples a registered thread's stack in place: capture-signal ownership, preallocated per-thread slots, dual `pthread_t` + kernel-id identity, late-signal handling. Used by `Crash.Freeze` and by the extended-thread collector.
+- `Crash.ThreadCapture` — process-wide POSIX service that samples a registered thread's stack in place: capture-signal ownership, registration-time stack bounds, a bounded FP/raw walker, preallocated per-thread slots, dual `pthread_t` + kernel-id identity, and late-signal handling. Used by `Crash.Freeze` and by the extended-thread collector.
 - `Crash.Breadcrumbs` — bounded, thread-safe host diagnostic trail.
 - `Crash.RawFallback` — preallocated binary fallback slots and startup recovery.
 - `Crash.Modules` — loaded-module enumeration.
@@ -526,8 +526,9 @@ translated back to the captured address range.
 watchdog thread watches heartbeats from the thread the host wants covered
 (normally the main/UI loop, which calls `TCrashFreeze.Ping` from its loop); when
 they stop for `FreezeTimeoutMS`, the watchdog captures the frozen thread's stack
-**in place** (through the shared `Crash.ThreadCapture` signal service: a realtime signal + in-handler unwind; SIGUSR2 + libSystem
-backtrace on macOS) and writes a regular `.el` with exception class
+**in place** through the shared `Crash.ThreadCapture` service (a realtime signal
+on Linux/Android or SIGUSR2 on macOS plus the bounded FP/raw walker described
+below) and writes a regular `.el` with exception class
 `EFrozenApplication` and a `Freeze Info` section. Detection arms only after the
 first ping — a slow cold start is never a freeze — episodes are one report each
 and capped per run, and `BeginLongOperation` / `EndLongOperation` (nestable)
@@ -601,8 +602,9 @@ Registration is per thread and idempotent. It installs a per-thread alternate
 signal stack (a stack the host already installed is borrowed and never disabled
 or freed), adds the thread-level Mach exception observer on macOS x86-64,
 records the thread under the given name and, when `ExtendedThreads` is on,
-reserves a capture slot so the thread's stack can ride along in other threads'
-reports. `UnregisterCurrentThread` must run on the same thread before it exits
+reserves a capture slot and records that thread's real stack bounds so its stack
+can ride along in other threads' reports. `UnregisterCurrentThread` must run on
+the same thread before it exits
 (a `finally` in the thread body is the right place): a thread that dies without
 it is treated as untrusted and is never sampled on faith. The name goes into the
 report verbatim, after `;` becomes `.`, CR/LF/TAB/`|`/`=` become spaces and the
@@ -616,7 +618,9 @@ reporter and the signal handlers are active, the freeze detector state,
 `Registered`, `ThreadID`, `Name`, `AltStack` (not required / unavailable /
 borrowed / owned) and `MachHandler` (not required / unavailable / installed).
 Only threads that actually registered are listed; plain `TThread` descendants
-that never called the API are deliberately absent rather than inferred.
+that never called the API are deliberately absent rather than inferred. The
+library does not enumerate or suspend arbitrary application threads, so direct
+`TThread` descendants remain an explicit host integration responsibility.
 
 **Registering a thread has a side effect once `ExtendedThreads` is on:** every
 report sends that thread a signal. `SA_RESTART` restarts most blocking syscalls
@@ -640,11 +644,22 @@ were doing around the crash, not just the raise point.
   reporting thread excluded; registrations beyond the limit are summarized as
   `Extended threads omitted by limit: N` in `Crash Signal Info`.
 - Each thread receives the capture signal (a free realtime signal on
-  Linux/Android, SIGUSR2 on macOS); the handler runs on the target thread,
-  unwinds into a preallocated slot and returns: no allocation, no locks,
-  nothing else. The reporter waits at most **100 ms** per thread and **1000 ms**
-  in total on a monotonic deadline; symbolization happens afterwards on the
-  reporting thread, and the stacks are cut to `TCrashCapture.MaxCallStackDepth`.
+  Linux/Android, SIGUSR2 on macOS). The action uses `SA_ONSTACK` on every
+  supported POSIX target. The handler records the kernel-supplied exact IP/SP/FP
+  and walks only inside the bounds saved at registration: at most 64 FP records
+  plus 128 pointer-sized raw words, all into a preallocated slot, with no
+  allocation, strings, locks, symbolization or platform unwinder. The reporter
+  waits at most **100 ms** per thread and **1000 ms** in total on a monotonic
+  deadline; symbolization happens afterwards on the reporting thread, and the
+  stacks are cut to `TCrashCapture.MaxCallStackDepth`.
+- On that calm reporting path, saved return-address candidates must belong to a
+  readable executable mapping and follow a supported call instruction. Code is
+  read fault-free (`process_vm_readv` on Linux/Android,
+  `vm_read_overwrite` on macOS), so a stale/unreadable mapping is rejected rather
+  than faulting inside the reporter. ARM64 signed/PAC-like addresses fail closed.
+  FP-derived frames are the trusted source; the raw scan is a bounded heuristic
+  used to recover callers across leaf/non-FP code and may still omit a real frame
+  or accept a call-shaped value from stack data.
 - A thread that could not be sampled still gets its block, with the reason in
   `Comment=` instead of frames: `Extended capture timed out`, `Thread exited
   during extended capture`, `Extended capture signal unavailable`, `Extended
@@ -669,6 +684,10 @@ macOS x86-64/ARM64; elsewhere `ExtendedThreadsAvailable` is `False` and
 reports stay single-threaded. On Windows the formatter still renders a
 multi-thread report handed to it, but nothing captures one (EurekaLog
 territory).
+
+This hardening is intentionally scoped to the signal-time registered-thread
+sampler. `Crash.CallStack` may still use the platform unwinder for the primary
+stack on its normal, non-signal reporting path.
 
 In the `.el` the extra threads are native EurekaLog blocks inside the Call Stack
 table, after the exception thread, and the Viewer lists them as `Running
