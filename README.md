@@ -68,6 +68,7 @@ begin
   Cfg.UploadUrl       := 'https://example.com/upload.php';
   Cfg.OnShowDialog    := ShowCrashDialog;  // GUI; omit for headless
   Cfg.ExtendedThreads := True;             // stacks of registered worker threads in every report
+  Cfg.ExtendedThreadsMax := 32;             // <= 0 uses 32; hard-clamped to 128
   TCrashReporter.Init(Cfg);
 
   // FMX GUI: also catch main-thread exceptions before the RTL does.
@@ -120,6 +121,7 @@ vary is a field — there are no compile-time constants baked into the library.
 | `RestartOnFreeze` | `False` | After the freeze report, replace the frozen process with a fresh instance; the next boot surfaces the notice and re-uploads the report (see *Freeze detection*) |
 | `OnFreezeReport` | `nil` | Per-episode host notification (fires on the watchdog thread) |
 | `ExtendedThreads` | `False` | Also capture the stacks of the other registered application threads into every report (see *Extended thread stacks*). Off in the standalone library; a host opts in |
+| `ExtendedThreadsMax` | `0` | Maximum extended-thread blocks per report. Values `<= 0` use the default `32`; values above the hard limit are clamped to `128` |
 
 Set the env var `CRASH_NO_UPLOAD=1` to skip uploads and keep the file on disk
 (useful for local testing).
@@ -590,7 +592,7 @@ The thread that calls `Init` is covered automatically. Any other application
 thread that should get the same treatment registers itself from its own body:
 
 ```pascal
-TCrashReporter.RegisterCurrentThread('Worker');
+TCrashReporter.RegisterCurrentThread('Worker', GroupID);
 try
   ...
 finally
@@ -598,7 +600,10 @@ finally
 end;
 ```
 
-Registration is per thread and idempotent. It installs a per-thread alternate
+`GroupID` is optional and defaults to zero. A nonzero value identifies threads
+that belong to the same logical owner for report-selection purposes; zero is
+the global/compatibility group. Registration is per thread and idempotent. It
+installs a per-thread alternate
 signal stack (a stack the host already installed is borrowed and never disabled
 or freed), adds the thread-level Mach exception observer on macOS x86-64,
 records the thread under the given name and, when `ExtendedThreads` is on,
@@ -615,8 +620,10 @@ reporter and the signal handlers are active, the freeze detector state,
 `ExtendedThreadsEnabled` (the configuration) next to `ExtendedThreadsAvailable`
 (the platform backend really acquired a capture signal), and one
 `TCrashThreadCoverage` per registered thread in registration order:
-`Registered`, `ThreadID`, `Name`, `AltStack` (not required / unavailable /
-borrowed / owned) and `MachHandler` (not required / unavailable / installed).
+`Registered`, `ThreadID`, `Name`, `GroupID`, `ExtendedCaptureAvailable`,
+`AltStack` (not required / unavailable / borrowed / owned) and `MachHandler`
+(not required / unavailable / installed). `ExtendedCaptureAvailable=False`
+keeps the registration visible when the fixed raw-slot pool is exhausted.
 Only threads that actually registered are listed; plain `TThread` descendants
 that never called the API are deliberately absent rather than inferred. The
 library does not enumerate or suspend arbitrary application threads, so direct
@@ -640,9 +647,17 @@ sample of the other registered threads, so one `.el` shows what the workers
 were doing around the crash, not just the raise point.
 
 - After `OnFilterReport` accepted the report (a dropped report signals nobody),
-  up to **32** registered threads are sampled in registration order, the
-  reporting thread excluded; registrations beyond the limit are summarized as
-  `Extended threads omitted by limit: N` in `Crash Signal Info`.
+  at most `ExtendedThreadsMax` registered threads are sampled, the reporting
+  thread excluded. The effective default is **32** and the hard maximum is
+  **128**. With primary `GroupID=0` the previous registration-order selection
+  is preserved. With a nonzero primary group the bounded selection order is:
+  one Own thread, up to two Global (`GroupID=0`) threads, remaining Own, then
+  remaining Global, then Foreign. The Foreign tail first takes the oldest
+  member of each distinct group and only then repeats groups. Candidates that
+  do not fit are summarized as `Extended threads omitted by limit: N` in
+  `Crash Signal Info`. MAIN is normally the oldest Global registration, so the
+  first Global slot and a 100 ms reserve protect one bounded MAIN attempt even
+  after blocked Own candidates consumed most of the one-second round.
 - Each thread receives the capture signal (a free realtime signal on
   Linux/Android, SIGUSR2 on macOS). The action uses `SA_ONSTACK` on every
   supported POSIX target. The handler records the kernel-supplied exact IP/SP/FP
@@ -664,6 +679,11 @@ were doing around the crash, not just the raise point.
   `Comment=` instead of frames: `Extended capture timed out`, `Thread exited
   during extended capture`, `Extended capture signal unavailable`, `Extended
   capture budget exceeded`, `Extended capture failed`.
+- The process-wide capture pool has **256** preallocated raw slots. Running out
+  does not hide the thread: its coverage entry remains registered with
+  `ExtendedCaptureAvailable=False`, and a selected report block says
+  `Extended capture signal unavailable`. Alternate-stack memory is allocated
+  per registered thread independently of this fixed pool.
 - A timed-out thread is not written off: its one late signal is consumed when
   it finally arrives, and the thread is sampled normally in the next report. A
   thread whose `pthread_t` was recycled is told apart by a second, kernel-level
@@ -700,8 +720,18 @@ Thread` entries on its Call Stack tab:
 |Running Thread: ID=650970816; Parent=0; Priority=0
 |Class=; Name=ExtendedDemoWorker
 |DeadLock=0; Wait Chain=
-|Comment=
+|Comment=Group=000000000000002A
 ```
+
+The Viewer materializes a thread entry only when its block contains at least
+one frame. A valid no-frame block still remains in the raw `.el`, including its
+`Comment=Extended capture ...` reason and optional group, but EurekaLog Viewer
+7.15 does not show that block on the Call Stack tab.
+
+For a nonzero group, the comment is `<state>; Group=<16HEX>` or just
+`Group=<16HEX>` when no state text exists. Group zero keeps the old `Comment=`
+bytes unchanged. The same composed string is used in both the table-width
+measure pass and the emit pass, including the primary block.
 
 ## EurekaLog `.el` compatibility
 

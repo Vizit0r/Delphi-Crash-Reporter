@@ -149,6 +149,9 @@ type
     { Capture registered application threads in addition to the exception/frozen
       thread. Default False in the standalone library; the host opts in. }
     ExtendedThreads: Boolean;
+    { Maximum number of additional registered threads included in one report.
+      <=0 selects the default 32; 1..128 is exact; larger values clamp to 128. }
+    ExtendedThreadsMax: Integer;
     { No-heartbeat threshold before a freeze report is captured. Default 30000. }
     FreezeTimeoutMS: Integer;
     { Restart the process after a freeze report: a fresh instance is spawned
@@ -188,6 +191,8 @@ type
     Registered: Boolean;
     ThreadID: UInt64;
     Name: String;
+    GroupID: UInt64;
+    ExtendedCaptureAvailable: Boolean;
     AltStack: TCrashAltStackState;
     MachHandler: TCrashMachState;
   end;
@@ -266,6 +271,10 @@ function CrashAutoTestOperationLifetimeGate: Boolean;
 function CrashAutoTestSanitizeThreadName(const AName: String): String;
 function CrashAutoTestSetExtendedCaptureOverride(
   const AEnabled: Boolean): Boolean;
+function CrashAutoTestEffectiveExtendedThreadsMax(
+  const AConfigured: Integer): Integer;
+function CrashAutoTestSetExtendedThreadsMax(const AValue: Integer;
+  out APrevious: Integer): Boolean;
 function CrashAutoTestCaptureExtendedThreads(const APrimaryThreadID: UInt64;
   out AThreads: TArray<TCrashThreadStack>; out AOmitted: Integer;
   out ATotalMS, AMaxThreadMS: UInt64): Boolean;
@@ -326,7 +335,8 @@ type
     class procedure ClearBreadcrumbs; static;
     { Cover the CALLING thread on a calm path. Repeated calls from the same
       thread are idempotent. AName is diagnostic only. }
-    class function RegisterCurrentThread(const AName: String = ''):
+    class function RegisterCurrentThread(const AName: String = '';
+      const AGroupID: UInt64 = 0):
       TCrashThreadCoverage; static;
     { Final action of a registered worker's try/finally. Owned alt-stack is
       disabled then freed; a borrowed stack is never touched. On macOS the
@@ -495,6 +505,7 @@ begin
   Result.BreadcrumbCapacity := CRASH_BREADCRUMB_DEFAULT_CAPACITY;
   Result.FreezeDetection := False; // opt in - see the field comment
   Result.ExtendedThreads := False; // standalone library is conservative
+  Result.ExtendedThreadsMax := 0;  // <=0 selects the default 32
   Result.FreezeTimeoutMS := 30000;
   Result.RestartOnFreeze := False; // opt in - see the field comment
 end;
@@ -811,10 +822,14 @@ type
     CaptureHandle: TCrashThreadCaptureHandle;
   end;
 
+  TCrashThreadCandidateTier = (tctOwn, tctGlobal, tctForeign);
+
   TCrashThreadCandidate = record
     ThreadID: UInt64;
     Name: String;
+    GroupID: UInt64;
     Sequence: UInt64;
+    Tier: TCrashThreadCandidateTier;
   end;
 
   TCrashReporterImpl = class
@@ -957,12 +972,23 @@ begin
 end;
 
 const
-  CRASH_EXTENDED_MAX_THREADS = 32;
+  CRASH_EXTENDED_DEFAULT_THREADS = 32;
+  CRASH_EXTENDED_HARD_MAX_THREADS = 128;
   CRASH_EXTENDED_THREAD_WAIT_MS = 100;
   CRASH_EXTENDED_TOTAL_BUDGET_MS = 1000;
   CRASH_EXTENDED_MIN_WAIT_MS = 2;
   CRASH_EXTENDED_LOCK_BUDGET_MS = 10;
   CRASH_EXTENDED_NAME_MAX_CHARS = 128;
+
+function CrashEffectiveExtendedThreadsMax(
+  const AConfigured: Integer): Integer;
+begin
+  if AConfigured <= 0 then
+    Exit(CRASH_EXTENDED_DEFAULT_THREADS);
+  if AConfigured > CRASH_EXTENDED_HARD_MAX_THREADS then
+    Exit(CRASH_EXTENDED_HARD_MAX_THREADS);
+  Result := AConfigured;
+end;
 
 function CrashSanitizeThreadName(const AName: String): String;
 begin
@@ -1005,6 +1031,31 @@ begin
     GAutoTestExtendedCaptureOwned := False;
   end;
   Result := True;
+end;
+
+function CrashAutoTestEffectiveExtendedThreadsMax(
+  const AConfigured: Integer): Integer;
+begin
+  Result := CrashEffectiveExtendedThreadsMax(AConfigured);
+end;
+
+function CrashAutoTestSetExtendedThreadsMax(const AValue: Integer;
+  out APrevious: Integer): Boolean;
+var
+  Reporter: TCrashReporterImpl;
+begin
+  APrevious := 0;
+  Reporter := GReporter;
+  Result := (Reporter <> nil) and Reporter.FInstalled;
+  if not Result then
+    Exit;
+  Reporter.FLock.Enter;
+  try
+    APrevious := Reporter.FConfig.ExtendedThreadsMax;
+    Reporter.FConfig.ExtendedThreadsMax := AValue;
+  finally
+    Reporter.FLock.Leave;
+  end;
 end;
 
 function CrashAutoTestCaptureExtendedThreads(const APrimaryThreadID: UInt64;
@@ -1144,47 +1195,184 @@ function TCrashReporterImpl.CaptureExtendedThreads(var AReport: TCrashReport;
   const APrimaryThreadID: UInt64;
   const ABoundedRegistry: Boolean): Integer;
 var
-  Candidates: array [0..CRASH_EXTENDED_MAX_THREADS - 1] of
+  Candidates: array [0..CRASH_EXTENDED_HARD_MAX_THREADS - 1] of
     TCrashThreadCandidate;
-  CandidateCount, EligibleCount, I, WaitMS, MaxDepth: Integer;
+  SeenForeignGroups: array [0..CRASH_EXTENDED_HARD_MAX_THREADS - 1] of
+    UInt64;
+  CandidateCount, EligibleCount, EffectiveLimit, OwnCount, GlobalCount,
+    OwnQuota, GlobalQuota, RemainingSlots, SeenForeignCount, I, WaitMS,
+    MaxDepth: Integer;
   Candidate: TCrashThreadCandidate;
   Registration, CurrentRegistration: TCrashThreadRegistration;
   Handle: TCrashThreadCaptureHandle;
   Trace: TCrashThreadRawTrace;
   Outcome: TCrashThreadCaptureOutcome;
-  Deadline, NowTick, Remaining: UInt64;
-  LeaseHeld, StillOwned: Boolean;
+  PrimaryGroupID: UInt64;
+  Deadline, OwnDeadline, CaptureDeadline, NowTick, Remaining: UInt64;
+  LeaseHeld, StillOwned, HasGlobalReserve: Boolean;
   {$IFDEF AUTOTESTS}
   CaptureStart, CaptureElapsed: UInt64;
   {$ENDIF}
+
+  function IsEligible(const ARegistration: TCrashThreadRegistration): Boolean;
+  begin
+    Result := (not ARegistration.Closing) and
+      (ARegistration.Coverage.ThreadID <> APrimaryThreadID);
+  end;
+
+  procedure AddCandidate(const ARegistration: TCrashThreadRegistration;
+    const ATier: TCrashThreadCandidateTier);
+  begin
+    if CandidateCount >= EffectiveLimit then
+      Exit;
+    Candidates[CandidateCount].ThreadID :=
+      ARegistration.Coverage.ThreadID;
+    Candidates[CandidateCount].Name := ARegistration.Coverage.Name;
+    Candidates[CandidateCount].GroupID := ARegistration.Coverage.GroupID;
+    Candidates[CandidateCount].Sequence := ARegistration.Sequence;
+    Candidates[CandidateCount].Tier := ATier;
+    Inc(CandidateCount);
+  end;
+
+  function ForeignGroupSeen(const AGroupID: UInt64): Boolean;
+  var
+    K: Integer;
+  begin
+    for K := 0 to SeenForeignCount - 1 do
+      if SeenForeignGroups[K] = AGroupID then
+        Exit(True);
+    Result := False;
+  end;
+
+  function CandidateAlreadySelected(const ASequence: UInt64): Boolean;
+  var
+    K: Integer;
+  begin
+    for K := 0 to CandidateCount - 1 do
+      if Candidates[K].Sequence = ASequence then
+        Exit(True);
+    Result := False;
+  end;
 begin
   Result := 0;
   AReport.ExtendedThreads := nil;
   AReport.ExtendedThreadsOmitted := 0;
+  AReport.PrimaryGroupID := 0;
   if not ExtendedCaptureOperational then
     Exit;
 
   CandidateCount := 0;
   EligibleCount := 0;
+  OwnCount := 0;
+  GlobalCount := 0;
+  SeenForeignCount := 0;
+  EffectiveLimit := CrashEffectiveExtendedThreadsMax(
+    FConfig.ExtendedThreadsMax);
   if not EnterRegistryForCapture(ABoundedRegistry) then
     Exit;
   try
-    // TObjectList insertion order is registration order. Sequence is copied as
-    // the stale-result guard and deliberately remains the authoritative key.
+    PrimaryGroupID := 0;
     for Registration in FThreadRegistrations do
       if (not Registration.Closing) and
-         (Registration.Coverage.ThreadID <> APrimaryThreadID) then
+         (Registration.Coverage.ThreadID = APrimaryThreadID) then
+      begin
+        PrimaryGroupID := Registration.Coverage.GroupID;
+        Break;
+      end;
+    AReport.PrimaryGroupID := PrimaryGroupID;
+
+    for Registration in FThreadRegistrations do
+      if IsEligible(Registration) then
       begin
         Inc(EligibleCount);
-        if CandidateCount < CRASH_EXTENDED_MAX_THREADS then
+        if PrimaryGroupID <> 0 then
         begin
-          Candidates[CandidateCount].ThreadID :=
-            Registration.Coverage.ThreadID;
-          Candidates[CandidateCount].Name := Registration.Coverage.Name;
-          Candidates[CandidateCount].Sequence := Registration.Sequence;
-          Inc(CandidateCount);
+          if Registration.Coverage.GroupID = PrimaryGroupID then
+            Inc(OwnCount)
+          else if Registration.Coverage.GroupID = 0 then
+            Inc(GlobalCount);
         end;
       end;
+
+    // GroupID=0 is the compatibility path: first N registrations, unchanged.
+    if PrimaryGroupID = 0 then
+    begin
+      for Registration in FThreadRegistrations do
+        if IsEligible(Registration) then
+          AddCandidate(Registration, tctGlobal);
+    end
+    else
+    begin
+      // Reserve candidate slots for one Own and up to two Global entries,
+      // then fill Own, Global and finally the best-effort Foreign tail.
+      RemainingSlots := EffectiveLimit;
+      OwnQuota := 0;
+      if (OwnCount > 0) and (RemainingSlots > 0) then
+      begin
+        OwnQuota := 1;
+        Dec(RemainingSlots);
+      end;
+      GlobalQuota := GlobalCount;
+      if GlobalQuota > 2 then
+        GlobalQuota := 2;
+      if GlobalQuota > RemainingSlots then
+        GlobalQuota := RemainingSlots;
+      Dec(RemainingSlots, GlobalQuota);
+      I := OwnCount - OwnQuota;
+      if I > RemainingSlots then
+        I := RemainingSlots;
+      Inc(OwnQuota, I);
+      Dec(RemainingSlots, I);
+      I := GlobalCount - GlobalQuota;
+      if I > RemainingSlots then
+        I := RemainingSlots;
+      Inc(GlobalQuota, I);
+
+      for Registration in FThreadRegistrations do
+        if IsEligible(Registration) and
+           (Registration.Coverage.GroupID = PrimaryGroupID) and
+           (CandidateCount < OwnQuota) then
+          AddCandidate(Registration, tctOwn);
+
+      I := 0;
+      for Registration in FThreadRegistrations do
+        if IsEligible(Registration) and
+           (Registration.Coverage.GroupID = 0) and
+           (I < GlobalQuota) then
+        begin
+          AddCandidate(Registration, tctGlobal);
+          Inc(I);
+        end;
+
+      // First Foreign pass: oldest representative of every distinct group.
+      for Registration in FThreadRegistrations do
+      begin
+        if CandidateCount >= EffectiveLimit then
+          Break;
+        if IsEligible(Registration) and
+           (Registration.Coverage.GroupID <> 0) and
+           (Registration.Coverage.GroupID <> PrimaryGroupID) and
+           (not ForeignGroupSeen(Registration.Coverage.GroupID)) then
+        begin
+          SeenForeignGroups[SeenForeignCount] :=
+            Registration.Coverage.GroupID;
+          Inc(SeenForeignCount);
+          AddCandidate(Registration, tctForeign);
+        end;
+      end;
+
+      // Second Foreign pass: remaining entries in registration order.
+      for Registration in FThreadRegistrations do
+      begin
+        if CandidateCount >= EffectiveLimit then
+          Break;
+        if IsEligible(Registration) and
+           (Registration.Coverage.GroupID <> 0) and
+           (Registration.Coverage.GroupID <> PrimaryGroupID) and
+           (not CandidateAlreadySelected(Registration.Sequence)) then
+          AddCandidate(Registration, tctForeign);
+      end;
+    end;
   finally
     FLock.Leave;
   end;
@@ -1196,19 +1384,34 @@ begin
 
   SetLength(AReport.ExtendedThreads, CandidateCount);
   Deadline := TThread.GetTickCount64 + CRASH_EXTENDED_TOTAL_BUDGET_MS;
+  HasGlobalReserve := False;
+  if PrimaryGroupID <> 0 then
+    for I := 0 to CandidateCount - 1 do
+      if Candidates[I].Tier = tctGlobal then
+      begin
+        HasGlobalReserve := True;
+        Break;
+      end;
+  OwnDeadline := Deadline;
+  if HasGlobalReserve then
+    OwnDeadline := Deadline - CRASH_EXTENDED_THREAD_WAIT_MS;
   for I := 0 to CandidateCount - 1 do
   begin
     Candidate := Candidates[I];
     AReport.ExtendedThreads[I].ThreadID := Candidate.ThreadID;
     AReport.ExtendedThreads[I].Name := Candidate.Name;
+    AReport.ExtendedThreads[I].GroupID := Candidate.GroupID;
     AReport.ExtendedThreads[I].State := ctcsCaptureFailed;
     AReport.ExtendedThreads[I].CallStack := nil;
     AReport.ExtendedThreads[I].CaptureDiagnostics := '';
     Handle := nil;
     LeaseHeld := False;
 
+    CaptureDeadline := Deadline;
+    if HasGlobalReserve and (Candidate.Tier = tctOwn) then
+      CaptureDeadline := OwnDeadline;
     NowTick := TThread.GetTickCount64;
-    if NowTick >= Deadline then
+    if NowTick >= CaptureDeadline then
     begin
       AReport.ExtendedThreads[I].State := ctcsBudgetExceeded;
       Continue;
@@ -1237,12 +1440,12 @@ begin
 
     try
       NowTick := TThread.GetTickCount64;
-      if NowTick >= Deadline then
+      if NowTick >= CaptureDeadline then
       begin
         AReport.ExtendedThreads[I].State := ctcsBudgetExceeded;
         Continue;
       end;
-      Remaining := Deadline - NowTick;
+      Remaining := CaptureDeadline - NowTick;
       if Remaining < CRASH_EXTENDED_MIN_WAIT_MS then
       begin
         AReport.ExtendedThreads[I].State := ctcsBudgetExceeded;
@@ -2693,8 +2896,8 @@ begin
   Result := (GReporter <> nil) and GReporter.FInstalled;
 end;
 
-class function TCrashReporter.RegisterCurrentThread(
-  const AName: String): TCrashThreadCoverage;
+class function TCrashReporter.RegisterCurrentThread(const AName: String;
+  const AGroupID: UInt64): TCrashThreadCoverage;
 var
   Reporter: TCrashReporterImpl;
   Registration, Existing: TCrashThreadRegistration;
@@ -2726,12 +2929,14 @@ begin
 
   Result.Registered := True;
   Result.Name := CrashSanitizeThreadName(AName);
+  Result.GroupID := AGroupID;
   Result.AltStack := CrashRegisterAltStackForCurrentThread;
   Result.MachHandler := CrashRegisterMachForCurrentThread;
   NativeIdentity := CrashCurrentThreadNativeIdentity;
   CaptureHandle := nil;
   if Reporter.ExtendedCaptureOperational then
     CrashThreadCaptureRegisterCurrentThread(CaptureHandle);
+  Result.ExtendedCaptureAvailable := CaptureHandle <> nil;
 
   Registration := TCrashThreadRegistration.Create;
   Registration.Coverage := Result;

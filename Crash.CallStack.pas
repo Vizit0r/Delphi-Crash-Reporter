@@ -108,6 +108,7 @@ type
   TCrashThreadStack = record
     ThreadID: UInt64;
     Name: String;
+    GroupID: UInt64;
     State: TCrashThreadCaptureState;
     CallStack: TCrashStack;
     CaptureDiagnostics: String;
@@ -120,6 +121,7 @@ type
     ExceptionClassName: String;
     ExceptionLocation: TCrashStackEntry;
     CallStack: TCrashStack;
+    PrimaryGroupID: UInt64;
     ExtendedThreads: TArray<TCrashThreadStack>;
     ExtendedThreadsOmitted: Integer;
     { Free-text bounded-capture diagnostics for the primary sampled thread

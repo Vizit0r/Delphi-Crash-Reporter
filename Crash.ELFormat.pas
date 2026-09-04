@@ -656,6 +656,17 @@ var
     end;
   end;
 
+  function BuildThreadComment(const ABaseComment: String;
+    const AGroupID: UInt64): String;
+  begin
+    Result := ABaseComment;
+    if AGroupID = 0 then
+      Exit;
+    if Result <> '' then
+      Result := Result + '; ';
+    Result := Result + 'Group=' + IntToHex(AGroupID, 16);
+  end;
+
   procedure UpdateMax(var AMax: Integer; const S: String);
   begin
     if Length(S) > AMax then AMax := Length(S);
@@ -839,6 +850,12 @@ begin
       IntToStr(ACtx.ThreadID) + '; Parent=0; Priority=0');
     if Length('Class=; Name=' + ACtx.ThreadName) > RequiredContentWidth then
       RequiredContentWidth := Length('Class=; Name=' + ACtx.ThreadName);
+    // Primary is measured outside the ExtendedThreads loop. Before GroupID it
+    // emitted only the short constant "Comment=" and needed no explicit row.
+    if Length('Comment=' + BuildThreadComment('', AReport.PrimaryGroupID)) >
+       RequiredContentWidth then
+      RequiredContentWidth := Length('Comment=' +
+        BuildThreadComment('', AReport.PrimaryGroupID));
     for I := 0 to High(AReport.ExtendedThreads) do
     begin
       if Length('Running Thread: ID=' +
@@ -852,10 +869,14 @@ begin
         RequiredContentWidth := Length('Class=; Name=' +
           AReport.ExtendedThreads[I].Name);
       if Length('Comment=' +
-           ThreadStateComment(AReport.ExtendedThreads[I].State)) >
+           BuildThreadComment(
+             ThreadStateComment(AReport.ExtendedThreads[I].State),
+             AReport.ExtendedThreads[I].GroupID)) >
          RequiredContentWidth then
         RequiredContentWidth := Length('Comment=' +
-          ThreadStateComment(AReport.ExtendedThreads[I].State));
+          BuildThreadComment(
+            ThreadStateComment(AReport.ExtendedThreads[I].State),
+            AReport.ExtendedThreads[I].GroupID));
     end;
 
     CurrentContentWidth := MaxMethods + MaxDetails + MaxStack + MaxAddress +
@@ -895,7 +916,8 @@ begin
     AppendFullWidthLine(SB, '*Exception Thread: ID=' + ThreadIDStr + '; Parent=0; Priority=0');
     AppendFullWidthLine(SB, 'Class=; Name=' + ACtx.ThreadName);
     AppendFullWidthLine(SB, 'DeadLock=0; Wait Chain=');
-    AppendFullWidthLine(SB, 'Comment=');
+    AppendFullWidthLine(SB, 'Comment=' +
+      BuildThreadComment('', AReport.PrimaryGroupID));
     // Internal thread separator: `|<dashes>|`
     SB.Append('|'); SB.Append(StringOfChar('-', ContentWidth)); SB.Append('|'); SB.Append(CRLF);
     // Data rows.
@@ -918,7 +940,9 @@ begin
         AReport.ExtendedThreads[J].Name);
       AppendFullWidthLine(SB, 'DeadLock=0; Wait Chain=');
       AppendFullWidthLine(SB, 'Comment=' +
-        ThreadStateComment(AReport.ExtendedThreads[J].State));
+        BuildThreadComment(
+          ThreadStateComment(AReport.ExtendedThreads[J].State),
+          AReport.ExtendedThreads[J].GroupID));
       SB.Append('|'); SB.Append(StringOfChar('-', ContentWidth));
       SB.Append('|'); SB.Append(CRLF);
       for I := 0 to High(RenderedStacks[J + 1]) do
