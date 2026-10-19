@@ -66,12 +66,27 @@ type
     signal changes the sa_mask required by already-installed fault handlers. }
   TCrashThreadCaptureSignalRefreshProc = procedure;
 
+  { Storage for a standalone signal set; pass it as Psigset_t(@Set). 128 bytes
+    covers glibc, bionic (8) and Darwin (4); the RTL sigset_t is only 4 bytes
+    on Android. }
+  TCrashSigSet = record
+    Words: array [0..15] of UInt64;
+  end;
+
 function CrashThreadCaptureAcquire: Boolean;
 procedure CrashThreadCaptureRelease;
 function CrashThreadCaptureAvailable: Boolean;
 function CrashThreadCaptureSignalNumber: Integer;
 procedure CrashThreadCaptureSetSignalRefresh(
   const AProc: TCrashThreadCaptureSignalRefreshProc);
+
+{ Signal-set bit operations in the libc layout (bit Sig-1 from the first byte,
+  little endian). Use these instead of the RTL sigaddset/sigismember: on
+  Android64 those shift a 32-bit value and set the wrong signal above 32.
+  ASet is a TCrashSigSet or a sigaction_t.sa_mask. }
+procedure CrashSigSetClear(out ASet: TCrashSigSet);
+procedure CrashSigSetAdd(var ASet; ASig: Integer);
+function CrashSigSetHas(const ASet; ASig: Integer): Boolean;
 
 function CrashCurrentPThreadIdent: UInt64;
 function CrashCurrentKernelThreadIdent: UInt64;
@@ -855,7 +870,7 @@ end;
 
 function DrainCurrentPendingSignal(const ASig: Integer): Boolean;
 var
-  OneSignal, OldMask, Pending: sigset_t;
+  OneSignal, OldMask, Pending: TCrashSigSet;
   {$IF Defined(CRASH_THREADCAP_LINUXLIKE)}
   WaitTime: TCrashTimespec;
   {$ENDIF}
@@ -867,14 +882,14 @@ begin
   FillChar(OneSignal, SizeOf(OneSignal), 0);
   FillChar(OldMask, SizeOf(OldMask), 0);
   FillChar(Pending, SizeOf(Pending), 0);
-  sigemptyset(OneSignal);
-  sigaddset(OneSignal, ASig);
+  CrashSigSetClear(OneSignal);
+  CrashSigSetAdd(OneSignal, ASig);
   if crash_pthread_sigmask(SIG_BLOCK, @OneSignal, @OldMask) <> 0 then
     Exit;
   try
     if crash_sigpending(@Pending) <> 0 then
       Exit;
-    if sigismember(Pending, ASig) <> 1 then
+    if not CrashSigSetHas(Pending, ASig) then
       Exit(True);
     {$IF Defined(CRASH_THREADCAP_LINUXLIKE)}
     FillChar(WaitTime, SizeOf(WaitTime), 0);
@@ -1532,7 +1547,7 @@ end;
 {$IFDEF AUTOTESTS}
 function CrashThreadCaptureCurrentSignalBlocked: Boolean;
 var
-  CurrentMask: sigset_t;
+  CurrentMask: TCrashSigSet;
   SigNum: Integer;
 begin
   Result := False;
@@ -1542,7 +1557,7 @@ begin
   FillChar(CurrentMask, SizeOf(CurrentMask), 0);
   if crash_pthread_sigmask(SIG_BLOCK, nil, @CurrentMask) <> 0 then
     Exit;
-  Result := sigismember(CurrentMask, SigNum) = 1;
+  Result := CrashSigSetHas(CurrentMask, SigNum);
 end;
 
 function CrashThreadCaptureTestIdentityMatches(
@@ -1980,6 +1995,25 @@ begin
   end;
 end;
 
+procedure CrashSigSetClear(out ASet: TCrashSigSet);
+begin
+  FillChar(ASet, SizeOf(ASet), 0);
+end;
+
+procedure CrashSigSetAdd(var ASet; ASig: Integer);
+begin
+  if ASig <= 0 then
+    Exit;
+  PByte(@ASet)[(ASig - 1) shr 3] := PByte(@ASet)[(ASig - 1) shr 3]
+    or Byte(1 shl ((ASig - 1) and 7));
+end;
+
+function CrashSigSetHas(const ASet; ASig: Integer): Boolean;
+begin
+  Result := (ASig > 0) and
+    ((PByte(@ASet)[(ASig - 1) shr 3] and Byte(1 shl ((ASig - 1) and 7))) <> 0);
+end;
+
 initialization
   GServiceLock := TCriticalSection.Create;
   GCoordinatorLock := TCriticalSection.Create;
@@ -2120,6 +2154,25 @@ begin
   Result := False;
 end;
 {$ENDIF}
+
+procedure CrashSigSetClear(out ASet: TCrashSigSet);
+begin
+  FillChar(ASet, SizeOf(ASet), 0);
+end;
+
+procedure CrashSigSetAdd(var ASet; ASig: Integer);
+begin
+  if ASig <= 0 then
+    Exit;
+  PByte(@ASet)[(ASig - 1) shr 3] := PByte(@ASet)[(ASig - 1) shr 3]
+    or Byte(1 shl ((ASig - 1) and 7));
+end;
+
+function CrashSigSetHas(const ASet; ASig: Integer): Boolean;
+begin
+  Result := (ASig > 0) and
+    ((PByte(@ASet)[(ASig - 1) shr 3] and Byte(1 shl ((ASig - 1) and 7))) <> 0);
+end;
 
 {$ENDIF}
 

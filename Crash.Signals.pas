@@ -575,7 +575,7 @@ begin
   // callback below. Never maintain per-signal masks at the call sites.
   CaptureSignal := CrashThreadCaptureSignalNumber;
   if (CaptureSignal > 0) and (CaptureSignal <> SigNum) then
-    sigaddset(Act.sa_mask, CaptureSignal);
+    CrashSigSetAdd(Act.sa_mask, CaptureSignal);
   sigaction(SigNum, @Act, @Prev);
   // Save prev only if it is NOT ourselves (guard against the re-install chain)
   // AND if nothing has been saved yet. The FIRST install catches the Pascal RTL
