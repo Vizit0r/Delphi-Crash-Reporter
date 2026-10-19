@@ -200,6 +200,10 @@ function CrashRawOwnerAlive(const AProcessID: UInt64): Boolean;
   and never written, which is all zeros on disk - from the capture key in the
   file name. Entered-but-torn blocks stay for the stale policy. }
 function CrashRawFileIsAbandoned(const AFilePath: String): Boolean;
+{ Committed record of ANOTHER process that is still running. Its owner either
+  survived the fault (the exception was handled) or is still writing its own
+  report; startup recovery leaves it alone. }
+function CrashRawRecordOwnedByLiveProcess(const ARaw: TCrashRawRecord): Boolean;
 procedure CrashRawDeleteFile(const AFilePath: String);
 procedure CrashRawDeleteUntouchedSibling(const ARaw: TCrashRawRecord);
 
@@ -960,6 +964,17 @@ begin
       Exit;
   end;
   Result := not CrashRawOwnerAlive(OwnerID);
+end;
+
+function CrashRawRecordOwnedByLiveProcess(const ARaw: TCrashRawRecord): Boolean;
+begin
+  Result := False;
+  {$IF not Defined(MSWINDOWS)}
+  // A record carrying our own pid comes from an earlier process that held it.
+  if (ARaw.ProcessID = 0) or (ARaw.ProcessID = UInt64(getpid)) then
+    Exit;
+  Result := CrashRawOwnerAlive(ARaw.ProcessID);
+  {$ENDIF}
 end;
 
 procedure CrashRawDeleteFile(const AFilePath: String);

@@ -172,19 +172,19 @@ begin
     raise Exception.Create('test raise from CrashDemo')
   else if AKind = 'stale' then
   begin
-    // Snapshot<->exception correlation, SAME-thread case: the swallowed fault
-    // leaves a pending snapshot on this thread, then a soft raise at a DIFFERENT
-    // address writes the report. Expect NO "Registers:" section and the "STALE
-    // snapshot" note (+ lowercase forensic dump) in Crash Signal Info.
+    // Handled-fault retirement, SAME-thread case: the swallowed fault's snapshot
+    // is retired when its exception is freed, then a soft raise at a DIFFERENT
+    // address writes the report. Expect a plain soft-raise report: NO
+    // "Registers:" section and NO Crash Signal Info.
     SwallowHardwareFault;
     raise Exception.Create('soft raise after a swallowed hardware fault (stale-snapshot test)');
   end
   else if AKind = 'foreign' then
   begin
-    // Snapshot<->exception correlation, FOREIGN-thread case (the CDFC1215
-    // scenario): a worker's hardware fault is swallowed on the worker, then the
-    // main thread's raise writes the report. Expect NO "Registers:" section and
-    // the "captured on ANOTHER thread" note (+ lowercase dump) in Signal Info.
+    // Handled-fault retirement, FOREIGN-thread case (the CDFC1215 scenario): a
+    // worker's hardware fault is swallowed on the worker and retired there, then
+    // the main thread's raise writes the report. Expect a plain soft-raise
+    // report: NO "Registers:" section and NO Crash Signal Info.
     W := TThread.CreateAnonymousThread(SwallowHardwareFault);
     W.FreeOnTerminate := False;
     W.Start;

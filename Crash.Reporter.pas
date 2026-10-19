@@ -2666,6 +2666,8 @@ begin
         CrashRawDeleteFile(RawPath);
       Continue;
     end;
+    if CrashRawRecordOwnedByLiveProcess(Raw) then
+      Continue;
     Duplicate := False;
     for ELPath in ELFiles do
       if CrashELContainsRawCaptureKey(ELPath, Raw.CaptureKey) then

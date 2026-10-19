@@ -59,9 +59,27 @@ type
 
 procedure CrashInstallSignalHandlers;
 function CrashSignalHandlersInstalled: Boolean;
+// True while every fault signal (SIGSEGV/SIGFPE/SIGILL/SIGBUS) is routed to
+// the Crash handler. False when nothing is installed or off capture targets.
+function CrashSignalHandlersArmed: Boolean;
+// Hardware faults the handler (or the macOS Mach observer) has captured since
+// start. Monotonic: a handled fault whose snapshot was retired still counts.
+function CrashSignalFaultCount: Integer;
 function CrashRegisterAltStackForCurrentThread: TCrashAltStackState;
 procedure CrashUnregisterAltStackForCurrentThread;
 function  CrashHasSignalSnapshot: Boolean;
+
+// Exception lifecycle hooks, called by Crash.CallStack. The handler is one-shot
+// and only a report re-arms it, so a hardware fault whose exception the
+// application handles would leave the process without fault capture and leave
+// its snapshot and committed raw record pending. Raised (on the raising thread,
+// after its backtrace) re-arms the handler on the faulting thread and binds the
+// pending snapshot to that exception. Released (when the exception object is
+// freed; the caller holds the report gate) retires a snapshot no report has
+// consumed: the fault was handled.
+procedure CrashNoteExceptionRaised(AStackInfo: Pointer);
+procedure CrashNoteExceptionReleased(AStackInfo: Pointer);
+function  CrashExceptionOwnsPendingFault(AStackInfo: Pointer): Boolean;
 
 // Drop a captured-but-unconsumed snapshot (host veto, discarded report) and
 // reopen both slots, so it cannot shadow a later fault's Registers section.
@@ -183,6 +201,11 @@ var
   GSnapshotEpoch:  Integer = 0;  // bumped by TakeSnapshot; pairs a concurrent claim with its primary capture cycle
   GOldHandlers:    array[1..31] of sigaction_t;
   GInstalled:      Boolean = False;
+  GHandlerSpent:   Integer = 0;   // 1 = the handler restored prev and awaits re-arm
+  GFaultCount:     Integer = 0;   // monotonic count of captured hardware faults
+  GOwnerInfo:      Pointer = nil; // stack info of the exception bound to the pending snapshot
+  GOwnerEpoch:     Integer = -1;  // GSnapshotEpoch of that binding
+  GSuccessorInfo:  Pointer = nil; // latest later exception on the owner's thread (a wrapper)
 
 threadvar
   GAltStackRegistered: Boolean;
@@ -453,6 +476,7 @@ var
   SP: UInt64;
   IsStackOverflow: Boolean;
 begin
+  TInterlocked.Increment(GFaultCount);
   TInterlocked.Increment(GSignalSnapshot.InvocationCount);
   // Read the capture-cycle epoch on ENTRY, before any claim attempt: read
   // after the CAS it could already belong to the NEXT cycle (TakeSnapshot in
@@ -519,6 +543,7 @@ begin
 
   if (SigNum >= Low(GOldHandlers)) and (SigNum <= High(GOldHandlers)) then
   begin
+    TInterlocked.Exchange(GHandlerSpent, 1);
     Restored := GOldHandlers[SigNum];
     sigaction(SigNum, @Restored, nil);
   end;
@@ -592,14 +617,25 @@ begin
     {$ENDIF}
 end;
 
+procedure ReinstallFaultActions;
+// Clear the spent mark BEFORE installing: a fault landing in between marks the
+// handler spent again and at worst costs one redundant re-arm later.
+begin
+  TInterlocked.Exchange(GHandlerSpent, 0);
+  InstallOne(SIGSEGV);
+  InstallOne(SIGFPE);
+  InstallOne(SIGILL);
+  InstallOne(SIGBUS);
+end;
+
 procedure CrashInstallSignalHandlers;
 // Idempotent (re-entry allowed). Called twice at startup (immediately + via
-// TThread.ForceQueue once the platform is initialised), and on Linux also after
-// every non-fatal crash (re-arm - see the reporter): at the end our handler
-// restores prev and thereby removes itself from active, so without a re-install
-// the next hardware crash would bypass us (no snapshot). InstallOne keeps the
-// FIRST (Pascal RTL) prev and never overwrites it with later (FMXLinux stub)
-// ones - see there.
+// TThread.ForceQueue once the platform is initialised), after every report and,
+// through CrashNoteExceptionRaised, after every hardware fault whose exception
+// the application handles: at the end our handler restores prev and thereby
+// removes itself from active, so without a re-install the next hardware crash
+// would bypass us (no snapshot). InstallOne keeps the FIRST (Pascal RTL) prev
+// and never overwrites it with later (FMXLinux stub) ones - see there.
 begin
   if not GInstalled then
   begin
@@ -608,10 +644,7 @@ begin
   end;
   GInstalled := True;
   CrashRegisterAltStackForCurrentThread;
-  InstallOne(SIGSEGV);
-  InstallOne(SIGFPE);
-  InstallOne(SIGILL);
-  InstallOne(SIGBUS);
+  ReinstallFaultActions;
 end;
 
 function CrashSignalHandlersInstalled: Boolean;
@@ -619,9 +652,33 @@ begin
   Result := GInstalled;
 end;
 
+function CrashSignalHandlersArmed: Boolean;
+const
+  FaultSignals: array[0..3] of Integer = (SIGSEGV, SIGFPE, SIGILL, SIGBUS);
+var
+  Current: sigaction_t;
+  SigNum: Integer;
+begin
+  Result := GInstalled;
+  if not Result then
+    Exit;
+  for SigNum in FaultSignals do
+  begin
+    FillChar(Current, SizeOf(Current), 0);
+    if (sigaction(SigNum, nil, @Current) <> 0) or
+       (not PrevIsOurselves(Current)) then
+      Exit(False);
+  end;
+end;
+
 function CrashHasSignalSnapshot: Boolean;
 begin
   Result := GSignalSnapshot.Captured = 1;
+end;
+
+function CrashSignalFaultCount: Integer;
+begin
+  Result := TInterlocked.CompareExchange(GFaultCount, 0, 0);
 end;
 
 function SignalNameOf(SigNum: Integer): String;
@@ -821,6 +878,89 @@ var
   C: TConcurrentSignal;
 begin
   TakeSnapshot(S, C);
+end;
+
+procedure CrashNoteExceptionRaised(AStackInfo: Pointer);
+// The RTL has already taken the re-fault and is raising its exception, so
+// re-installing cannot bounce this fault back into our handler. Only the
+// faulting thread re-arms: another thread may still be between our handler and
+// its own re-fault. An unrecorded fault (both slots busy elsewhere) re-arms
+// from any thread; a racing re-fault then only re-enters the handler once.
+var
+  SelfID: UInt64;
+  Epoch: Integer;
+begin
+  if not GInstalled then
+    Exit;
+  SelfID := CurrentThreadIdent;
+  if TInterlocked.CompareExchange(GHandlerSpent, 0, 0) <> 0 then
+    if ((GSignalSnapshot.Captured = 1) and (GSignalSnapshot.ThreadID = SelfID)) or
+       ((GConcurrentSignal.Captured = 1) and
+        (GConcurrentSignal.ThreadID = SelfID)) or
+       ((GSignalSnapshot.Captured <> 1) and
+        (GConcurrentSignal.Captured <> 1)) then
+      ReinstallFaultActions;
+
+  // Bind the first exception raised on the faulting thread of this capture
+  // cycle: that is the fault's own Pascal exception. A later one on the same
+  // thread is remembered as its successor (typically a wrapper raised from the
+  // fault's except block).
+  if (AStackInfo = nil) or (GSignalSnapshot.Captured <> 1) or
+     (GSignalSnapshot.ThreadID <> SelfID) then
+    Exit;
+  Epoch := GSnapshotEpoch;
+  if TInterlocked.CompareExchange(GOwnerEpoch, 0, 0) <> Epoch then
+  begin
+    TInterlocked.Exchange(GSuccessorInfo, nil);
+    TInterlocked.Exchange(GOwnerEpoch, Epoch);
+    TInterlocked.Exchange(GOwnerInfo, AStackInfo);
+  end
+  else if TInterlocked.CompareExchange(GOwnerInfo, nil, nil) <> nil then
+    TInterlocked.Exchange(GSuccessorInfo, AStackInfo);
+end;
+
+function CrashExceptionOwnsPendingFault(AStackInfo: Pointer): Boolean;
+begin
+  Result := (AStackInfo <> nil) and
+    ((TInterlocked.CompareExchange(GOwnerInfo, nil, nil) = AStackInfo) or
+     (TInterlocked.CompareExchange(GSuccessorInfo, nil, nil) = AStackInfo));
+end;
+
+procedure CrashNoteExceptionReleased(AStackInfo: Pointer);
+// A report always consumes the snapshot before the exception object is freed
+// (ExceptProc/ExceptionAcquired/OnException run while it is alive), which
+// advances the epoch. A snapshot still pending in its own cycle therefore
+// belongs to a fault the application handled: drop it and retire its raw
+// generation, so neither a later report nor the next startup presents it.
+// While a successor is alive the fault is still in flight under another
+// exception (re-raised as a wrapper): the binding moves to it instead.
+var
+  Successor: Pointer;
+begin
+  if AStackInfo = nil then
+    Exit;
+  if TInterlocked.CompareExchange(GOwnerInfo, nil, AStackInfo) <> AStackInfo then
+  begin
+    // A successor freed before its owner was handled inside the fault's
+    // except block; the owner keeps the binding.
+    TInterlocked.CompareExchange(GSuccessorInfo, nil, AStackInfo);
+    Exit;
+  end;
+  Successor := TInterlocked.Exchange(GSuccessorInfo, nil);
+  if (Successor <> nil) and (GSignalSnapshot.Captured = 1) and
+     (GSnapshotEpoch = TInterlocked.CompareExchange(GOwnerEpoch, 0, 0)) then
+  begin
+    TInterlocked.Exchange(GOwnerInfo, Successor);
+    Exit;
+  end;
+  if (GSignalSnapshot.Captured = 1) and
+     (GSnapshotEpoch = TInterlocked.CompareExchange(GOwnerEpoch, 0, 0)) then
+  begin
+    CrashDiscardPendingSnapshot;
+    CrashRawRotate(True);
+  end;
+  if TInterlocked.CompareExchange(GHandlerSpent, 0, 0) <> 0 then
+    ReinstallFaultActions;
 end;
 
 function FormatRegistersSection(const S: TSignalSnapshot): String;
@@ -1197,6 +1337,7 @@ procedure CrashRecordMacOSSnapshot(const ARegs: TCrashMacOSRegs;
 var
   ClaimEpoch: Integer;
 begin
+  TInterlocked.Increment(GFaultCount);
   TInterlocked.Increment(GSignalSnapshot.InvocationCount);
   // Entry-time epoch, before any claim attempt (see CrashSignalHandler).
   ClaimEpoch := GSnapshotEpoch;
@@ -1270,6 +1411,11 @@ finalization
 
 procedure CrashInstallSignalHandlers;            begin end;
 function CrashSignalHandlersInstalled: Boolean;  begin Result := False; end;
+function CrashSignalHandlersArmed: Boolean;      begin Result := False; end;
+function CrashSignalFaultCount: Integer;         begin Result := 0; end;
+procedure CrashNoteExceptionRaised(AStackInfo: Pointer);  begin end;
+procedure CrashNoteExceptionReleased(AStackInfo: Pointer); begin end;
+function  CrashExceptionOwnsPendingFault(AStackInfo: Pointer): Boolean; begin Result := False; end;
 function CrashRegisterAltStackForCurrentThread: TCrashAltStackState;
 begin
   Result := casNotRequired;

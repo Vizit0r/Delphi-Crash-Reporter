@@ -461,11 +461,28 @@ The repair is conservative — it only fires for a primary fault **in your own c
 is already complete → nothing is added); a fault inside a system library is treated
 as secondary and left alone (its nearest in-app frame is already shown).
 
-**Snapshot↔exception correlation.** The handler is one-shot: after the first
-catch it restores the previous (RTL) disposition and is re-armed only after a
-report is written. A fault whose exception the app swallows therefore leaves a
-pending snapshot behind, and the *next* reported exception — possibly on
-another thread — would otherwise inherit it. Seen live (report `CDFC1215`):
+**Handled faults.** The handler is one-shot: after the first catch it restores
+the previous (RTL) disposition so the re-executed instruction becomes a Pascal
+exception. It is re-armed after every report and also when the application
+handles the fault itself (`try … except`, a thread that swallows its
+exception) — otherwise the process would run without fault capture for the
+rest of its life. Crash hooks the exception lifecycle for this: when the
+fault's exception is raised on the faulting thread (after its backtrace is
+taken) the handler is re-installed and the pending snapshot is bound to that
+exception; when the exception object is freed without any report having
+consumed the snapshot, the snapshot is dropped and its raw generation is
+retired, so neither a later report nor the next startup presents a handled
+fault as a crash. A fault re-raised as another exception (a wrapper raised from
+the `except` block) keeps its snapshot until that wrapper is handled or
+reported. `CrashSignalHandlersArmed` reports whether all four fault signals
+currently route to the handler.
+
+**Snapshot↔exception correlation.** A snapshot can still be pending when an
+unrelated exception is reported: its own exception is alive (for example, still
+inside its `except` block) while another thread crashes, or a fault arrives
+while a report is already in flight. The *next* reported exception — possibly
+on another thread — would otherwise inherit it. Seen live (report `CDFC1215`,
+before handled faults were retired):
 the report header carried the main thread's `CheckSynchronize` AV while
 Registers/Stack dump held a worker thread's `RemoveQueuedEvents` #GP context. The snapshot is now stamped with the
 faulting thread's pthread identity, and at report time it is correlated with
@@ -503,7 +520,9 @@ valid stage and commit markers (unknown versions are rejected). V2 keeps the V1
 identity, and reduces only the unused payload reserve. It converts the block into a normal
 EL-compatible `ERawHardwareFault` report, deduplicates it against a full `.el`
 by the embedded `Raw Capture Key`, and removes the raw file only after successful
-conversion or confirmed duplication. Fresh incomplete/corrupt blocks are kept
+conversion or confirmed duplication. A committed block whose owner process is
+still running is left to that owner (instances share one report directory): the
+owner survived the fault or is still writing its own report. Fresh incomplete/corrupt blocks are kept
 for diagnosis; stale ones expire after seven days. A successfully persisted
 ordinary hardware-fault `.el` supersedes and removes its matching raw slot.
 
@@ -777,11 +796,11 @@ msbuild Demo/CrashDemo.dproj /t:Build /p:Config=Release /p:Platform=Linux64
 CRASH_NO_UPLOAD=1 ./CrashDemo --crash=segv     # hardware fault -> .el with Registers
 CRASH_NO_UPLOAD=1 ./CrashDemo --crash=raise    # software raise -> .el without Registers
 # also: --crash=fpe (div-by-zero), --crash=callbad (call into unmapped memory)
-# snapshot<->exception correlation tests (the CDFC1215 mixed-report scenario):
+# handled-fault retirement (the CDFC1215 mixed-report scenario):
 CRASH_NO_UPLOAD=1 ./CrashDemo --crash=stale    # swallowed fault, then soft raise on the SAME
-                                               # thread -> no Registers, "STALE snapshot" note
+                                               # thread -> plain report, no Crash Signal Info
 CRASH_NO_UPLOAD=1 ./CrashDemo --crash=foreign  # worker's fault swallowed, main thread raises ->
-                                               # no Registers, "captured on ANOTHER thread" note
+                                               # plain report, no Crash Signal Info
 # freeze watchdog + RestartOnFreeze end-to-end:
 CRASH_NO_UPLOAD=1 ./CrashDemo --freeze         # run 1 blocks its watched thread, is reported and
                                                # REPLACED by a fresh instance; that instance (same

@@ -338,10 +338,35 @@ begin
 end;
 
 class procedure TCrashCapture.GlobalCleanUpStackInfo(Info: Pointer);
+const
+  GATE_WAIT_MS = 200;
+var
+  Deadline: UInt64;
 begin
+  if (Info = nil) then
+    Exit;
+  { A freed exception that still owns the pending hardware-fault snapshot was
+    handled by the application. Retiring it rotates the raw fallback, which the
+    report path also does: serialize on the report gate. A gate held past the
+    bound (a report in flight) leaves the snapshot to that report. }
+  if CrashExceptionOwnsPendingFault(Info) then
+  begin
+    Deadline := TThread.GetTickCount64 + GATE_WAIT_MS;
+    repeat
+      if TryEnterReportGate then
+      try
+        CrashNoteExceptionReleased(Info);
+        Break;
+      finally
+        LeaveReportGate;
+      end;
+      if TThread.GetTickCount64 >= Deadline then
+        Break;
+      TThread.Sleep(1);
+    until False;
+  end;
   { Free memory allocated by GlobalGetExceptionStackInfo }
-  if (Info <> nil) then
-    FreeMem(Info);
+  FreeMem(Info);
 end;
 
 class procedure TCrashCapture.GlobalExceptHandler(ExceptObject: TObject;
@@ -578,7 +603,10 @@ begin
     Just return nil if we are already reporting an exception, or call stacks
     are disabled. }
   if (FInstance = nil) or (FInstance.FReportingException <> 0) or (FInstance.FMaxCallStackDepth <= 0) then
+  begin
+    CrashNoteExceptionRaised(nil);
     Exit(nil);
+  end;
 
   { Allocate a PCallStack record large enough to hold just MaxCallStackDepth
     entries }
@@ -588,6 +616,8 @@ begin
   { Use backtrace API to retrieve call stack }
   CallStack.Count := backtrace(@CallStack.Stack, FInstance.FMaxCallStackDepth);
   Result := CallStack;
+  { After the backtrace, so the hook adds no frame to it. }
+  CrashNoteExceptionRaised(Result);
 end;
 
 class function TCrashCapture.GetCallStack(
@@ -676,7 +706,10 @@ begin
     Just return nil if we are already reporting an exception, or call stacks
     are disabled. }
   if (FInstance = nil) or (FInstance.FReportingException <> 0) or (FInstance.FMaxCallStackDepth <= 0) then
+  begin
+    CrashNoteExceptionRaised(nil);
     Exit(nil);
+  end;
 
   { Allocate a PCallStack record large enough to hold just MaxCallStackDepth
     entries }
@@ -687,6 +720,8 @@ begin
   CallStack.Count := 0;
   _Unwind_Backtrace(UnwindCallback, Callstack);
   Result := CallStack;
+  { After the backtrace, so the hook adds no frame to it. }
+  CrashNoteExceptionRaised(Result);
 end;
 
 class function TCrashCapture.GetCallStack(
@@ -971,13 +1006,18 @@ var
   CallStack: PCallStack;
 begin
   if (FInstance = nil) or (FInstance.FReportingException <> 0) or (FInstance.FMaxCallStackDepth <= 0) then
+  begin
+    CrashNoteExceptionRaised(nil);
     Exit(nil);
+  end;
 
   GetMem(CallStack, SizeOf(TCallStack) +
     (FInstance.FMaxCallStackDepth - 1) * SizeOf(UIntPtr));
   CallStack.Count := 0;
   _Unwind_Backtrace(CrashLinuxUnwindCallback, CallStack);
   Result := CallStack;
+  { After the backtrace, so the hook adds no frame to it. }
+  CrashNoteExceptionRaised(Result);
 end;
 
 class function TCrashCapture.GetCallStack(
