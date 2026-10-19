@@ -200,7 +200,10 @@ type
     FModuleAddress: UIntPtr;
     FReportingException: Integer; // 0/1 via TInterlocked - single-flight gate across concurrently crashing threads
   private
+    // Unused on Windows: no singleton there (see initialization).
+    {$HINTS OFF}
     constructor InternalCreate(const ADummy: Integer = 0);
+    {$HINTS ON}
     procedure ReportException(const AExceptionObject: TObject;
       const AExceptionAddress: Pointer;
       const ASource: TCrashSource);
