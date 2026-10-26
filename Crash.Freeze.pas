@@ -33,6 +33,11 @@ unit Crash.Freeze;
       the mobile background, where the host cannot ping at all; and
       OnExternalSuppress lets the reporter mute it while an exception
       report/dialog is in flight.
+    - Whole-process stall: when the watchdog's own sleep overran the timeout,
+      the process as a whole was stopped (SIGSTOP, cgroup freezer / docker
+      pause, a paused VM) - the monotonic clock ran on, but no thread could
+      ping. That span is a grace, not a freeze: the watched thread gets a full
+      timeout from the wake-up to ping again.
 
   Scope:
     - Linux x86-64. The capture signal is the FIRST FREE realtime signal in
@@ -136,6 +141,12 @@ type
     class property OnExternalSuppress: TFunc<Boolean> read FOnExternalSuppress write FOnExternalSuppress;
   end;
 
+{$IFDEF AUTOTESTS}
+{ One-shot: the watchdog's next sleep lasts AExtraMS longer (models a
+  whole-process stall without stopping the test process). }
+procedure CrashFreezeTestStallWatchdogOnce(const AExtraMS: Integer);
+{$ENDIF}
+
 implementation
 
 {$IF (Defined(LINUX) and Defined(CPUX64)) or
@@ -166,6 +177,9 @@ var
   GSuspended:     Integer = 0; // host-suspended flag (see SetSuspended); separate from the nestable GSuppress
   GInstalled:     Boolean = False;
   GWatchdog:      TThread = nil;
+  {$IFDEF AUTOTESTS}
+  GTestStallMS:   Integer = 0; // see CrashFreezeTestStallWatchdogOnce
+  {$ENDIF}
 
 type
   TFreezeWatchdog = class(TThread)
@@ -251,7 +265,7 @@ end;
 
 procedure TFreezeWatchdog.Execute;
 var
-  Now64, LastPing, LastAlive, GraceMark, EpisodeStart: Int64;
+  Now64, SleepStart, LastPing, LastAlive, GraceMark, EpisodeStart: Int64;
   InEpisode, Suppressed: Boolean;
   ExternalProbe: TFunc<Boolean>;
 begin
@@ -261,13 +275,24 @@ begin
   InEpisode := False;
   while not Terminated do
   begin
+    SleepStart := Int64(TThread.GetTickCount64);
+    {$IFDEF AUTOTESTS}
+    TThread.Sleep(CHECK_QUANTUM_MS + TInterlocked.Exchange(GTestStallMS, 0));
+    {$ELSE}
     TThread.Sleep(CHECK_QUANTUM_MS);
+    {$ENDIF}
     if Terminated then
       Break;
     LastPing := TInterlocked.Read(GLastPingMS);
     if LastPing = 0 then
       Continue; // dormant until the first ping (cold start is not a freeze)
     Now64 := Int64(TThread.GetTickCount64);
+
+    // The watchdog itself overslept the timeout: the whole process was
+    // stopped, not just the watched thread - grace from the wake-up.
+    // Only the sleep is measured: our own report/upload time never counts.
+    if (Now64 - SleepStart) >= GTimeoutMS then
+      GraceMark := Now64;
 
     Suppressed := (TInterlocked.CompareExchange(GSuppress, 0, 0) > 0) or
                   (TInterlocked.CompareExchange(GSuspended, 0, 0) <> 0);
@@ -405,6 +430,13 @@ begin
   Result := GInstalled;
 end;
 
+{$IFDEF AUTOTESTS}
+procedure CrashFreezeTestStallWatchdogOnce(const AExtraMS: Integer);
+begin
+  TInterlocked.Exchange(GTestStallMS, AExtraMS);
+end;
+{$ENDIF}
+
 initialization
 
 finalization
@@ -442,6 +474,12 @@ class function TCrashFreeze.Active: Boolean;
 begin
   Result := False;
 end;
+
+{$IFDEF AUTOTESTS}
+procedure CrashFreezeTestStallWatchdogOnce(const AExtraMS: Integer);
+begin
+end;
+{$ENDIF}
 
 {$ENDIF}
 
