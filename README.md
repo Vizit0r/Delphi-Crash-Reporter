@@ -18,10 +18,13 @@ it out and non-fatal exceptions fall back to a stderr message. `Demo/CrashDemo`
 is precisely this case: a pure console program that links the entire reporter
 with zero FMX units.
 
-© 2026 Vizit0r, BSD 2-Clause — see `LICENSE.txt`. The call-stack, line-number,
-demangling and Mach-O/DWARF parts grew out of
-[grijjy/JustAddCode](https://github.com/grijjy/JustAddCode) (ErrorReporting),
-© 2017 Grijjy, Inc.
+© 2026 Vizit0r, BSD 2-Clause — see `LICENSE.txt`. The RTL exception hooks and
+the macOS/Android stack walk in `Crash.CallStack`, the symbol demangler, the
+Mach-O API translations and the Mach-O/DWARF line-number tooling (`.gol` reader
+and generator) grew out of [grijjy/JustAddCode](https://github.com/grijjy/JustAddCode)
+(ErrorReporting), © 2017 Grijjy, Inc. Linux and ELF support, signal handling,
+freeze detection, thread capture and the EurekaLog-format writer were written
+for this library.
 
 ## What you get
 
