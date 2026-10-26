@@ -1,4 +1,4 @@
-unit Crash.Modules;
+﻿unit Crash.Modules;
 
 { Enumerates loaded modules (shared libs + main exe) for the .el "Modules"
   section, byte-perfect with EurekaLog TEurekaModulesFormatter layout

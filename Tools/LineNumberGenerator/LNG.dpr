@@ -1,4 +1,4 @@
-program LNG;
+﻿program LNG;
 
 {$APPTYPE CONSOLE}
 {$WARN SYMBOL_PLATFORM OFF}

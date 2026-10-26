@@ -1,4 +1,4 @@
-unit Crash.Dialog.FMX;
+﻿unit Crash.Dialog.FMX;
 
 { Modal FMX dialog for non-fatal exception reports (csOnException / csAcquired).
 

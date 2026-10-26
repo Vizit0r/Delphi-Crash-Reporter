@@ -1,4 +1,4 @@
-unit Crash.Reporter;
+﻿unit Crash.Reporter;
 
 { Public orchestrator of the Crash Reporter library.
 

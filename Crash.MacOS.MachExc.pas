@@ -1,4 +1,4 @@
-unit Crash.MacOS.MachExc;
+﻿unit Crash.MacOS.MachExc;
 
 { macOS Mach exception handler - captures CPU registers on hardware faults.
 

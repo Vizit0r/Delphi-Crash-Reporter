@@ -1,4 +1,4 @@
-unit MachO;
+﻿unit MachO;
 {<Utilities for reading (debug) sections from a Mach-O file (such as a
   Intel macOS64 executable or .dSYM file).
 

@@ -1,4 +1,4 @@
-unit GeneratorElf;
+﻿unit GeneratorElf;
 { Linux/ELF variant of TLineNumberGenerator. Reads DWARF debug sections
   embedded in a Linux ELF64 binary (built with DCC_DebugInformation=2) and
   emits a .gol file in the same byte-format that Crash.LineNumbers

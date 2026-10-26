@@ -1,4 +1,4 @@
-unit Elf;
+﻿unit Elf;
 { Linux ELF64 container reader. Counterpart to MachO.pas — provides debug
   sections (.debug_info, .debug_line, .debug_abbrev, .debug_str) to Dwarf.pas
   and exposes the 20-byte GNU build-id (truncated to 16 bytes as TGUID) as the

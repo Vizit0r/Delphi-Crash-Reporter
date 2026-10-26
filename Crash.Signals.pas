@@ -1,4 +1,4 @@
-unit Crash.Signals;
+﻿unit Crash.Signals;
 
 { POSIX signal-based CPU snapshot for hardware exceptions (SIGSEGV/SIGFPE/SIGILL/SIGBUS).
 

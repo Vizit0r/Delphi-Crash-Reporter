@@ -1,4 +1,4 @@
-unit Crash.MacOS.Api;
+﻿unit Crash.MacOS.Api;
 { Partial translations of some Mach-O related kernel headers.
 
   Part of the Crash Reporter library - standalone, EurekaLog-compatible

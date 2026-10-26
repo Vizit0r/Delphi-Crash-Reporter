@@ -1,4 +1,4 @@
-unit Crash.Demangle;
+﻿unit Crash.Demangle;
 { Part of the Crash Reporter library - standalone, EurekaLog-compatible
   crash/exception reporting for Delphi cross-platform targets.
 

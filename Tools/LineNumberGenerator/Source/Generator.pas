@@ -1,4 +1,4 @@
-unit Generator;
+﻿unit Generator;
 { Derived from Grijjy JustAddCode / ErrorReporting:
     Copyright (c) 2017 Grijjy, Inc. BSD 2-Clause license (see LICENSE.txt).
   Modifications Copyright (c) 2026 Vizit0r, under the same license. }

@@ -1,4 +1,4 @@
-unit Crash.LineNumbers;
+﻿unit Crash.LineNumbers;
 {$IFOPT R+} {$DEFINE CRASH_R_WAS_ON} {$ENDIF}
 {$IFOPT Q+} {$DEFINE CRASH_Q_WAS_ON} {$ENDIF}
 // Disable range and integer-overflow checks for this whole unit.

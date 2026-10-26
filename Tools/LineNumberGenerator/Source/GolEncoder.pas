@@ -1,4 +1,4 @@
-unit GolEncoder;
+﻿unit GolEncoder;
 
 { Shared .gol state-machine encoder for the LNG (Mach-O) and LNG_ELF (ELF)
   generators - one implementation instead of two hand-synced copies. Pure and

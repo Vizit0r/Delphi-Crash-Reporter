@@ -1,4 +1,4 @@
-unit Crash.Freeze;
+﻿unit Crash.Freeze;
 
 { Main-thread freeze (hang) detector - the EurekaLog "anti-freeze" analogue
   for POSIX targets.

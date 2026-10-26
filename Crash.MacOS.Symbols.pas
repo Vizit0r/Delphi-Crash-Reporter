@@ -1,4 +1,4 @@
-unit Crash.MacOS.Symbols;
+﻿unit Crash.MacOS.Symbols;
 
 { macOS-only Pascal symbol resolution from Mach-O LC_SYMTAB.
 

@@ -1,4 +1,4 @@
-unit Crash.ELFormat;
+﻿unit Crash.ELFormat;
 
 { EurekaLog .el text-format writer.
 
