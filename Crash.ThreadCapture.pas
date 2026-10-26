@@ -11,7 +11,9 @@
 
   Supported runtime backends:
     Linux x86-64, Android ARM64, macOS x86-64/ARM64.
-  Other targets compile to fail-soft stubs. }
+  Other targets compile to fail-soft stubs.
+
+  Copyright (c) 2026 Vizit0r. BSD 2-Clause license (see LICENSE.txt). }
 
 interface
 

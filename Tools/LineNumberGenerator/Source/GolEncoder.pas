@@ -7,7 +7,9 @@ unit GolEncoder;
   Crash.LineNumbers.pas.
 
   Part of the Crash Reporter library - standalone, EurekaLog-compatible
-  crash/exception reporting for Delphi cross-platform targets. }
+  crash/exception reporting for Delphi cross-platform targets.
+
+  Copyright (c) 2026 Vizit0r. BSD 2-Clause license (see LICENSE.txt). }
 
 interface
 

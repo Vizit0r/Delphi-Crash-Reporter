@@ -6,7 +6,10 @@ unit MachO;
   * https://h3adsh0tzz.com/2020/01/macho-file-format/
 
   For the specification (no longer provided by Apple):
-  * http://idea2ic.com/File_Formats/MachORuntime.pdf }
+  * http://idea2ic.com/File_Formats/MachORuntime.pdf
+
+  Derived from Grijjy JustAddCode / ErrorReporting:
+    Copyright (c) 2017 Grijjy, Inc. BSD 2-Clause license (see LICENSE.txt). }
 
 interface
 

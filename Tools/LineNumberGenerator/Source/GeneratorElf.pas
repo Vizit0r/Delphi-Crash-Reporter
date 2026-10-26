@@ -8,7 +8,9 @@ unit GeneratorElf;
   Diff vs. Generator.pas (Mach-O):
   * Single input file (the ELF), not exe + .dSYM.
   * ID = first 16 bytes of .note.gnu.build-id (vs. LC_UUID).
-  * DWARF sections come from .debug_* (vs. __DWARF segment __debug_*). }
+  * DWARF sections come from .debug_* (vs. __DWARF segment __debug_*).
+
+  Copyright (c) 2026 Vizit0r. BSD 2-Clause license (see LICENSE.txt). }
 
 interface
 

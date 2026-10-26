@@ -1,6 +1,8 @@
 ﻿unit Crash.Breadcrumbs;
 
-{ Bounded, framework-agnostic breadcrumb storage for crash reports. }
+{ Bounded, framework-agnostic breadcrumb storage for crash reports.
+
+  Copyright (c) 2026 Vizit0r. BSD 2-Clause license (see LICENSE.txt). }
 
 interface
 

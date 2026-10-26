@@ -4,7 +4,7 @@ unit Crash.Demangle;
 
   Derived from Grijjy JustAddCode / ErrorReporting:
     Copyright (c) 2017 Grijjy, Inc. BSD 2-Clause license (see LICENSE.txt).
-  Modifications under the same BSD 2-Clause license. }
+  Modifications Copyright (c) 2026 Vizit0r, under the same license. }
 
 interface
 

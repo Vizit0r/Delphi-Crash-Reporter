@@ -16,7 +16,9 @@ unit Crash.ELFormat;
     - The 11 columns: Methods | Details | Stack | Address | Module | Offset
       | Source | Unit | Class | Procedure/Method | Line.
 
-  Header hashes are placeholders (zeros); the Viewer usually doesn't validate them. }
+  Header hashes are placeholders (zeros); the Viewer usually doesn't validate them.
+
+  Copyright (c) 2026 Vizit0r. BSD 2-Clause license (see LICENSE.txt). }
 
 interface
 

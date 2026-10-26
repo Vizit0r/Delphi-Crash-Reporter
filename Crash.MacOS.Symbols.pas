@@ -24,7 +24,9 @@ unit Crash.MacOS.Symbols;
   Build requirements:
     - Linking -> Symbols: True (don't strip).
     - Debug info kind doesn't matter for THIS unit, only for line numbers
-      (separate concern handled by Crash.LineNumbers + .gol). }
+      (separate concern handled by Crash.LineNumbers + .gol).
+
+  Copyright (c) 2026 Vizit0r. BSD 2-Clause license (see LICENSE.txt). }
 
 interface
 

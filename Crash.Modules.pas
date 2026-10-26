@@ -19,7 +19,9 @@ unit Crash.Modules;
         /proc files don't report a size and that path has hung inside crash
         propagation under WSL.
     - macOS:         dyld public API. Size summed from LC_SEGMENT_64.vmsize.
-    - Windows:       not implemented (intentionally skipped). }
+    - Windows:       not implemented (intentionally skipped).
+
+  Copyright (c) 2026 Vizit0r. BSD 2-Clause license (see LICENSE.txt). }
 
 interface
 

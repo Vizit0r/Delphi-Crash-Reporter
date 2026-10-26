@@ -7,7 +7,10 @@ unit Dwarf;
   * https://dwarfstd.org/doc/Debugging%20using%20DWARF-2012.pdf
 
   And the official specification:
-  * https://dwarfstd.org/doc/DWARF5.pdf }
+  * https://dwarfstd.org/doc/DWARF5.pdf
+
+  Derived from Grijjy JustAddCode / ErrorReporting:
+    Copyright (c) 2017 Grijjy, Inc. BSD 2-Clause license (see LICENSE.txt). }
 
 {$SCOPEDENUMS ON}
 

@@ -18,7 +18,9 @@ unit Elf;
     negligible for our scale of binaries.
   * The first 16 bytes are NOT re-interpreted as a "GUID layout" (D1/D2/D3
     little-endian fields) -- they are stored byte-for-byte. The runtime
-    reader (Crash.LineNumbers) must compare them the same way. }
+    reader (Crash.LineNumbers) must compare them the same way.
+
+  Copyright (c) 2026 Vizit0r. BSD 2-Clause license (see LICENSE.txt). }
 
 interface
 

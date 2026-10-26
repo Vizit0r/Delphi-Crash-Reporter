@@ -12,7 +12,9 @@ unit Crash.Dialog.FMX;
   This unit is optional and FMX-only. The host opts in by wiring it into the
   config:
     Cfg.OnShowDialog := ShowCrashDialog;
-  and may optionally set CrashDialogTitle before the first crash. }
+  and may optionally set CrashDialogTitle before the first crash.
+
+  Copyright (c) 2026 Vizit0r. BSD 2-Clause license (see LICENSE.txt). }
 
 interface
 

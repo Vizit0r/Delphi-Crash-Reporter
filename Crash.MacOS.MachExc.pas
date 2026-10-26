@@ -40,7 +40,9 @@ unit Crash.MacOS.MachExc;
   Message layout uses mach_exc/exception_raise_state_identity with
   MACH_EXCEPTION_CODES (msgh_id 2407). The 64-bit exception codes preserve a
   full fault address; KERN_FAILURE still falls through to the Delphi RTL's
-  task-level classic handler. }
+  task-level classic handler.
+
+  Copyright (c) 2026 Vizit0r. BSD 2-Clause license (see LICENSE.txt). }
 
 interface
 

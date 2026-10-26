@@ -1,6 +1,8 @@
 ﻿unit Crash.Pending;
 
-{ Durable delivery marker helpers for Crash .el reports. }
+{ Durable delivery marker helpers for Crash .el reports.
+
+  Copyright (c) 2026 Vizit0r. BSD 2-Clause license (see LICENSE.txt). }
 
 interface
 

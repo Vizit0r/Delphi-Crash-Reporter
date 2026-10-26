@@ -21,7 +21,9 @@
   Lookup is a pure in-memory binary search (the file is read once at startup), so
   it is cheap and allocation-light on the crash path.
 
-  No-op on non-Android targets (the unit still compiles everywhere). }
+  No-op on non-Android targets (the unit still compiles everywhere).
+
+  Copyright (c) 2026 Vizit0r. BSD 2-Clause license (see LICENSE.txt). }
 
 interface
 

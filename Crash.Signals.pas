@@ -40,7 +40,9 @@ unit Crash.Signals;
     - macOS x86-64 (Intel) + ARM64 (Apple Silicon).
     - Android ARM64 (aarch64 ucontext snapshot).
     - Everything else (32-bit ARM, iOS, Windows) - the API compiles to no-op
-      stubs. }
+      stubs.
+
+  Copyright (c) 2026 Vizit0r. BSD 2-Clause license (see LICENSE.txt). }
 
 interface
 

@@ -26,7 +26,9 @@ unit Crash.Reporter;
   On Init it scans the exe directory for leftover .el files from previous runs;
   depending on the config they are uploaded (and deleted on success) or just
   collected. The collected reports are available via TakePending; the caller
-  decides how to surface them (stderr, log, dialog, server). }
+  decides how to surface them (stderr, log, dialog, server).
+
+  Copyright (c) 2026 Vizit0r. BSD 2-Clause license (see LICENSE.txt). }
 
 interface
 

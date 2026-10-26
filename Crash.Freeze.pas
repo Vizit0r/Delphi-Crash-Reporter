@@ -52,7 +52,9 @@ unit Crash.Freeze;
       path uses. Note the OS's own ANR machinery only helps with device
       access - this detector is what makes field hangs reportable.
     - Everything else (Windows, iOS, 32-bit ARM) - no-op stubs (Windows is
-      EurekaLog territory). }
+      EurekaLog territory).
+
+  Copyright (c) 2026 Vizit0r. BSD 2-Clause license (see LICENSE.txt). }
 
 interface
 

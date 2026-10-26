@@ -4,7 +4,9 @@
 
   Calm path: prepares two O_CLOEXEC, fixed-size files and in-memory templates.
   Signal path: copies an already populated snapshot, writes it with bounded raw
-  syscalls, fsyncs, and publishes the commit byte last. }
+  syscalls, fsyncs, and publishes the commit byte last.
+
+  Copyright (c) 2026 Vizit0r. BSD 2-Clause license (see LICENSE.txt). }
 
 interface
 

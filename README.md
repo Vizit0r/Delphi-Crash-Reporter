@@ -18,8 +18,10 @@ it out and non-fatal exceptions fall back to a stderr message. `Demo/CrashDemo`
 is precisely this case: a pure console program that links the entire reporter
 with zero FMX units.
 
-Derived from [grijjy/JustAddCode](https://github.com/grijjy/JustAddCode)
-(ErrorReporting), BSD 2-Clause — see `LICENSE.txt`.
+© 2026 Vizit0r, BSD 2-Clause — see `LICENSE.txt`. The call-stack, line-number,
+demangling and Mach-O/DWARF parts grew out of
+[grijjy/JustAddCode](https://github.com/grijjy/JustAddCode) (ErrorReporting),
+© 2017 Grijjy, Inc.
 
 ## What you get
 
@@ -845,5 +847,15 @@ the two empty preallocated `.crashraw` slots remain on disk but are not reports.
 
 ## License
 
-BSD 2-Clause. Portions © 2017 Grijjy, Inc.; modifications under the same terms.
+BSD 2-Clause. Copyright © 2026 Vizit0r.
+
+Portions are derived from [grijjy/JustAddCode](https://github.com/grijjy/JustAddCode)
+(ErrorReporting), Copyright © 2017 Grijjy, Inc., under the same license:
+`Crash.CallStack`, `Crash.Demangle`, `Crash.LineNumbers`, `Crash.MacOS.Api` and,
+in `Tools/LineNumberGenerator/Source`, `Dwarf`, `MachO` and `Generator`. Each of
+those units names its copyright holders in its header.
+
+If you ship this library in binary form, reproduce `LICENSE.txt` (both copyright
+lines) in your documentation or other distributed materials.
+
 See `LICENSE.txt`.
