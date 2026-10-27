@@ -143,10 +143,11 @@ type
     ReportDir: String;
     { Freeze (hang) detection - see Crash.Freeze. Default False (opt in): keep
       it off until the detector has proven itself on the target app. Active
-      only on targets with capture support (currently Linux x86-64); elsewhere
-      the flag is accepted and ignored. Report-only: the frozen thread is
-      never aborted. The host must call TCrashFreeze.Ping from the watched
-      (main) loop, otherwise detection stays dormant. }
+      only on targets with capture support (Linux x86-64, macOS, Android
+      ARM64); elsewhere the flag is accepted and ignored. Report-only: the
+      frozen thread is never aborted. The host must call TCrashFreeze.Ping
+      from the watched (main) loop, otherwise detection stays dormant; pings
+      from other threads are ignored. }
     FreezeDetection: Boolean;
     { Capture registered application threads in addition to the exception/frozen
       thread. Default False in the standalone library; the host opts in. }

@@ -244,6 +244,11 @@ Optional UI:
 - `Crash.Dialog.FMX` — modal FMX report dialog. `ShowCrashDialog` wires into
   `TCrashConfig.OnShowDialog`; set `CrashDialogTitle` to change the caption.
 
+Tests (`Tests/`, test builds only — see [Tests](#tests)):
+
+- `Crash.Tests.Registry` / `Crash.Tests.Progress` — test registry, runner and sub-step accounting.
+- `Crash.Tests.*` — the test bodies; `CrashTests.dpr` is the console runner.
+
 ## Source line numbers (`.gol`)
 
 Line numbers come from a `.gol` file generated at build time from the binary's
@@ -550,7 +555,8 @@ translated back to the captured address range.
 
 `Crash.Freeze` is the EurekaLog "anti-freeze" analogue for POSIX targets. A
 watchdog thread watches heartbeats from the thread the host wants covered
-(normally the main/UI loop, which calls `TCrashFreeze.Ping` from its loop); when
+(normally the main/UI loop, which calls `TCrashFreeze.Ping` from its loop; a
+ping from any other thread is ignored, so a helper timer cannot mask a hang); when
 they stop for `FreezeTimeoutMS`, the watchdog captures the frozen thread's stack
 **in place** through the shared `Crash.ThreadCapture` service (a realtime signal
 on Linux/Android or SIGUSR2 on macOS plus the bounded FP/raw walker described
@@ -783,6 +789,49 @@ strict in a few non-obvious ways:
   IDs are printed as 32-bit values like EurekaLog's, even where the native id is
   64-bit.
 - **Encoding.** UTF-16LE + BOM, matching a Windows EurekaLog build.
+
+## Tests
+
+`Tests/CrashTests.dpr` (+ `CrashTests.dproj`) is the library's automated test
+suite as a console program: each test prints its sub-steps and the runner ends
+with `=== SUMMARY: PASS=x SKIP=y FAIL=z (of n)`. Exit code: 0 — nothing failed,
+1 — a test failed, 2 — bad command line.
+
+```
+# build (Linux64; -p:Platform=OSX64 / Win64 the same way)
+msbuild Tests/CrashTests.dproj /t:Build /p:Config=Release /p:Platform=Linux64
+# -> Tests/Linux64/Release/CrashTests
+
+./CrashTests                         # every test
+./CrashTests --test=CrashFreeze      # one test (repeatable)
+./CrashTests --list                  # what is registered
+./CrashTests --summary-only          # summary and FAIL lines only
+```
+
+| Test | Covers |
+|---|---|
+| `GolCodec` | the `.gol` encoder against an independent reference decoder |
+| `ELFormat` | the `.el` layout against golden text |
+| `CrashPending` | `.pending` delivery markers and startup selection |
+| `CrashCapabilities` | parameter privacy, breadcrumbs, file naming, lifecycle |
+| `CrashRawFallback` | the raw hardware-fault fallback: format, corruption, recovery |
+| `CrashHandledFault` | a handled hardware fault keeps capture armed and leaves no stale snapshot |
+| `CrashExtendedThreads` | registered-thread capture: limits, budgets, integration |
+| `CrashFreeze` | the freeze detector: detection, suppression, re-arm, whole-process stall grace, `RestartOnFreeze` contract, BugID normalization |
+| `CrashChildProcess` | the runner starts itself as a child that dies of a real fault (unhandled raise, null write, a raise after a swallowed fault on the same or another thread, stack overflow) and checks the `.el` it leaves; the stack overflow (Linux only) is recovered from the raw block by the next start |
+
+On Windows the reporter is a no-op, so most tests skip there. The suite runs on
+the main thread with the reporter initialized the way a host typically would
+(extended thread capture on, freeze detection report-only, no upload).
+
+The test seams inside the library units are compiled in under `AUTOTESTS`;
+define it only in test builds — it adds test-only branches to the signal
+handler and the capture slots. `CrashTests.dproj` defines it.
+
+A host application with its own test framework can run the same bodies:
+`Crash.Tests.Registry.CrashRegisteredTests` lists them, and each entry's `Proc`
+returns the lines and the result. Entries of kind `ctkRunnerOnly` need the
+standalone runner (they start it as a child process).
 
 ## Demo / smoke test
 

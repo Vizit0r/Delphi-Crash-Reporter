@@ -109,7 +109,8 @@ type
     class procedure Shutdown; static;
 
     { Heartbeat. Call from the watched thread's loop; cheap (one atomic
-      write), safe at any frequency. No-op until Install. }
+      write), safe at any frequency. No-op until Install, and from any other
+      thread (such a ping would mask a freeze of the watched one). }
     class procedure Ping; static;
 
     { Mute detection across a known-legitimate stall (nestable). Callable
@@ -147,6 +148,9 @@ type
 { One-shot: the watchdog's next sleep lasts AExtraMS longer (models a
   whole-process stall without stopping the test process). }
 procedure CrashFreezeTestStallWatchdogOnce(const AExtraMS: Integer);
+{ Watchdog state for test diagnostics: loop count, why the last quantum did
+  not report, suppression counters, heartbeat age. }
+function CrashFreezeTestStateText: String;
 {$ENDIF}
 
 implementation
@@ -163,6 +167,8 @@ uses
   System.Classes,
   System.SyncObjs,
   System.Math,
+  Posix.Pthread,
+  Posix.SysTypes,
   Crash.ThreadCapture;
 
 const
@@ -173,6 +179,7 @@ const
 
 var
   GWatchedCapture: TCrashThreadCaptureHandle = nil;
+  GWatchedThread: pthread_t = 0;
   GTimeoutMS:     Int64 = 0;
   GLastPingMS:    Int64 = 0;   // TThread.GetTickCount64 (CLOCK_MONOTONIC: excludes system suspend)
   GSuppress:      Integer = 0;
@@ -181,6 +188,8 @@ var
   GWatchdog:      TThread = nil;
   {$IFDEF AUTOTESTS}
   GTestStallMS:   Integer = 0; // see CrashFreezeTestStallWatchdogOnce
+  GTestLoops:     Integer = 0; // see CrashFreezeTestStateText
+  GTestLastSkip:  Integer = 0;
   {$ENDIF}
 
 type
@@ -285,9 +294,17 @@ begin
     {$ENDIF}
     if Terminated then
       Break;
+    {$IFDEF AUTOTESTS}
+    TInterlocked.Increment(GTestLoops);
+    {$ENDIF}
     LastPing := TInterlocked.Read(GLastPingMS);
     if LastPing = 0 then
+    begin
+      {$IFDEF AUTOTESTS}
+      TInterlocked.Exchange(GTestLastSkip, 1);
+      {$ENDIF}
       Continue; // dormant until the first ping (cold start is not a freeze)
+    end;
     Now64 := Int64(TThread.GetTickCount64);
 
     // The watchdog itself overslept the timeout: the whole process was
@@ -319,17 +336,33 @@ begin
       // detection moment proves the thread came back.
       if LastPing > EpisodeStart then
         InEpisode := False;
+      {$IFDEF AUTOTESTS}
+      TInterlocked.Exchange(GTestLastSkip, 2);
+      {$ENDIF}
       Continue;
     end;
 
     LastAlive := Max(LastPing, GraceMark);
     if (Now64 - LastAlive) < GTimeoutMS then
+    begin
+      {$IFDEF AUTOTESTS}
+      if Suppressed then
+        TInterlocked.Exchange(GTestLastSkip, 3)
+      else if GraceMark > LastPing then
+        TInterlocked.Exchange(GTestLastSkip, 4)
+      else
+        TInterlocked.Exchange(GTestLastSkip, 5);
+      {$ENDIF}
       Continue;
+    end;
 
     // Over the noise cap: the episode is still tracked (one per freeze), just
     // no longer reported.
     if FEpisodes >= MAX_EPISODES_PER_RUN then
     begin
+      {$IFDEF AUTOTESTS}
+      TInterlocked.Exchange(GTestLastSkip, 6);
+      {$ENDIF}
       InEpisode := True;
       EpisodeStart := Now64;
       Continue;
@@ -337,7 +370,15 @@ begin
     // Busy report gate (an exception report is in flight) = retry on the next
     // quantum, the freeze is not going anywhere.
     if not CaptureAndReport(Now64 - LastPing) then
+    begin
+      {$IFDEF AUTOTESTS}
+      TInterlocked.Exchange(GTestLastSkip, 7);
+      {$ENDIF}
       Continue;
+    end;
+    {$IFDEF AUTOTESTS}
+    TInterlocked.Exchange(GTestLastSkip, 8);
+    {$ENDIF}
     InEpisode := True;
     EpisodeStart := Now64;
     Inc(FEpisodes);
@@ -361,6 +402,7 @@ begin
     Exit;
   end;
   GTimeoutMS := Max(Int64(MIN_TIMEOUT_MS), Int64(ATimeoutMS));
+  GWatchedThread := pthread_self;
   TInterlocked.Exchange(GLastPingMS, 0);
   try
     GWatchdog := TFreezeWatchdog.Create(False);
@@ -394,7 +436,7 @@ end;
 
 class procedure TCrashFreeze.Ping;
 begin
-  if not GInstalled then
+  if (not GInstalled) or (pthread_equal(pthread_self, GWatchedThread) = 0) then
     Exit;
   TInterlocked.Exchange(GLastPingMS, Int64(TThread.GetTickCount64));
 end;
@@ -436,6 +478,27 @@ end;
 procedure CrashFreezeTestStallWatchdogOnce(const AExtraMS: Integer);
 begin
   TInterlocked.Exchange(GTestStallMS, AExtraMS);
+end;
+
+function CrashFreezeTestStateText: String;
+const
+  SKIP_NAMES: array[0..8] of String = ('none', 'dormant', 'in-episode',
+    'suppressed', 'grace', 'fresh-ping', 'episode-cap', 'gate-busy', 'reported');
+var
+  LastPing: Int64;
+  Skip: Integer;
+begin
+  LastPing := TInterlocked.Read(GLastPingMS);
+  Skip := TInterlocked.CompareExchange(GTestLastSkip, 0, 0);
+  if (Skip < Low(SKIP_NAMES)) or (Skip > High(SKIP_NAMES)) then
+    Skip := 0;
+  if LastPing <> 0 then
+    LastPing := Int64(TThread.GetTickCount64) - LastPing;
+  Result := Format('installed=%s loops=%d last=%s suppress=%d suspended=%d ' +
+    'pingAgoMS=%d timeoutMS=%d',
+    [BoolToStr(GInstalled, True), TInterlocked.CompareExchange(GTestLoops, 0, 0),
+     SKIP_NAMES[Skip], TInterlocked.CompareExchange(GSuppress, 0, 0),
+     TInterlocked.CompareExchange(GSuspended, 0, 0), LastPing, GTimeoutMS]);
 end;
 {$ENDIF}
 
@@ -480,6 +543,11 @@ end;
 {$IFDEF AUTOTESTS}
 procedure CrashFreezeTestStallWatchdogOnce(const AExtraMS: Integer);
 begin
+end;
+
+function CrashFreezeTestStateText: String;
+begin
+  Result := 'stubs';
 end;
 {$ENDIF}
 
