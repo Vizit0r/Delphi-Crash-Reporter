@@ -55,6 +55,7 @@ const
   RESPONSIVE_WORKER_COUNT = 34;
   BLOCKED_WORKER_COUNT = 12;
   CAPTURE_LIMIT = 32;
+  HARD_CAPTURE_LIMIT = 128; // ExtendedThreadsMax clamp
   WORKER_READY_TIMEOUT_MS = 5000;
   {$IF Defined(MACOS)}
   TEST_MAP_ANONYMOUS = $1000;
@@ -821,6 +822,23 @@ begin
     'H6: real alt-stack signal respects guard bounds and resets stale payload');
 end;
 
+function RaiseCaptureLimit: Integer;
+// Selection takes the first N registrations and the round's workers register
+// last: in a host with many live registered threads they would fall past the
+// default 32. Steps that check their own workers (not the limit) raise it to
+// the hard maximum; returns the previous value for RestoreCaptureLimit.
+begin
+  Result := 0;
+  CrashAutoTestSetExtendedThreadsMax(HARD_CAPTURE_LIMIT, Result);
+end;
+
+procedure RestoreCaptureLimit(const APrevious: Integer);
+var
+  Ignored: Integer;
+begin
+  CrashAutoTestSetExtendedThreadsMax(APrevious, Ignored);
+end;
+
 procedure RunOwningFrameRound(const ACoordinator: TCrashThreadCoverage;
   const AProgress: TCrashTestProgress);
 const
@@ -828,7 +846,7 @@ const
 var
   Workers: TObjectList<TExtendedCaptureWorker>;
   Threads: TArray<TCrashThreadStack>;
-  Omitted, Index, I, SavedMaxDepth: Integer;
+  Omitted, Index, I, SavedMaxDepth, SavedLimit: Integer;
   ExecuteLow, ExecuteHigh: UIntPtr;
   TotalMS, MaxThreadMS: UInt64;
   CaptureOK, RangeOK, FrameOK: Boolean;
@@ -836,6 +854,7 @@ var
 begin
   Workers := StartWorkers(PREFIX, 1, False);
   SavedMaxDepth := TCrashCapture.MaxCallStackDepth;
+  SavedLimit := RaiseCaptureLimit;
   try
     TCrashCapture.MaxCallStackDepth := 16;
     CaptureOK := CrashAutoTestCaptureExtendedThreads(
@@ -854,9 +873,13 @@ begin
            UInt64(Threads[Index].CallStack[I].CodeAddress -
              Threads[Index].CallStack[I].ModuleAddress),
            Threads[Index].CallStack[I].RoutineName]);
+    if CaptureOK and (Index < 0) then
+      AProgress.InfoFmt('E1a: worker not selected (listed=%d omitted=%d)',
+        [Length(Threads), Omitted]);
     AProgress.Account(FrameOK,
       'E1a: responsive trace reaches the owning Delphi Execute code interval');
   finally
+    RestoreCaptureLimit(SavedLimit);
     TCrashCapture.MaxCallStackDepth := SavedMaxDepth;
     CleanupError := StopWorkers(Workers);
     Workers.Free;
@@ -876,13 +899,15 @@ var
   FreezeReport: TCrashReport;
   ExtendCapture: TCrashFreezeExtendCaptureEvent;
   Omitted, WorkerPrimaryOmitted, BaselineEligible, ExpectedSelected,
-    ExpectedOmitted, I, Index, CapturedCount, SavedMaxDepth: Integer;
+    ExpectedOmitted, I, Index, CapturedCount, SavedMaxDepth,
+    SavedLimit: Integer;
   TotalMS, MaxThreadMS, OtherTotalMS, OtherMaxMS: UInt64;
   OrderOK, CaptureOK, FreezeOK, DiagnosticsOK: Boolean;
   CleanupError: String;
 begin
   Workers := StartWorkers(PREFIX, RESPONSIVE_WORKER_COUNT, False);
   SavedMaxDepth := TCrashCapture.MaxCallStackDepth;
+  SavedLimit := -1;
   try
     TCrashCapture.MaxCallStackDepth := 3;
     if not WaitWorkersReady(Workers, WORKER_READY_TIMEOUT_MS) then
@@ -952,6 +977,8 @@ begin
       '(total=' + IntToStr(Int64(TotalMS)) + ' ms, max-thread=' +
       IntToStr(Int64(MaxThreadMS)) + ' ms)');
 
+    // E3-E5 checked the default limit; E6/E7 check the workers themselves.
+    SavedLimit := RaiseCaptureLimit;
     WorkerPrimaryOmitted := 0;
     OtherTotalMS := 0;
     OtherMaxMS := 0;
@@ -979,6 +1006,8 @@ begin
     AProgress.Account(FreezeOK,
       'E7: freeze extension preserves the primary stack and adds worker blocks');
   finally
+    if SavedLimit >= 0 then
+      RestoreCaptureLimit(SavedLimit);
     TCrashCapture.MaxCallStackDepth := SavedMaxDepth;
     CleanupError := StopWorkers(Workers);
     Workers.Free;
@@ -994,12 +1023,13 @@ const
 var
   Workers: TObjectList<TExtendedCaptureWorker>;
   Threads: TArray<TCrashThreadStack>;
-  Omitted, I, Index, TimedOutCount, BudgetCount: Integer;
+  Omitted, I, Index, TimedOutCount, BudgetCount, SavedLimit: Integer;
   TotalMS, MaxThreadMS: UInt64;
   CaptureOK, StatesOK: Boolean;
   CleanupError: String;
 begin
   Workers := StartWorkers(PREFIX, BLOCKED_WORKER_COUNT, True);
+  SavedLimit := RaiseCaptureLimit;
   try
     if not WaitWorkersReady(Workers, WORKER_READY_TIMEOUT_MS) then
     begin
@@ -1036,6 +1066,7 @@ begin
       '(total=' + IntToStr(Int64(TotalMS)) + ' ms, max-thread=' +
       IntToStr(Int64(MaxThreadMS)) + ' ms)');
   finally
+    RestoreCaptureLimit(SavedLimit);
     CleanupError := StopWorkers(Workers);
     Workers.Free;
     AProgress.Account(CleanupError = '',
