@@ -51,6 +51,8 @@ type
   {$IFDEF AUTOTESTS}
   TCrashAutoTestUploadProc = reference to function(const AUrl, AFieldName,
     AReportText, AFileName: String): Boolean;
+  TCrashAutoTestUploadBodyProc = reference to function(const AFileName: String;
+    const ABody: TArray<Byte>): Boolean;
   {$ENDIF}
 
   { Optional: returns extra free-form text appended to the report as a trailing
@@ -69,6 +71,19 @@ type
     keep it cheap and robust. An exception raised by the filter is swallowed and
     the report is KEPT: a faulty filter must never suppress a real crash. }
   TCrashReportFilterProc = reference to function(const AReport: TCrashReport): Boolean;
+
+  { Optional: extra files for a non-fatal report (logs, state dumps). Called
+    synchronously on the reporting thread, only for csHandled / csOnException /
+    csAcquired reports - never for fatal, freeze or recovered ones.
+    AReport.ExceptionObject is valid during the call. Write the files into
+    ATempDir (it exists, the library deletes it later) or name existing files
+    by full path, and return them in AFiles. With at least one file the report
+    is written as a ".elp" zip package (BugReport.el + the files) instead of a
+    plain ".el". Keep it bounded: it runs in the reporting path, and an
+    exception raised here is swallowed (the report goes out without files). }
+  TCrashCollectAttachmentsProc = reference to procedure(
+    const AReport: TCrashReport; const ATempDir: String;
+    var AFiles: TArray<String>);
 
   { Everything the host can configure. Fill the fields you care about (start from
     DefaultCrashConfig) and pass to TCrashReporter.Init once at startup. }
@@ -177,6 +192,9 @@ type
     { Fired (on the WATCHDOG thread) after a freeze report is handled - lets
       the host log/notify. Keep it cheap and thread-safe. }
     OnFreezeReport: TCrashFreezeReportProc;
+    { Extra files for non-fatal reports, see TCrashCollectAttachmentsProc.
+      nil -> always a plain .el. }
+    OnCollectAttachments: TCrashCollectAttachmentsProc;
   end;
 
 { A config pre-filled with sensible defaults. Override the fields you need. }
@@ -257,6 +275,9 @@ function CrashConsumeFreezeRestartEnvMark: Boolean;
 function CrashAutoTestQueueUpload(const AReportText, AReportPath: String;
   const ATransport: TCrashAutoTestUploadProc;
   const AOnComplete: TCrashUploadCompleteProc = nil): Boolean;
+{ The same worker; the transport sees the exact upload body (file bytes). }
+function CrashAutoTestQueueUploadBody(const AReportText, AReportPath: String;
+  const ATransport: TCrashAutoTestUploadBodyProc): Boolean;
 { The exact anti-cascade transition used by HandleReport, exposed so state
   tests can prove that a second capture is not allowed to create a file. }
 function CrashAutoTestTryClaimReport(var AAlreadyReported: Boolean): Boolean;
@@ -408,6 +429,15 @@ type
       FreezeDetection=True; no-op when the reporter is not installed. Must be
       called on the watched (main) thread - it is the capture target. }
     class procedure EnableFreezeDetection(const ATimeoutMS: Integer); static;
+
+    { Report an exception the host CAUGHT and keeps running after - the
+      "report and continue" of a keep-alive except block. Call it inside the
+      except block (the raise-point stack is attached to the exception there).
+      Handled like any non-fatal report: filter, attachments, dialog or
+      background upload. AException is an Exception instance (TObject keeps
+      SysUtils out of this interface); anything else is ignored. No-op on
+      Windows and before Init. }
+    class procedure ReportHandled(const AException: TObject); static;
   end;
 
 implementation
@@ -473,7 +503,7 @@ end;
 
 type
   TCrashUploadWorkerProc = reference to function(const AUrl, AFieldName,
-    AReportText, AFileName: String): Boolean;
+    AReportText, AFileName: String; const ABody: TBytes): Boolean;
 
   ICrashOperationLifetime = interface
     function Active: Boolean;
@@ -856,6 +886,8 @@ type
     FBreadcrumbs: TCrashBreadcrumbStore;
     FOperationLifetime: ICrashOperationLifetime;
     FInstanceID: UInt64;
+    FAttachDir: String;              // temp dir of the current report's attachments
+    FAttachFiles: TArray<String>;    // non-empty -> the current report is a .elp package
     function EffectiveFileNamePrefix: String;
     function EffectiveScanPrefix: String;
     function EffectiveReportDir: String;
@@ -871,6 +903,8 @@ type
     function WriteReportTextToUniqueFile(const AText: String;
       var APath: String): Boolean;
     procedure ResetAlreadyReported;
+    procedure CollectAttachments(const AReport: TCrashReport);
+    procedure CleanupStaleAttachDirs;
     procedure HandleReport(const AReport: TCrashReport);
     procedure DoHandleReport(const AReport: TCrashReport);
     function TryEnterRegistry(const ATimeoutMS: Integer): Boolean;
@@ -1718,6 +1752,15 @@ begin
   // slipped past the skip above) would collide. The unique-suffix logic in the
   // write core guarantees no real report is ever overwritten by another (the
   // root case - the content-less phantom - is already dropped in HandleReport).
+  if Length(FAttachFiles) > 0 then
+  begin
+    FCrashFilePath := ChangeFileExt(FCrashFilePath, '.elp');
+    if CrashWriteReportPackageToUniqueFile(AText, FAttachFiles, FCrashFilePath) then
+      Exit(True);
+    // A package that cannot be written must not cost the report itself.
+    FAttachFiles := nil;
+    FCrashFilePath := BuildCrashFilePath;
+  end;
   Result := WriteReportTextToUniqueFile(AText, FCrashFilePath);
 end;
 
@@ -1731,13 +1774,77 @@ begin
 end;
 
 procedure TCrashReporterImpl.ResetAlreadyReported;
+var
+  AttachDir: String;
 begin
   FLock.Enter;
   try
     FAlreadyReported := False;
     FCrashFilePath := '';
+    AttachDir := FAttachDir;
+    FAttachDir := '';
+    FAttachFiles := nil;
   finally
     FLock.Leave;
+  end;
+  if AttachDir <> '' then
+    try
+      TDirectory.Delete(AttachDir, True);
+    except
+      // A leftover is removed by the next startup scan.
+    end;
+end;
+
+const
+  CRASH_ATTACH_DIR_SUFFIX = '.attach';
+
+procedure TCrashReporterImpl.CollectAttachments(const AReport: TCrashReport);
+var
+  Dir: String;
+  Files, Kept: TArray<String>;
+  FilePath: String;
+begin
+  FAttachDir := '';
+  FAttachFiles := nil;
+  if not Assigned(FConfig.OnCollectAttachments) then
+    Exit;
+  if not (AReport.Source in [csHandled, csOnException, csAcquired]) then
+    Exit;
+  if AReport.IsFreeze then
+    Exit;
+  Dir := ChangeFileExt(BuildCrashFilePath, '') + '_' +
+    ChangeFileExt(TPath.GetRandomFileName, '') + CRASH_ATTACH_DIR_SUFFIX;
+  try
+    ForceDirectories(Dir);
+    FAttachDir := Dir;
+    Files := nil;
+    FConfig.OnCollectAttachments(AReport, Dir, Files);
+    Kept := nil;
+    for FilePath in Files do
+      if (FilePath <> '') and TFile.Exists(FilePath) then
+        Kept := Kept + [FilePath];
+    FAttachFiles := Kept;
+  except
+    // A faulty provider must not break reporting: plain .el.
+    FAttachFiles := nil;
+  end;
+end;
+
+procedure TCrashReporterImpl.CleanupStaleAttachDirs;
+var
+  Dir, Stale: String;
+begin
+  Dir := EffectiveReportDir;
+  if (Dir = '') or (not TDirectory.Exists(Dir)) then
+    Exit;
+  try
+    for Stale in TDirectory.GetDirectories(Dir,
+        EffectiveScanPrefix + '*' + CRASH_ATTACH_DIR_SUFFIX) do
+      try
+        TDirectory.Delete(Stale, True);
+      except
+      end;
+  except
   end;
 end;
 
@@ -1908,6 +2015,8 @@ begin
   // BuildCrashFilePath). Compute it here, where AReport is in hand, before
   // WriteToFile builds the path.
   FExceptionID := CrashGenerateExceptionID(Report);
+  if not IsFatal then
+    CollectAttachments(AReport);
 
   ReportPersisted := False;
   if FConfig.SaveToFile then
@@ -2249,11 +2358,12 @@ begin
   end;
 end;
 
-function CrashUploadCore(const AUrl, AFieldName, AReportText,
-  AFileName: String): Boolean;
+function CrashUploadBody(const AUrl, AFieldName: String; const ABody: TBytes;
+  const AFileName: String): Boolean;
 // Self-contained multipart POST used by the facade Upload and by the startup
 // background worker. Deliberately touches NO reporter-singleton state: the
 // worker may still be running while the singleton is torn down at shutdown.
+// ABody is the file as on disk: UTF-16LE+BOM .el text or .elp package bytes.
 var
   Client: THTTPClient;
   Form: TMultipartFormData;
@@ -2269,8 +2379,7 @@ begin
   // so a local .el can be read without a network side effect.
   if GetEnvironmentVariable('CRASH_NO_UPLOAD') = '1' then Exit;
 
-  // File body bytes - UTF-16LE with BOM, same as the .el on disk.
-  Bytes := TEncoding.Unicode.GetPreamble + TEncoding.Unicode.GetBytes(AReportText);
+  Bytes := ABody;
 
   // Server-side name = on-disk name, so logs/monitoring keep the context.
   if AFileName <> '' then UploadName := AFileName
@@ -2307,6 +2416,13 @@ begin
   end;
 end;
 
+function CrashUploadCore(const AUrl, AFieldName, AReportText,
+  AFileName: String): Boolean;
+begin
+  Result := CrashUploadBody(AUrl, AFieldName,
+    CrashReportUploadBody(AReportText, ''), AFileName);
+end;
+
 function CrashQueueUpload(const AUrl, AFieldName, AReportText,
   AReportPath: String; const AOnComplete: TCrashUploadCompleteProc;
   const ALifetime: ICrashOperationLifetime): Boolean;
@@ -2341,13 +2457,20 @@ begin
     procedure
     var
       Success: Boolean;
+      Body: TBytes;
     begin
-      if Assigned(TransportProc) then
-        Success := TransportProc(UploadUrl, UploadField, UploadText,
-          ExtractFileName(UploadPath))
-      else
-        Success := CrashUploadCore(UploadUrl, UploadField, UploadText,
-          ExtractFileName(UploadPath));
+      Success := False;
+      try
+        Body := CrashReportUploadBody(UploadText, UploadPath);
+        if Assigned(TransportProc) then
+          Success := TransportProc(UploadUrl, UploadField, UploadText,
+            ExtractFileName(UploadPath), Body)
+        else
+          Success := CrashUploadBody(UploadUrl, UploadField, Body,
+            ExtractFileName(UploadPath));
+      except
+        // Unreadable package: the report and its marker stay for startup.
+      end;
       if Success then
         CrashDeleteReportAndPendingMarker(UploadPath);
       if Assigned(CompleteProc) and
@@ -2378,7 +2501,8 @@ begin
   if not Assigned(ATransport) then
     Exit;
   WorkerTransport :=
-    function(const AUrl, AFieldName, AText, AFileName: String): Boolean
+    function(const AUrl, AFieldName, AText, AFileName: String;
+      const ABody: TBytes): Boolean
     begin
       Result := ATransport(AUrl, AFieldName, AText, AFileName);
     end;
@@ -2387,6 +2511,27 @@ begin
       AReportText, AReportPath, WorkerTransport, AOnComplete, nil);
   except
     // The test observes a failed queue request directly.
+  end;
+end;
+
+function CrashAutoTestQueueUploadBody(const AReportText, AReportPath: String;
+  const ATransport: TCrashAutoTestUploadBodyProc): Boolean;
+var
+  WorkerTransport: TCrashUploadWorkerProc;
+begin
+  Result := False;
+  if not Assigned(ATransport) then
+    Exit;
+  WorkerTransport :=
+    function(const AUrl, AFieldName, AText, AFileName: String;
+      const ABody: TBytes): Boolean
+    begin
+      Result := ATransport(AFileName, ABody);
+    end;
+  try
+    Result := CrashQueueUploadWithTransport('autotest://upload', 'fixture',
+      AReportText, AReportPath, WorkerTransport, nil, nil);
+  except
   end;
 end;
 {$ENDIF}
@@ -2461,7 +2606,8 @@ begin
         CallbackCalled := False;
         GateResult := Lifetime.Active and CrashQueueUploadWithTransport(
           'autotest://lifetime', 'fixture', 'fixture', 'fixture.el',
-          function(const AUrl, AFieldName, AText, AFileName: String): Boolean
+          function(const AUrl, AFieldName, AText, AFileName: String;
+            const ABody: TBytes): Boolean
           begin
             Entered.SetEvent;
             Gate.WaitFor(2000);
@@ -2702,6 +2848,7 @@ begin
   // matching reports written by a previous app version.
   Pattern := EffectiveScanPrefix + '*.el';
   MarkerPattern := EffectiveScanPrefix + '*.pending';
+  CleanupStaleAttachDirs;
 
   // A crash between deleting the sent .el and deleting its marker leaves a
   // harmless orphan. Remove it before partitioning the live reports.
@@ -2714,7 +2861,8 @@ begin
 
   Files := nil;
   try
-    Files := TDirectory.GetFiles(Dir, Pattern);
+    Files := TDirectory.GetFiles(Dir, Pattern) +
+      TDirectory.GetFiles(Dir, ChangeFileExt(Pattern, '.elp'));
   except
     Exit; // directory unavailable - don't fail bootstrap
   end;
@@ -2732,7 +2880,7 @@ begin
   try
     for FilePath in SurfaceFiles do
       try
-        Kept.Add(TFile.ReadAllText(FilePath, TEncoding.Unicode));
+        Kept.Add(CrashReadReportText(FilePath));
       except
         // Couldn't read - skip silently; the file stays.
       end;
@@ -2766,8 +2914,12 @@ begin
       begin
         UpFile := StartupUploadFiles[I];
         try
-          UpText := TFile.ReadAllText(UpFile, TEncoding.Unicode);
-          if CrashUploadCore(UploadUrl, UploadField, UpText,
+          if CrashIsPackagedReport(UpFile) then
+            UpText := ''
+          else
+            UpText := TFile.ReadAllText(UpFile, TEncoding.Unicode);
+          if CrashUploadBody(UploadUrl, UploadField,
+               CrashReportUploadBody(UpText, UpFile),
                ExtractFileName(UpFile)) then
             CrashDeleteReportAndPendingMarker(UpFile);
         except
@@ -3144,6 +3296,14 @@ end;
 class function TCrashReporter.MainThreadMachCovered: Boolean;
 begin
   Result := (GReporter = nil) or GReporter.FMachMainThreadCovered;
+end;
+
+class procedure TCrashReporter.ReportHandled(const AException: TObject);
+begin
+  if (GReporter = nil) or (not GReporter.FInstalled) then
+    Exit;
+  if AException is Exception then
+    TCrashCapture.ReportHandled(Exception(AException));
 end;
 
 class procedure TCrashReporter.EnableFreezeDetection(const ATimeoutMS: Integer);

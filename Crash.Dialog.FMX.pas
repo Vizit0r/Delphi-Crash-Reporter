@@ -1,6 +1,7 @@
 ﻿unit Crash.Dialog.FMX;
 
-{ Modal FMX dialog for non-fatal exception reports (csOnException / csAcquired).
+{ Modal FMX dialog for non-fatal exception reports (csOnException / csAcquired /
+  csHandled).
 
   Part of the Crash Reporter library - standalone, EurekaLog-compatible
   crash/exception reporting for Delphi cross-platform targets.

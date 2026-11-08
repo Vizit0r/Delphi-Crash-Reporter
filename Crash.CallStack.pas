@@ -90,7 +90,9 @@ type
   TCrashSource = (
     csOnException,   // Application.OnException - FMX main thread caught it; process stays alive.
     csAcquired,      // ExceptionAcquired - secondary thread caught it; process stays alive.
-    csFatalProc      // ExceptProc - truly unhandled; RTL will Halt(217) shortly.
+    csFatalProc,     // ExceptProc - truly unhandled; RTL will Halt(217) shortly.
+    csHandled        // TCrashCapture.ReportHandled - the host caught it and asked
+                     // for a report; process stays alive.
   );
 
 type
@@ -128,6 +130,10 @@ type
       (currently the watched thread in freeze reports). }
     PrimaryCaptureDiagnostics: String;
     Source: TCrashSource;
+    { The exception object behind the report. Valid only while the report is
+      delivered synchronously (OnReport and the host callbacks it runs); nil for
+      freeze, raw-recovered and nil-object reports. Never stored. }
+    ExceptionObject: TObject;
     { Freeze-watchdog report (Crash.Freeze): the stack is a SAMPLE of a running
       thread, not a raise point - BugID generation uses the freeze
       normalization (see CrashGenerateExceptionID). }
@@ -269,6 +275,12 @@ type
       lives in the app's .so and ParamStr(0) is empty, so a name probe cannot
       work there. 0 before Init / on unsupported targets. }
     class function MainModuleAddress: UIntPtr; static;
+
+    { Report an exception the host has CAUGHT and keeps running after (the
+      "report and continue" of a keep-alive except block). Call it inside the
+      except block: the stack captured at the raise point is still attached to
+      AException there. No-op on Windows and before the reporter is wired. }
+    class procedure ReportHandled(const AException: Exception); static;
   end;
 
 implementation
@@ -389,6 +401,21 @@ end;
 procedure TCrashCapture.GlobalHandleException(Sender: TObject; E: Exception);
 begin
   ReportException(E, ExceptAddr, csOnException);
+end;
+
+class procedure TCrashCapture.ReportHandled(const AException: Exception);
+var
+  Addr: Pointer;
+begin
+  if (not Assigned(FInstance)) or (AException = nil) then
+    Exit;
+  // ExceptAddr belongs to the exception being handled right now; for any other
+  // object the address is unknown.
+  if ExceptObject = AException then
+    Addr := ExceptAddr
+  else
+    Addr := nil;
+  FInstance.ReportException(AException, Addr, csHandled);
 end;
 
 {$IF Defined(MACOS) or Defined(ANDROID) or Defined(LINUX)}
@@ -547,11 +574,14 @@ begin
       end;
     end;
 
+    // Only managed fields of a local record start defined.
+    Report := Default(TCrashReport);
     Report.ExceptionMessage := ExceptionMessage;
     Report.ExceptionClassName := ExcClassName;
     Report.ExceptionLocation := ExceptionLocation;
     Report.CallStack := CallStack;
     Report.Source := ASource;
+    Report.ExceptionObject := AExceptionObject;
     if Assigned(FOnReport) then
     try
       FOnReport(Report);

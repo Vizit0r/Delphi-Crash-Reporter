@@ -39,6 +39,7 @@ uses
   Crash.Tests.Capabilities,
   Crash.Tests.RawFallback,
   Crash.Tests.HandledFault,
+  Crash.Tests.HandledReport,
   Crash.Tests.ExtendedThreads,
   Crash.Tests.Freeze,
   Crash.Tests.ChildProcess;

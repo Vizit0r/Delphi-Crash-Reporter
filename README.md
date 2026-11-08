@@ -125,6 +125,7 @@ vary is a field — there are no compile-time constants baked into the library.
 | `FreezeTimeoutMS` | `30000` | No-heartbeat threshold before a freeze is reported |
 | `RestartOnFreeze` | `False` | After the freeze report, replace the frozen process with a fresh instance; the next boot surfaces the notice and re-uploads the report (see *Freeze detection*) |
 | `OnFreezeReport` | `nil` | Per-episode host notification (fires on the watchdog thread) |
+| `OnCollectAttachments` | `nil` | Extra files for non-fatal reports; with at least one file the report is written as a `.elp` package (see *Handled exceptions and attachments*) |
 | `ExtendedThreads` | `False` | Also capture the stacks of the other registered application threads into every report (see *Extended thread stacks*). Off in the standalone library; a host opts in |
 | `ExtendedThreadsMax` | `0` | Maximum extended-thread blocks per report. Values `<= 0` use the default `32`; values above the hard limit are clamped to `128` |
 
@@ -180,6 +181,48 @@ The FMX Send action creates the marker only after the user clicks it, performs
 HTTP in a worker and displays retry state without blocking the UI. Closing the
 dialog without Send leaves no delivery marker. Restart creates the marker before
 process replacement and never waits for the network.
+
+### Handled exceptions and attachments
+
+`TCrashReporter.ReportHandled(E)` reports an exception the host **caught** and
+keeps running after - the "report and continue" of a keep-alive `except` block.
+Call it inside the `except` block: the stack captured at the raise point is still
+attached to the exception there. The report goes through the normal non-fatal
+path (`OnFilterReport`, dialog or background upload) with `Source = csHandled`.
+
+```pascal
+try
+  ProcessIncomingPacket(P);
+except
+  on E: Exception do
+    TCrashReporter.ReportHandled(E); // the loop goes on
+end;
+```
+
+`OnCollectAttachments` adds files to a non-fatal report (`csHandled`,
+`csOnException`, `csAcquired`; never fatal, freeze or recovered reports). It runs
+synchronously on the reporting thread, and `AReport.ExceptionObject` is the live
+exception during the call, so the host can decide by its class or fields. Write
+the files into `ATempDir` (the library deletes it after the report is done) or
+name existing files by full path:
+
+```pascal
+Cfg.OnCollectAttachments :=
+  procedure(const AReport: TCrashReport; const ATempDir: String;
+    var AFiles: TArray<String>)
+  begin
+    if AReport.ExceptionObject is EMyProtocolError then
+      AFiles := AFiles + [CopyLogTail(ATempDir)];
+  end;
+```
+
+With no files (the usual case) the report stays a plain UTF-16LE `.el`. With at
+least one, it is a `.elp` zip package instead: `BugReport.el` (the same UTF-16LE
+text) plus the files under their base names. The package is published, marked
+`.pending`, uploaded and recovered at startup exactly like a `.el`; the upload
+body is the package bytes. A provider that raises, or a package that cannot be
+written, costs only the attachments - the report is then written as a `.el`.
+Packaging uses `System.Zip`, so on POSIX the process links the system zlib.
 
 ### Vetoing a report (`OnFilterReport`)
 
@@ -812,13 +855,13 @@ msbuild Tests/CrashTests.dproj /t:Build /p:Config=Release /p:Platform=Linux64
 |---|---|
 | `GolCodec` | the `.gol` encoder against an independent reference decoder |
 | `ELFormat` | the `.el` layout against golden text |
-| `CrashPending` | `.pending` delivery markers and startup selection |
+| `CrashPending` | `.pending` delivery markers and startup selection; `.elp` packages: layout, marker mapping, upload body |
 | `CrashCapabilities` | parameter privacy, breadcrumbs, file naming, lifecycle |
 | `CrashRawFallback` | the raw hardware-fault fallback: format, corruption, recovery |
 | `CrashHandledFault` | a handled hardware fault keeps capture armed and leaves no stale snapshot |
 | `CrashExtendedThreads` | registered-thread capture: limits, budgets, integration |
 | `CrashFreeze` | the freeze detector: detection, suppression, re-arm, whole-process stall grace, `RestartOnFreeze` contract, BugID normalization |
-| `CrashChildProcess` | the runner starts itself as a child that dies of a real fault (unhandled raise, null write, a raise after a swallowed fault on the same or another thread, stack overflow) and checks the `.el` it leaves; the stack overflow (Linux only) is recovered from the raw block by the next start |
+| `CrashChildProcess` | the runner starts itself as a child that dies of a real fault (unhandled raise, null write, a raise after a swallowed fault on the same or another thread, stack overflow) and checks the `.el` it leaves; the stack overflow (Linux only) is recovered from the raw block by the next start; a `ReportHandled` exception leaves a `.el` and the child keeps running, with an attachment provider a `.elp` package |
 
 On Windows the reporter is a no-op, so most tests skip there. The suite runs on
 the main thread with the reporter initialized the way a host typically would

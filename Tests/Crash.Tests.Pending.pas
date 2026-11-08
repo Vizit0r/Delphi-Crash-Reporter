@@ -1,6 +1,7 @@
 ﻿unit Crash.Tests.Pending;
 
-// Pure state tests for Crash.Pending marker and selection contracts.
+// Pure state tests for Crash.Pending marker, selection and .elp package
+// contracts.
 //
 // Copyright (c) 2026 Vizit0r. BSD 2-Clause license (see LICENSE.txt).
 
@@ -29,6 +30,7 @@ uses
   System.Generics.Collections,
   System.IOUtils,
   System.SyncObjs,
+  System.Zip,
   Crash.Pending,
   Crash.Reporter,
   Crash.Tests.Progress;
@@ -343,6 +345,165 @@ begin
   end;
 end;
 
+function ZipEntryText(const AZipPath, AEntry: String;
+  const AEncoding: TEncoding): String;
+var
+  Zip: TZipFile;
+  Bytes: TBytes;
+  Enc: TEncoding;
+  Skip: Integer;
+begin
+  Result := '';
+  Zip := TZipFile.Create;
+  try
+    Zip.Open(AZipPath, zmRead);
+    if Zip.IndexOf(AEntry) < 0 then
+      Exit;
+    Zip.Read(AEntry, Bytes);
+  finally
+    Zip.Free;
+  end;
+  Enc := nil;
+  Skip := TEncoding.GetBufferEncoding(Bytes, Enc, AEncoding);
+  Result := Enc.GetString(Bytes, Skip, Length(Bytes) - Skip);
+end;
+
+function ZipEntryNames(const AZipPath: String): TArray<String>;
+var
+  Zip: TZipFile;
+begin
+  Zip := TZipFile.Create;
+  try
+    Zip.Open(AZipPath, zmRead);
+    Result := Zip.FileNames;
+  finally
+    Zip.Free;
+  end;
+end;
+
+function Step_P11_PackageWriteRead: Boolean;
+var
+  Dir, A1, A2, Sub, FirstPath, SecondPath: String;
+  Names: TArray<String>;
+  Bytes: TBytes;
+  Zip: TZipFile;
+begin
+  Dir := NewFixtureDir;
+  try
+    A1 := TPath.Combine(Dir, 'log.txt');
+    Sub := TPath.Combine(Dir, 'sub');
+    ForceDirectories(Sub);
+    A2 := TPath.Combine(Sub, 'log.txt');
+    TFile.WriteAllText(A1, 'first attachment', TEncoding.UTF8);
+    TFile.WriteAllText(A2, 'second attachment', TEncoding.UTF8);
+
+    FirstPath := TPath.Combine(Dir, 'Crash_WIN_PACKAGE.elp');
+    Result := CrashWriteReportPackageToUniqueFile('package report',
+      [A1, A2, TPath.Combine(Dir, 'missing.txt')], FirstPath) and
+      CrashIsPackagedReport(FirstPath) and TFile.Exists(FirstPath);
+    if not Result then
+      Exit;
+    Names := ZipEntryNames(FirstPath);
+    // BugReport.el first, same base names kept apart, a missing file skipped
+    Result := (Length(Names) = 3) and (Names[0] = 'BugReport.el') and
+      (ZipEntryText(FirstPath, 'log.txt', TEncoding.UTF8) = 'first attachment') and
+      (ZipEntryText(FirstPath, 'log_2.txt', TEncoding.UTF8) = 'second attachment') and
+      (CrashReadReportText(FirstPath) = 'package report');
+    // the report entry is UTF-16LE with BOM, like a plain .el
+    Zip := TZipFile.Create;
+    try
+      Zip.Open(FirstPath, zmRead);
+      Zip.Read('BugReport.el', Bytes);
+    finally
+      Zip.Free;
+    end;
+    Result := Result and (Length(Bytes) >= 2) and (Bytes[0] = $FF) and
+      (Bytes[1] = $FE);
+
+    SecondPath := TPath.Combine(Dir, 'Crash_WIN_PACKAGE.elp');
+    Result := Result and
+      CrashWriteReportPackageToUniqueFile('second package', [A1], SecondPath) and
+      (SecondPath <> FirstPath) and
+      (CrashReadReportText(FirstPath) = 'package report') and
+      (CrashReadReportText(SecondPath) = 'second package') and
+      (Length(TDirectory.GetFiles(Dir, '*.tmp.*')) = 0);
+  finally
+    if TDirectory.Exists(Dir) then
+      TDirectory.Delete(Dir, True);
+  end;
+end;
+
+function Step_P12_PackageMarkerAndBody: Boolean;
+var
+  Dir, ReportPath, PlainPath, MarkerPath, OrphanMarker: String;
+  Body, Expected: TBytes;
+begin
+  Dir := NewFixtureDir;
+  try
+    ReportPath := TPath.Combine(Dir, 'Crash_WIN_PKGMARK.elp');
+    Result := CrashWriteReportPackageToUniqueFile('marked package', [],
+      ReportPath) and CrashWritePendingMarker(ReportPath);
+    MarkerPath := CrashPendingMarkerPath(ReportPath);
+    Result := Result and
+      (MarkerPath = TPath.Combine(Dir, 'Crash_WIN_PKGMARK.pending')) and
+      (CrashPendingReportPath(MarkerPath) = ReportPath) and
+      CrashHasPendingMarker(ReportPath);
+    // the marker of a package is not an orphan
+    OrphanMarker := TPath.Combine(Dir, 'Crash_WIN_GONE.pending');
+    TFile.WriteAllText(OrphanMarker, CRASH_PENDING_SIGNATURE, TEncoding.UTF8);
+    CrashCleanupOrphanPendingMarkers([MarkerPath, OrphanMarker]);
+    Result := Result and TFile.Exists(MarkerPath) and
+      (not TFile.Exists(OrphanMarker));
+    // upload body: package bytes as on disk, plain text as UTF-16LE+BOM
+    Body := CrashReportUploadBody('ignored', ReportPath);
+    Expected := TFile.ReadAllBytes(ReportPath);
+    Result := Result and (Length(Body) = Length(Expected)) and
+      CompareMem(@Body[0], @Expected[0], Length(Body));
+    PlainPath := TPath.Combine(Dir, 'Crash_WIN_PLAIN.el');
+    Body := CrashReportUploadBody('plain', PlainPath);
+    Expected := TEncoding.Unicode.GetPreamble + TEncoding.Unicode.GetBytes('plain');
+    Result := Result and (Length(Body) = Length(Expected)) and
+      CompareMem(@Body[0], @Expected[0], Length(Body));
+  finally
+    if TDirectory.Exists(Dir) then
+      TDirectory.Delete(Dir, True);
+  end;
+end;
+
+function Step_P13_PackageAsyncUpload: Boolean;
+var
+  Dir, ReportPath, MarkerPath, SentName: String;
+  Expected, Sent: TBytes;
+  TransportDone: TEvent;
+begin
+  Dir := NewFixtureDir;
+  TransportDone := TEvent.Create(nil, True, False, '');
+  try
+    ReportPath := TPath.Combine(Dir, 'Crash_WIN_PKGSEND.elp');
+    Result := CrashWriteReportPackageToUniqueFile('sent package', [],
+      ReportPath) and CrashWritePendingMarker(ReportPath);
+    MarkerPath := CrashPendingMarkerPath(ReportPath);
+    Expected := TFile.ReadAllBytes(ReportPath);
+    Result := Result and CrashAutoTestQueueUploadBody('sent package', ReportPath,
+      function(const AFileName: String; const ABody: TArray<Byte>): Boolean
+      begin
+        SentName := AFileName;
+        Sent := ABody;
+        TransportDone.SetEvent;
+        Result := True;
+      end);
+    Result := Result and (TransportDone.WaitFor(2000) = wrSignaled) and
+      WaitUntilMissing(ReportPath, MarkerPath, 2000) and
+      (SentName = 'Crash_WIN_PKGSEND.elp') and
+      (Length(Sent) = Length(Expected)) and
+      CompareMem(@Sent[0], @Expected[0], Length(Sent));
+  finally
+    TransportDone.Free;
+    if TDirectory.Exists(Dir) then
+      TDirectory.Delete(Dir, True);
+  end;
+end;
+
 class function TCrashPending_AllInOne.AutoTest(
   out OutLines: TArray<string>): Boolean;
 var
@@ -373,6 +534,12 @@ begin
         'P9: startup limit leaves unattempted reports and markers untouched');
       Progress.Account(Step_P10_AntiCascadeCreatesOneFile,
         'P10: anti-cascade claim permits exactly one report file');
+      Progress.Account(Step_P11_PackageWriteRead,
+        'P11: .elp package holds BugReport.el (UTF-16LE) and the attachments');
+      Progress.Account(Step_P12_PackageMarkerAndBody,
+        'P12: .elp marker mapping, orphan cleanup and upload body');
+      Progress.Account(Step_P13_PackageAsyncUpload,
+        'P13: async upload sends the .elp bytes and removes it with its marker');
       Progress.WriteSummary(TEST_NAME);
       Result := Progress.AllPassed;
     finally

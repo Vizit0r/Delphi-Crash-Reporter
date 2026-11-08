@@ -16,6 +16,13 @@
 //    K5  stack overflow (Linux): the child dies without an in-process report;
 //        the next start in the same directory recovers the committed raw
 //        block as an ERawHardwareFault report
+//    K6  a CAUGHT exception reported via TCrashReporter.ReportHandled: the
+//        child keeps running and exits 0, one plain .el names the class,
+//        message and routine
+//    K7  the same with an OnCollectAttachments provider: one .elp package
+//        instead of the .el - BugReport.el plus the provider's file, written
+//        while AReport.ExceptionObject was the live exception; the temp
+//        attachment dir is gone
 //
 //  Needs the standalone runner (CrashTests): it sets CrashTestChildExe and
 //  calls CrashTestRunChildIfRequested before anything else. Inside a host
@@ -58,6 +65,7 @@ uses
   System.Classes,
   System.IOUtils,
   System.Generics.Collections,
+  System.Zip,
   {$IF (Defined(LINUX) and Defined(CPUX64)) or (Defined(MACOS) and not Defined(IOS))}
   Posix.Base,
   Posix.SysTypes,
@@ -66,6 +74,7 @@ uses
   Posix.SysWait,
   Posix.Signal,
   {$ENDIF}
+  Crash.CallStack,
   Crash.Reporter,
   Crash.Tests.Registry,
   Crash.Tests.Progress;
@@ -75,6 +84,8 @@ const
   ARG_CHILD = '--crash-child=';
   ARG_DIR   = '--report-dir=';
   CHILD_RAISE_MESSAGE = 'crash-child raise';
+  CHILD_ATTACH_FILE = 'child_attach.txt';
+  CHILD_ATTACH_PREFIX = 'attachment for ';
 
 type
   ECrashChildTest = class(Exception);
@@ -125,11 +136,38 @@ begin
   Result := CrashChildBurnStack(N + 1) + Pad[0] + Pad[High(Pad)];
 end;
 
+procedure CrashChildHandled;
+begin
+  try
+    raise ECrashChildTest.Create(CHILD_RAISE_MESSAGE + ' (handled)');
+  except
+    on E: Exception do
+      TCrashReporter.ReportHandled(E);
+  end;
+end;
+
+procedure CrashChildCollectAttachments(const AReport: TCrashReport;
+  const ATempDir: String; var AFiles: TArray<String>);
+var
+  FilePath, What: String;
+begin
+  if AReport.ExceptionObject is Exception then
+    What := AReport.ExceptionObject.ClassName + ': ' +
+      Exception(AReport.ExceptionObject).Message
+  else
+    What := 'no exception object';
+  FilePath := TPath.Combine(ATempDir, CHILD_ATTACH_FILE);
+  TFile.WriteAllText(FilePath, CHILD_ATTACH_PREFIX + What, TEncoding.UTF8);
+  AFiles := AFiles + [FilePath, TPath.Combine(ATempDir, 'never_written.txt')];
+end;
+
 procedure CrashChildTrigger(const AKind: String);
 var
   W: TThread;
 begin
-  if AKind = 'raise' then
+  if (AKind = 'handled') or (AKind = 'handled-attach') then
+    CrashChildHandled
+  else if AKind = 'raise' then
     raise ECrashChildTest.Create(CHILD_RAISE_MESSAGE)
   else if AKind = 'segv' then
     CrashChildNullWrite
@@ -183,6 +221,8 @@ begin
   Cfg.ReportDir := Dir;
   Cfg.SaveToFile := True;
   Cfg.UploadEnabled := False;
+  if Kind = 'handled-attach' then
+    Cfg.OnCollectAttachments := CrashChildCollectAttachments;
   TCrashReporter.Init(Cfg);
   ExitCode := 0;
   CrashChildTrigger(Kind);
@@ -416,6 +456,103 @@ begin
 end;
 {$ENDIF}
 
+function FilesWithExt(const ADir, AExt: String): TArray<String>;
+var
+  F: String;
+begin
+  Result := nil;
+  for F in TDirectory.GetFiles(ADir) do
+    if SameText(ExtractFileExt(F), AExt) then
+      Result := Result + [F];
+end;
+
+procedure Step_K6_Handled(const AProgress: TCrashTestProgress; const ARoot: String);
+var
+  Dir, Text: String;
+  Run: TChildRun;
+  Plain, Packaged: TArray<String>;
+  Ok: Boolean;
+begin
+  Dir := NewScenarioDir(ARoot, 'handled');
+  Run := RunChild('handled', Dir);
+  Plain := FilesWithExt(Dir, '.el');
+  Packaged := FilesWithExt(Dir, '.elp');
+  Text := '';
+  if Length(Plain) = 1 then
+    Text := TFile.ReadAllText(Plain[0], TEncoding.Unicode);
+  Ok := Run.Reaped and WIFEXITED(Run.Status) and (WEXITSTATUS(Run.Status) = 0) and
+    (Length(Plain) = 1) and (Length(Packaged) = 0) and
+    Has(Text, ECrashChildTest.ClassName) and
+    Has(Text, CHILD_RAISE_MESSAGE + ' (handled)') and
+    StackReaches(Text, 'CrashChildHandled');
+  if not Ok then
+  begin
+    AProgress.InfoFmt('K6 diag: child %s; %d .el, %d .elp; class=%s handler=%s',
+      [Run.Describe, Length(Plain), Length(Packaged),
+       BoolToStr(Has(Text, ECrashChildTest.ClassName), True),
+       BoolToStr(StackReaches(Text, 'CrashChildHandled'), True)]);
+    DumpChildLog(AProgress, Dir);
+  end;
+  AProgress.Account(Ok,
+    'K6: ReportHandled writes a plain .el and the process keeps running');
+end;
+
+procedure Step_K7_HandledWithAttachments(const AProgress: TCrashTestProgress;
+  const ARoot: String);
+var
+  Dir, Text, Attach: String;
+  Run: TChildRun;
+  Plain, Packaged: TArray<String>;
+  Zip: TZipFile;
+  Bytes: TBytes;
+  Names: TArray<String>;
+  Ok: Boolean;
+begin
+  Dir := NewScenarioDir(ARoot, 'handled-attach');
+  Run := RunChild('handled-attach', Dir);
+  Plain := FilesWithExt(Dir, '.el');
+  Packaged := FilesWithExt(Dir, '.elp');
+  Text := '';
+  Attach := '';
+  Names := nil;
+  if Length(Packaged) = 1 then
+  begin
+    Zip := TZipFile.Create;
+    try
+      Zip.Open(Packaged[0], zmRead);
+      Names := Zip.FileNames;
+      if Zip.IndexOf('BugReport.el') >= 0 then
+      begin
+        Zip.Read('BugReport.el', Bytes);
+        Text := TEncoding.Unicode.GetString(Bytes, 2, Length(Bytes) - 2);
+      end;
+      if Zip.IndexOf(CHILD_ATTACH_FILE) >= 0 then
+      begin
+        Zip.Read(CHILD_ATTACH_FILE, Bytes);
+        Attach := TEncoding.UTF8.GetString(Bytes);
+      end;
+    finally
+      Zip.Free;
+    end;
+  end;
+  Ok := Run.Reaped and WIFEXITED(Run.Status) and (WEXITSTATUS(Run.Status) = 0) and
+    (Length(Plain) = 0) and (Length(Packaged) = 1) and (Length(Names) = 2) and
+    Has(Text, ECrashChildTest.ClassName) and
+    Has(Attach, CHILD_ATTACH_PREFIX + ECrashChildTest.ClassName + ': ' +
+      CHILD_RAISE_MESSAGE + ' (handled)') and
+    (Length(TDirectory.GetDirectories(Dir, '*.attach')) = 0);
+  if not Ok then
+  begin
+    AProgress.InfoFmt('K7 diag: child %s; %d .el, %d .elp, %d entries; class=%s; attachment="%s"; attach dirs=%d',
+      [Run.Describe, Length(Plain), Length(Packaged), Length(Names),
+       BoolToStr(Has(Text, ECrashChildTest.ClassName), True), Attach,
+       Length(TDirectory.GetDirectories(Dir, '*.attach'))]);
+    DumpChildLog(AProgress, Dir);
+  end;
+  AProgress.Account(Ok,
+    'K7: with attachments the handled report becomes one .elp package');
+end;
+
 {$ENDREGION}
 
 class function TCrashChildProcess_AllInOne.AutoTest(out OutLines: TArray<string>): Boolean;
@@ -443,6 +580,8 @@ begin
         CheckRaiseLike(Progress, Root, 'foreign', 'K4',
           'a raise after a fault swallowed on a worker carries no fault sections');
         Step_K5_StackOverflow(Progress, Root);
+        Step_K6_Handled(Progress, Root);
+        Step_K7_HandledWithAttachments(Progress, Root);
       finally
         try
           TDirectory.Delete(Root, True);

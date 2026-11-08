@@ -1,6 +1,7 @@
 ﻿unit Crash.Pending;
 
-{ Durable delivery marker helpers for Crash .el reports.
+{ Durable delivery marker helpers for Crash .el reports and .elp packages
+  (a zip of BugReport.el plus host-supplied attachments).
 
   Copyright (c) 2026 Vizit0r. BSD 2-Clause license (see LICENSE.txt). }
 
@@ -20,6 +21,17 @@ function CrashPendingReportPath(const AMarkerPath: String): String;
 function CrashWritePendingMarker(const AReportPath: String): Boolean;
 function CrashWriteReportTextToUniqueFile(const AText: String;
   var AReportPath: String): Boolean;
+{ True for a ".elp" package path. }
+function CrashIsPackagedReport(const AReportPath: String): Boolean;
+{ Writes a zip package: BugReport.el (UTF-16LE with BOM, like a plain .el) plus
+  AFiles under their base names. Same unique-name and temp+move publication as
+  CrashWriteReportTextToUniqueFile; AReportPath is emptied on failure. }
+function CrashWriteReportPackageToUniqueFile(const AText: String;
+  const AFiles: TArray<String>; var AReportPath: String): Boolean;
+{ Report text of a plain .el or of BugReport.el inside a .elp. }
+function CrashReadReportText(const AReportPath: String): String;
+{ Upload body: the package bytes for a .elp, else UTF-16LE+BOM of AText. }
+function CrashReportUploadBody(const AText, AReportPath: String): TBytes;
 function CrashHasPendingMarker(const AReportPath: String): Boolean;
 procedure CrashDeletePendingMarker(const AReportPath: String);
 procedure CrashDeleteReportAndPendingMarker(const AReportPath: String);
@@ -37,7 +49,12 @@ implementation
 uses
   System.Classes,
   System.Generics.Collections,
-  System.IOUtils;
+  System.IOUtils,
+  System.Zip;
+
+const
+  CRASH_PACKAGE_REPORT_ENTRY = 'BugReport.el';
+  CRASH_PACKAGE_EXT = '.elp';
 
 function CrashPendingMarkerPath(const AReportPath: String): String;
 begin
@@ -47,10 +64,23 @@ begin
 end;
 
 function CrashPendingReportPath(const AMarkerPath: String): String;
+var
+  Packaged: String;
 begin
   if AMarkerPath = '' then
     Exit('');
   Result := ChangeFileExt(AMarkerPath, '.el');
+  if not TFile.Exists(Result) then
+  begin
+    Packaged := ChangeFileExt(AMarkerPath, CRASH_PACKAGE_EXT);
+    if TFile.Exists(Packaged) then
+      Result := Packaged;
+  end;
+end;
+
+function CrashIsPackagedReport(const AReportPath: String): Boolean;
+begin
+  Result := SameText(ExtractFileExt(AReportPath), CRASH_PACKAGE_EXT);
 end;
 
 function CrashWritePendingMarker(const AReportPath: String): Boolean;
@@ -113,6 +143,95 @@ begin
   end;
   if TempPath <> '' then
     try TFile.Delete(TempPath); except end;
+end;
+
+function CrashReportTextBytes(const AText: String): TBytes;
+begin
+  Result := TEncoding.Unicode.GetPreamble + TEncoding.Unicode.GetBytes(AText);
+end;
+
+function CrashWriteReportPackageToUniqueFile(const AText: String;
+  const AFiles: TArray<String>; var AReportPath: String): Boolean;
+var
+  Dir, TempPath, FilePath, EntryName: String;
+  Zip: TZipFile;
+  Names: TList<String>;
+  N: Integer;
+begin
+  Result := False;
+  TempPath := '';
+  if AReportPath = '' then
+    Exit;
+  CrashSelectUniqueReportPath(AReportPath);
+  try
+    Dir := ExtractFilePath(AReportPath);
+    if Dir <> '' then
+      ForceDirectories(Dir);
+    TempPath := AReportPath + '.tmp.' + TPath.GetRandomFileName;
+    Names := TList<String>.Create;
+    Zip := TZipFile.Create;
+    try
+      Zip.Open(TempPath, zmWrite);
+      Zip.Add(CrashReportTextBytes(AText), CRASH_PACKAGE_REPORT_ENTRY);
+      Names.Add(LowerCase(CRASH_PACKAGE_REPORT_ENTRY));
+      for FilePath in AFiles do
+      begin
+        if not TFile.Exists(FilePath) then
+          Continue;
+        EntryName := ExtractFileName(FilePath);
+        N := 2;
+        while Names.Contains(LowerCase(EntryName)) do
+        begin
+          EntryName := ChangeFileExt(ExtractFileName(FilePath), '') + '_' +
+            IntToStr(N) + ExtractFileExt(FilePath);
+          Inc(N);
+        end;
+        Names.Add(LowerCase(EntryName));
+        Zip.Add(FilePath, EntryName);
+      end;
+      Zip.Close;
+    finally
+      Zip.Free;
+      Names.Free;
+    end;
+    CrashSelectUniqueReportPath(AReportPath);
+    TFile.Move(TempPath, AReportPath);
+    TempPath := '';
+    Result := True;
+  except
+    AReportPath := '';
+  end;
+  if TempPath <> '' then
+    try TFile.Delete(TempPath); except end;
+end;
+
+function CrashReadReportText(const AReportPath: String): String;
+var
+  Zip: TZipFile;
+  Bytes: TBytes;
+  Encoding: TEncoding;
+  Skip: Integer;
+begin
+  if not CrashIsPackagedReport(AReportPath) then
+    Exit(TFile.ReadAllText(AReportPath, TEncoding.Unicode));
+  Zip := TZipFile.Create;
+  try
+    Zip.Open(AReportPath, zmRead);
+    Zip.Read(CRASH_PACKAGE_REPORT_ENTRY, Bytes);
+  finally
+    Zip.Free;
+  end;
+  Encoding := nil;
+  Skip := TEncoding.GetBufferEncoding(Bytes, Encoding, TEncoding.Unicode);
+  Result := Encoding.GetString(Bytes, Skip, Length(Bytes) - Skip);
+end;
+
+function CrashReportUploadBody(const AText, AReportPath: String): TBytes;
+begin
+  if CrashIsPackagedReport(AReportPath) then
+    Result := TFile.ReadAllBytes(AReportPath)
+  else
+    Result := CrashReportTextBytes(AText);
 end;
 
 function CrashHasPendingMarker(const AReportPath: String): Boolean;
