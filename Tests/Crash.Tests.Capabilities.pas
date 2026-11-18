@@ -31,6 +31,9 @@ uses
   Crash.CallStack,
   Crash.ELFormat,
   Crash.Reporter,
+  Crash.ReportNaming,
+  Crash.ThreadRegistry,
+  Crash.Upload,
   Crash.Tests.Progress;
 
 const
@@ -54,9 +57,9 @@ var
   Arguments: TArray<String>;
 begin
   Arguments := TArray<String>.Create('/safe', '/secret=value', 'positional');
-  Result := CrashAutoTestFormatParameters(Arguments, nil, False) = '';
+  Result := CrashFormatParameters(Arguments, nil, False) = '';
   Result := Result and
-    (CrashAutoTestFormatParameters(Arguments, nil, True) =
+    (CrashFormatParameters(Arguments, nil, True) =
       '/safe /secret=value positional');
 end;
 
@@ -67,7 +70,7 @@ begin
   Arguments := TArray<String>.Create('/safe', '/secret=value',
     '--mode=quiet', 'positional', '-SAFE=second');
   AllowList := TArray<String>.Create('safe', '/mode');
-  Result := CrashAutoTestFormatParameters(Arguments, AllowList, False) =
+  Result := CrashFormatParameters(Arguments, AllowList, False) =
     '/safe --mode=quiet -SAFE=second';
 end;
 
@@ -75,14 +78,14 @@ function Step_P3_CallbackPrecedenceAndFailPrivate: Boolean;
 var
   Text: String;
 begin
-  Text := CrashAutoTestFormatParameters(
+  Text := CrashFormatParameters(
     TArray<String>.Create('/secret=value'),
     TArray<String>.Create('secret'), True, FixtureSanitizer);
   Result := (Length(Text) = 4096) and
     (Pos(#13, Text) = 0) and (Pos(#10, Text) = 0) and
     (Copy(Text, 1, 11) = 'approved  x');
   Result := Result and
-    (CrashAutoTestFormatParameters(TArray<String>.Create('/safe'), nil,
+    (CrashFormatParameters(TArray<String>.Create('/safe'), nil,
       True, FailingSanitizer) = '');
 end;
 
@@ -136,9 +139,9 @@ function Step_N1_TemplateAndStablePrefix: Boolean;
 var
   FileName, Prefix: String;
 begin
-  FileName := CrashAutoTestRenderFileName(
+  FileName := CrashRenderFileNameTemplate(
     '{App}_{Platform}_{Version}_{BugID}', 'My/App', '1:2', 'DEADBEEF');
-  Prefix := CrashAutoTestTemplateScanPrefix(
+  Prefix := CrashTemplateScanPrefix(
     '{App}_{Platform}_{Version}_{BugID}', 'My/App');
   Result := (Prefix <> '') and (Copy(Prefix, 1, 7) = 'My_App_') and
     (Copy(FileName, 1, Length(Prefix)) = Prefix) and
@@ -148,10 +151,10 @@ end;
 
 function Step_N2_InvalidTemplatesFailClosed: Boolean;
 begin
-  Result := CrashAutoTestRenderFileName('{App}_{Unknown}_{BugID}',
+  Result := CrashRenderFileNameTemplate('{App}_{Unknown}_{BugID}',
     'App', '1', 'AABBCCDD') = '';
   Result := Result and
-    (CrashAutoTestRenderFileName('{App}_{Version}', 'App', '1',
+    (CrashRenderFileNameTemplate('{App}_{Version}', 'App', '1',
       'AABBCCDD') = '');
 end;
 
@@ -202,12 +205,12 @@ var
   Sanitized: String;
 begin
   Config := DefaultCrashConfig;
-  Sanitized := CrashAutoTestSanitizeThreadName(
+  Sanitized := CrashSanitizeThreadName(
     'Worker;bad|name=' + #9 + #13#10);
   Result := (not Config.ExtendedThreads) and
     (Sanitized = 'Worker.bad name    ') and
-    (CrashAutoTestSanitizeThreadName(#9#13#10) = 'Worker') and
-    (Length(CrashAutoTestSanitizeThreadName(StringOfChar('x', 200))) = 128);
+    (CrashSanitizeThreadName(#9#13#10) = 'Worker') and
+    (Length(CrashSanitizeThreadName(StringOfChar('x', 200))) = 128);
 end;
 
 class function TCrashCapabilities_AllInOne.AutoTest(

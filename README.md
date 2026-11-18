@@ -268,7 +268,12 @@ are declared in `Crash.CallStack` (which the quick-start already uses).
 
 Core (framework-agnostic):
 
-- `Crash.Reporter` — public façade: `TCrashConfig`, `DefaultCrashConfig`, `TCrashReporter`.
+- `Crash.Reporter` — public façade: `TCrashConfig`, `DefaultCrashConfig`, `TCrashReporter`; builds and routes reports.
+- `Crash.ThreadRegistry` — registered-thread coverage and the extended-thread collector (group-aware selection, time budgets, capture leases).
+- `Crash.Upload` — multipart delivery, the background upload worker and the startup batch.
+- `Crash.Restart` — freeze-restart notice file, environment loop guard, verified POSIX spawn and process replacement.
+- `Crash.RawRecovery` — turns committed raw slots of dead processes into `.el` reports at startup.
+- `Crash.ReportNaming` — executable/platform tags, the filtered Application/1.4 parameter line, file-name templates, default report directory.
 - `Crash.CallStack` — RTL exception hooks + stack capture; `TCrashCapture`, `TCrashReport`, `TCrashReportSection`.
 - `Crash.Signals` — POSIX `sigaction` CPU-register snapshot for hardware faults.
 - `Crash.ThreadCapture` — process-wide POSIX service that samples a registered thread's stack in place: capture-signal ownership, registration-time stack bounds, a bounded FP/raw walker, preallocated per-thread slots, dual `pthread_t` + kernel-id identity, and late-signal handling. Used by `Crash.Freeze` and by the extended-thread collector.

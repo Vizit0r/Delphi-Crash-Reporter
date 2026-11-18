@@ -35,6 +35,7 @@ uses
   Crash.RawFallback,
   Crash.Signals,
   Crash.Reporter,
+  Crash.RawRecovery,
   Crash.Tests.Progress;
 
 const
@@ -201,8 +202,8 @@ begin
   Text := 'Crash Signal Info:' + #13#10 +
     '  Raw Capture Key: ' + PRIMARY_KEY + #13#10;
   TFile.WriteAllText(Path, Text, TEncoding.Unicode);
-  Result := CrashAutoTestELContainsRawCaptureKey(Path, PRIMARY_KEY) and
-    (not CrashAutoTestELContainsRawCaptureKey(Path, CONCURRENT_KEY));
+  Result := CrashELContainsRawCaptureKey(Path, PRIMARY_KEY) and
+    (not CrashELContainsRawCaptureKey(Path, CONCURRENT_KEY));
 end;
 
 function Step_R8_RecoveredFormatting(const ARaw: TCrashRawRecord): Boolean;

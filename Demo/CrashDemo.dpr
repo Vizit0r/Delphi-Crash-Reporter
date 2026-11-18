@@ -28,6 +28,11 @@ uses
   Crash.Unwind.EhFrame,
   Crash.ThreadCapture.CallSite,
   Crash.ThreadCapture.Trace,
+  Crash.ReportNaming,
+  Crash.Restart,
+  Crash.Upload,
+  Crash.RawRecovery,
+  Crash.ThreadRegistry,
   Crash.Reporter,
   Crash.Freeze,
   Crash.CallStack;

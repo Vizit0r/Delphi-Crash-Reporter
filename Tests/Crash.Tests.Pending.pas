@@ -33,6 +33,7 @@ uses
   System.Zip,
   Crash.Pending,
   Crash.Reporter,
+  Crash.Upload,
   Crash.Tests.Progress;
 
 const

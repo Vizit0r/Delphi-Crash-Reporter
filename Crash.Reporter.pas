@@ -33,9 +33,12 @@
 interface
 
 uses
-  Crash.CallStack, // TCrashConfig, TCrashReport, TCrashReportSection(s)
-  Crash.Freeze,    // TCrashFreezeInfo / TCrashFreezeReportProc (freeze detector)
-  Crash.Signals;   // TCrashAltStackState (per-thread hardware-fault coverage)
+  Crash.CallStack,      // TCrashReport, TCrashReportSection(s)
+  Crash.Freeze,         // TCrashFreezeInfo / TCrashFreezeReportProc (freeze detector)
+  Crash.ReportNaming,   // TCrashSanitizeParametersProc
+  Crash.Restart,        // TCrashRestartNotice
+  Crash.ThreadRegistry, // TCrashMachState, TCrashThreadCoverage
+  Crash.Upload;         // TCrashUploadCompleteProc
 
 type
   { Shows a modal dialog with the full report text for non-fatal exceptions.
@@ -46,14 +49,7 @@ type
 
   { Completion callback for a background upload. It is queued to the main
     thread; the transport worker never calls host/UI code directly. }
-  TCrashUploadCompleteProc = reference to procedure(const ASuccess: Boolean);
-
-  {$IFDEF AUTOTESTS}
-  TCrashAutoTestUploadProc = reference to function(const AUrl, AFieldName,
-    AReportText, AFileName: String): Boolean;
-  TCrashAutoTestUploadBodyProc = reference to function(const AFileName: String;
-    const ABody: TArray<Byte>): Boolean;
-  {$ENDIF}
+  TCrashUploadCompleteProc = Crash.Upload.TCrashUploadCompleteProc;
 
   { Optional: returns extra free-form text appended to the report as a trailing
     section (e.g. "what the app was doing"). Called at report time. }
@@ -62,8 +58,7 @@ type
   { Optional privacy hook. Receives ParamStr(1..N) as separate values and
     returns the exact single-line text allowed into Application/1.4. An
     exception fails private and emits an empty field. }
-  TCrashSanitizeParametersProc = reference to function(
-    const AArguments: TArray<String>): String;
+  TCrashSanitizeParametersProc = Crash.ReportNaming.TCrashSanitizeParametersProc;
 
   { Optional last-step veto. Called with the fully-built report (message, class,
     stack, source) right before it is persisted/surfaced. Return False to drop the
@@ -197,30 +192,22 @@ type
     OnCollectAttachments: TCrashCollectAttachmentsProc;
   end;
 
+
 { A config pre-filled with sensible defaults. Override the fields you need. }
 function DefaultCrashConfig: TCrashConfig;
 
 type
-  TCrashMachState = (
-    cmsNotRequired,
-    cmsUnavailable,
-    cmsInstalled
-  );
+  TCrashMachState = Crash.ThreadRegistry.TCrashMachState;
 
+const
+  cmsNotRequired = Crash.ThreadRegistry.cmsNotRequired;
+  cmsUnavailable = Crash.ThreadRegistry.cmsUnavailable;
+  cmsInstalled = Crash.ThreadRegistry.cmsInstalled;
+
+type
   { Actual calm-path coverage verdict for one registered thread. }
-  TCrashThreadCoverage = record
-    Registered: Boolean;
-    ThreadID: UInt64;
-    Name: String;
-    GroupID: UInt64;
-    ExtendedCaptureAvailable: Boolean;
-    AltStack: TCrashAltStackState;
-    MachHandler: TCrashMachState;
-  end;
+  TCrashThreadCoverage = Crash.ThreadRegistry.TCrashThreadCoverage;
 
-  { Point-in-time reporter status. Threads contains only callers that really
-    registered and have not yet unregistered; direct TThread/vendored workers
-    are deliberately not inferred. }
   TCrashStatus = record
     Active: Boolean;
     SignalHandlersInstalled: Boolean;
@@ -234,113 +221,22 @@ type
   end;
 
   { What a previous run left behind when RestartOnFreeze replaced a frozen
-    instance. Read (and consumed) from the notice file at Init; the host
-    surfaces it via TCrashReporter.TakeRestartNotice - a dialog, a journal
-    line, a log entry. }
-  TCrashRestartNotice = record
-    Found: Boolean;         // False = the previous run did not freeze-restart
-    RestartedAt: TDateTime; // when the frozen instance replaced itself
-    FrozenForMS: Int64;     // no-heartbeat span of that freeze
-    BugID: String;          // EL-style id of the freeze report
-    ReportFile: String;     // .el left on disk ('' = uploaded-and-removed, or not saved)
-    Uploaded: Boolean;      // True = the report reached the endpoint before the restart
-  end;
-
-{ Serialize / parse a freeze-restart notice file - the on-disk contract between
-  the frozen instance and its next boot. Public so hosts and tests can inspect
-  the file without an actual process restart. Read returns False when the file
-  is missing or does not carry the notice signature; neither routine touches
-  reporter state, and neither deletes the file. }
-procedure CrashWriteRestartNoticeFile(const APath: String;
-  const ANotice: TCrashRestartNotice);
-function CrashReadRestartNoticeFile(const APath: String;
-  out ANotice: TCrashRestartNotice): Boolean;
-
-{ Freeze-restart loop-guard mark in the process ENVIRONMENT - the disk-free
-  twin of the notice file. The guard must survive a report dir that cannot be
-  written (read-only, full disk, missing), so it rides process inheritance:
-  CreateProcess/execv hand the environment to the replacement unconditionally.
-  Set returns True only when the mark is verifiably in place (the value is
-  read back after the API call) - a False from BOTH channels means the
-  restart loop guard cannot be armed at all, and the caller must not restart.
-  Consume = read + remove, so later host-spawned children never inherit a
-  stale mark. Exposed for tests. }
-function CrashSetFreezeRestartEnvMark: Boolean;
-function CrashConsumeFreezeRestartEnvMark: Boolean;
+    instance (see Crash.Restart). }
+  TCrashRestartNotice = Crash.Restart.TCrashRestartNotice;
 
 {$IFDEF AUTOTESTS}
-{ Queue the same transport worker with an injected transport. This avoids a
-  live endpoint in state tests while exercising delete/keep and non-blocking
-  behavior. }
-function CrashAutoTestQueueUpload(const AReportText, AReportPath: String;
-  const ATransport: TCrashAutoTestUploadProc;
-  const AOnComplete: TCrashUploadCompleteProc = nil): Boolean;
-{ The same worker; the transport sees the exact upload body (file bytes). }
-function CrashAutoTestQueueUploadBody(const AReportText, AReportPath: String;
-  const ATransport: TCrashAutoTestUploadBodyProc): Boolean;
 { The exact anti-cascade transition used by HandleReport, exposed so state
   tests can prove that a second capture is not allowed to create a file. }
 function CrashAutoTestTryClaimReport(var AAlreadyReported: Boolean): Boolean;
-function CrashAutoTestELContainsRawCaptureKey(const AFilePath,
-  ACaptureKey: String): Boolean;
-function CrashAutoTestFormatParameters(const AArguments,
-  AAllowList: TArray<String>; const AIncludeAll: Boolean;
-  const ASanitizer: TCrashSanitizeParametersProc = nil): String;
-function CrashAutoTestRenderFileName(const ATemplate, AApp, AVersion,
-  ABugID: String): String;
-function CrashAutoTestTemplateScanPrefix(const ATemplate, AApp: String): String;
 function CrashAutoTestAcceptInitialConfig(var AInstalled: Boolean;
   var ACurrent: TCrashConfig; const AIncoming: TCrashConfig): Boolean;
-function CrashAutoTestOperationLifetimeGate: Boolean;
-function CrashAutoTestSanitizeThreadName(const AName: String): String;
 function CrashAutoTestSetExtendedCaptureOverride(
   const AEnabled: Boolean): Boolean;
-function CrashAutoTestEffectiveExtendedThreadsMax(
-  const AConfigured: Integer): Integer;
 function CrashAutoTestSetExtendedThreadsMax(const AValue: Integer;
   out APrevious: Integer): Boolean;
 function CrashAutoTestCaptureExtendedThreads(const APrimaryThreadID: UInt64;
   out AThreads: TArray<TCrashThreadStack>; out AOmitted: Integer;
   out ATotalMS, AMaxThreadMS: UInt64): Boolean;
-{$ENDIF}
-
-{$IF not Defined(MSWINDOWS)}
-{ Spawn AExePath with AArgv (argv[0] included) detached, confirming through a
-  CLOEXEC pipe that execv actually started it (a successful exec closes the
-  write end - EOF; a failure writes a marker byte first, retried across
-  EINTR). Fail-closed at every stage: no confirmation channel (pipe/fcntl
-  failure, e.g. fd exhaustion) = no fork at all; a broken read on the channel
-  = the child is killed and False (exec state unknown - the caller must keep
-  living); an EOF whose child is already a zombie with one of our failure
-  exit codes (126 sweep / 127 execv) = False, so a lost marker byte cannot
-  masquerade as success. The child marks EVERY inherited fd >= 3
-  close-on-exec between fork and execv (close_range, then a raw /proc/self/fd
-  walk, then a bounded fcntl sweep - see the fallbacks below), so the
-  replacement starts with only stdio - none of the frozen instance's sockets,
-  locks or pipes leak into it; a sweep that cannot vouch for the whole table
-  aborts the spawn (126) instead of exec'ing with an unknown fd set. False =
-  nothing survives the call; the CALLER is alive either way, and a failed
-  child is reaped. The building block of Restart, exposed so spawn-failure
-  handling stays testable. }
-function CrashSpawnDetachedVerified(const AExePath: String;
-  const AArgv: TArray<String>): Boolean;
-
-{ Fallback levels of the child fd sweep, exposed for tests (safe to run in a
-  live process: CLOEXEC only affects future execs). ViaProcFS walks the
-  ACTUALLY open descriptors through /proc/self/fd with raw syscalls (no
-  range bound); BySweep marks fd 3..AFdLimit-1 via fcntl. Both retry EINTR,
-  ignore EBADF and return False when any live descriptor could not be
-  marked. }
-{$IF Defined(LINUX)}
-function CrashMarkFDsCloseOnExecViaProcFS: Boolean;
-{$ENDIF}
-function CrashMarkFDsCloseOnExecBySweep(const AFdLimit: Integer): Boolean;
-{$IF Defined(AUTOTESTS)}
-{ Exact finite RLIMIT_NOFILE -> bounded-sweep limit. -1 means the limit cannot
-  be represented safely, so an unbounded primitive must succeed or spawn must
-  fail closed. Exposed only to regression tests. }
-function CrashFdSweepLimitFromRLimit(const ARlimCur: UInt64): Integer;
-{$ENDIF}
 {$ENDIF}
 
 type
@@ -446,87 +342,17 @@ uses
   System.Classes,
   System.SyncObjs,
   System.IOUtils,
-  System.DateUtils,
   System.Generics.Collections,
-  System.Net.HttpClient,
-  System.Net.Mime,
-  System.Net.URLClient,
   Crash.ELFormat,
-  Crash.Modules,
   Crash.MacOS.Symbols,
-  Crash.MacOS.MachExc,
   Crash.Android.Symbols,
   Crash.Breadcrumbs,
   Crash.Pending,
   Crash.RawFallback,
+  Crash.RawRecovery,
+  Crash.Signals,
   Crash.ThreadCapture,
-  Crash.ThreadCapture.Trace,
-  {$IF Defined(MSWINDOWS)}
-  Winapi.Windows,
-  {$ENDIF}
-  {$IF not Defined(MSWINDOWS)}
-  Posix.Pthread,
-  Posix.Unistd, // getpid(), fork(), execv(), pipe()
-  Posix.Stdlib,
-  Posix.SysTypes,
-  Posix.Base,
-  Posix.Fcntl,   // FD_CLOEXEC on the exec-confirmation pipe + the child fd sweep
-  Posix.SysWait, // waitpid() for the failed-exec child
-  Posix.Signal,  // kill(SIGKILL) when the confirmation channel breaks
-  Posix.Errno,
-  {$ENDIF}
   System.SysUtils;
-
-function CrashModuleSizeForBase(const ABase: UInt64;
-  out ASize: UInt64): Boolean;
-var
-  Modules: TModuleInfoArray;
-  M: TModuleInfo;
-begin
-  Result := False;
-  ASize := 0;
-  if ABase = 0 then
-    Exit(False);
-  Modules := CrashEnumerateModules;
-  for M in Modules do
-    if M.BaseAddr = ABase then
-    begin
-      ASize := M.Size;
-      Exit(ASize <> 0);
-    end;
-end;
-
-function CrashCurrentMainImage(out ABase, ASize: UInt64): Boolean;
-begin
-  ABase := UInt64(TCrashCapture.MainModuleAddress);
-  Result := CrashModuleSizeForBase(ABase, ASize);
-end;
-
-type
-  TCrashUploadWorkerProc = reference to function(const AUrl, AFieldName,
-    AReportText, AFileName: String; const ABody: TBytes): Boolean;
-
-  ICrashOperationLifetime = interface
-    function Active: Boolean;
-    procedure Deactivate;
-  end;
-
-  TCrashOperationLifetime = class(TInterfacedObject, ICrashOperationLifetime)
-  private
-    FActive: Integer;
-  public
-    constructor Create;
-    function Active: Boolean;
-    procedure Deactivate;
-  end;
-
-function CrashQueueUpload(const AUrl, AFieldName, AReportText,
-  AReportPath: String; const AOnComplete: TCrashUploadCompleteProc;
-  const ALifetime: ICrashOperationLifetime): Boolean; forward;
-function CrashQueueUploadWithTransport(const AUrl, AFieldName, AReportText,
-  AReportPath: String; const ATransport: TCrashUploadWorkerProc;
-  const AOnComplete: TCrashUploadCompleteProc;
-  const ALifetime: ICrashOperationLifetime): Boolean; forward;
 
 function DefaultCrashConfig: TCrashConfig;
 begin
@@ -544,112 +370,6 @@ begin
   Result.RestartOnFreeze := False; // opt in - see the field comment
 end;
 
-constructor TCrashOperationLifetime.Create;
-begin
-  inherited Create;
-  FActive := 1;
-end;
-
-function TCrashOperationLifetime.Active: Boolean;
-begin
-  Result := TInterlocked.CompareExchange(FActive, 1, 1) = 1;
-end;
-
-procedure TCrashOperationLifetime.Deactivate;
-begin
-  TInterlocked.Exchange(FActive, 0);
-end;
-
-function GetExeBaseName: String; inline;
-begin
-  Result := ChangeFileExt(ExtractFileName(ParamStr(0)), '');
-end;
-
-function GetPlatformTag: String; inline;
-begin
-  {$IF Defined(MSWINDOWS)}  Result := 'WIN';
-  {$ELSEIF Defined(ANDROID)}Result := 'ANDROID';
-  {$ELSEIF Defined(IOS)}    Result := 'IOS';
-  {$ELSEIF Defined(MACOS)}  Result := 'MACOS';
-  {$ELSEIF Defined(LINUX)}  Result := 'LINUX';
-  {$ELSE}                   Result := 'UNKNOWN';
-  {$ENDIF}
-end;
-
-const
-  CRASH_APP_PARAMETERS_MAX_CHARS = 4096;
-
-function CrashSingleLineBounded(const AText: String;
-  const AMaxChars: Integer): String;
-begin
-  Result := StringReplace(AText, #13, ' ', [rfReplaceAll]);
-  Result := StringReplace(Result, #10, ' ', [rfReplaceAll]);
-  if Length(Result) > AMaxChars then
-    SetLength(Result, AMaxChars);
-end;
-
-function CrashArgumentSwitchName(const AArgument: String;
-  const ARequirePrefix: Boolean): String;
-var
-  P: Integer;
-begin
-  Result := Trim(AArgument);
-  if Result = '' then
-    Exit;
-  if ARequirePrefix and not CharInSet(Result[1], ['/', '-']) then
-    Exit('');
-  while (Result <> '') and CharInSet(Result[1], ['/', '-']) do
-    Delete(Result, 1, 1);
-  P := Pos('=', Result);
-  if P > 0 then
-    SetLength(Result, P - 1);
-  Result := LowerCase(Trim(Result));
-end;
-
-function CrashFormatParameters(const AArguments,
-  AAllowList: TArray<String>; const AIncludeAll: Boolean;
-  const ASanitizer: TCrashSanitizeParametersProc): String;
-var
-  Allowed, ArgName: String;
-  Argument: String;
-  Selected: TList<String>;
-begin
-  Result := '';
-  if Assigned(ASanitizer) then
-  begin
-    try
-      Result := ASanitizer(AArguments);
-    except
-      Result := '';
-    end;
-    Exit(CrashSingleLineBounded(Result, CRASH_APP_PARAMETERS_MAX_CHARS));
-  end;
-  if Length(AAllowList) > 0 then
-  begin
-    Selected := TList<String>.Create;
-    try
-      for Argument in AArguments do
-      begin
-        ArgName := CrashArgumentSwitchName(Argument, True);
-        if ArgName = '' then
-          Continue;
-        for Allowed in AAllowList do
-          if ArgName = CrashArgumentSwitchName(Allowed, False) then
-          begin
-            Selected.Add(Argument);
-            Break;
-          end;
-      end;
-      Result := String.Join(' ', Selected.ToArray);
-    finally
-      Selected.Free;
-    end;
-  end
-  else if AIncludeAll then
-    Result := String.Join(' ', AArguments);
-  Result := CrashSingleLineBounded(Result, CRASH_APP_PARAMETERS_MAX_CHARS);
-end;
-
 function CrashCurrentParameters(const AConfig: TCrashConfig): String;
 var
   Arguments: TArray<String>;
@@ -662,76 +382,6 @@ begin
     AConfig.IncludeAppParameters, AConfig.OnSanitizeParameters);
 end;
 
-function CrashSanitizeFileName(const AValue: String): String;
-var
-  C: Char;
-  I: Integer;
-begin
-  Result := Trim(AValue);
-  for I := 1 to Length(Result) do
-  begin
-    C := Result[I];
-    if (Ord(C) < 32) or CharInSet(C, ['<', '>', ':', '"', '/', '\', '|', '?', '*']) then
-      Result[I] := '_';
-  end;
-end;
-
-function CrashRenderFileNameTemplate(const ATemplate, AApp, AVersion,
-  ABugID: String): String;
-var
-  AppValue: String;
-begin
-  Result := '';
-  if (ATemplate = '') or
-     (Pos('{bugid}', LowerCase(ATemplate)) = 0) then
-    Exit;
-  AppValue := AApp;
-  if AppValue = '' then
-    AppValue := GetExeBaseName;
-  Result := StringReplace(ATemplate, '{App}',
-    CrashSanitizeFileName(AppValue), [rfReplaceAll, rfIgnoreCase]);
-  Result := StringReplace(Result, '{Platform}', GetPlatformTag,
-    [rfReplaceAll, rfIgnoreCase]);
-  Result := StringReplace(Result, '{Version}',
-    CrashSanitizeFileName(AVersion), [rfReplaceAll, rfIgnoreCase]);
-  Result := StringReplace(Result, '{BugID}',
-    CrashSanitizeFileName(ABugID), [rfReplaceAll, rfIgnoreCase]);
-  if (Pos('{', Result) > 0) or (Pos('}', Result) > 0) then
-    Exit('');
-  Result := CrashSanitizeFileName(Result);
-  if Result = '' then
-    Exit;
-  if not SameText(ExtractFileExt(Result), '.el') then
-    Result := Result + '.el';
-end;
-
-function CrashTemplateScanPrefix(const ATemplate, AApp: String): String;
-var
-  AppValue, LowerTemplate, PrefixTemplate: String;
-  BugPos, CutPos, VersionPos: Integer;
-begin
-  Result := '';
-  LowerTemplate := LowerCase(ATemplate);
-  BugPos := Pos('{bugid}', LowerTemplate);
-  if BugPos = 0 then
-    Exit;
-  VersionPos := Pos('{version}', LowerTemplate);
-  CutPos := BugPos;
-  if (VersionPos > 0) and (VersionPos < CutPos) then
-    CutPos := VersionPos;
-  PrefixTemplate := Copy(ATemplate, 1, CutPos - 1);
-  AppValue := AApp;
-  if AppValue = '' then
-    AppValue := GetExeBaseName;
-  Result := StringReplace(PrefixTemplate, '{App}',
-    CrashSanitizeFileName(AppValue), [rfReplaceAll, rfIgnoreCase]);
-  Result := StringReplace(Result, '{Platform}', GetPlatformTag,
-    [rfReplaceAll, rfIgnoreCase]);
-  if (Pos('{', Result) > 0) or (Pos('}', Result) > 0) then
-    Exit('');
-  Result := CrashSanitizeFileName(Result);
-end;
-
 function CrashAcceptInitialConfig(var AInstalled: Boolean;
   var ACurrent: TCrashConfig; const AIncoming: TCrashConfig): Boolean;
 begin
@@ -742,130 +392,15 @@ begin
   AInstalled := True;
 end;
 
-const
-  { First line of a freeze-restart notice file; the version tag lets a future
-    format change fail closed (an unknown notice reads as not-found). }
-  CRASH_RESTART_NOTICE_SIGNATURE = 'CrashRestartNotice v1';
-
-procedure CrashWriteRestartNoticeFile(const APath: String;
-  const ANotice: TCrashRestartNotice);
-var
-  Text: String;
-const
-  BoolChar: array [Boolean] of Char = ('0', '1');
+{$IFDEF AUTOTESTS}
+function CrashAutoTestAcceptInitialConfig(var AInstalled: Boolean;
+  var ACurrent: TCrashConfig; const AIncoming: TCrashConfig): Boolean;
 begin
-  // key=value lines; the timestamp is ISO 8601 so the parse never depends on
-  // the locale of either run. UTF-8: ReportFile may carry non-ASCII paths.
-  Text :=
-    CRASH_RESTART_NOTICE_SIGNATURE + #13#10 +
-    'restarted_at=' + DateToISO8601(ANotice.RestartedAt, False) + #13#10 +
-    'frozen_ms=' + IntToStr(ANotice.FrozenForMS) + #13#10 +
-    'bugid=' + ANotice.BugID + #13#10 +
-    'report_file=' + ANotice.ReportFile + #13#10 +
-    'uploaded=' + BoolChar[ANotice.Uploaded] + #13#10;
-  ForceDirectories(ExtractFilePath(APath));
-  TFile.WriteAllText(APath, Text, TEncoding.UTF8);
+  Result := CrashAcceptInitialConfig(AInstalled, ACurrent, AIncoming);
 end;
-
-function CrashReadRestartNoticeFile(const APath: String;
-  out ANotice: TCrashRestartNotice): Boolean;
-var
-  Lines: TArray<String>;
-  L, Key, Val: String;
-  EqPos: Integer;
-  DT: TDateTime;
-  MS: Int64;
-begin
-  ANotice := Default(TCrashRestartNotice);
-  Result := False;
-  if (APath = '') or (not TFile.Exists(APath)) then
-    Exit;
-  try
-    Lines := TFile.ReadAllLines(APath, TEncoding.UTF8);
-  except
-    Exit; // unreadable = no notice
-  end;
-  if (Length(Lines) = 0) or (Lines[0].Trim <> CRASH_RESTART_NOTICE_SIGNATURE) then
-    Exit;
-  // Fields are best-effort: a missing/garbled value keeps its default, the
-  // notice itself (signature matched) still counts.
-  for L in Lines do
-  begin
-    EqPos := Pos('=', L);
-    if EqPos <= 1 then
-      Continue;
-    Key := Copy(L, 1, EqPos - 1);
-    Val := Copy(L, EqPos + 1, MaxInt);
-    if Key = 'restarted_at' then
-    begin
-      if TryISO8601ToDate(Val, DT, False) then
-        ANotice.RestartedAt := DT;
-    end
-    else if Key = 'frozen_ms' then
-    begin
-      if TryStrToInt64(Val, MS) then
-        ANotice.FrozenForMS := MS;
-    end
-    else if Key = 'bugid' then
-      ANotice.BugID := Val
-    else if Key = 'report_file' then
-      ANotice.ReportFile := Val
-    else if Key = 'uploaded' then
-      ANotice.Uploaded := Val = '1';
-  end;
-  ANotice.Found := True;
-  Result := True;
-end;
-
-const
-  CRASH_FREEZE_RESTART_ENV = 'CRASH_FREEZE_RESTARTED';
-
-function CrashSetFreezeRestartEnvMark: Boolean;
-begin
-  {$IF Defined(MSWINDOWS)}
-  SetEnvironmentVariable(CRASH_FREEZE_RESTART_ENV, '1');
-  {$ELSE}
-  setenv(CRASH_FREEZE_RESTART_ENV, '1', 1); // can fail (ENOMEM)
-  {$ENDIF}
-  // Read-back instead of trusting the API result: True = the mark is
-  // verifiably in place for inheritance.
-  Result := GetEnvironmentVariable(CRASH_FREEZE_RESTART_ENV) = '1';
-end;
-
-function CrashConsumeFreezeRestartEnvMark: Boolean;
-begin
-  Result := GetEnvironmentVariable(CRASH_FREEZE_RESTART_ENV) = '1';
-  if not Result then
-    Exit;
-  {$IF Defined(MSWINDOWS)}
-  SetEnvironmentVariable(CRASH_FREEZE_RESTART_ENV, nil);
-  {$ELSE}
-  unsetenv(CRASH_FREEZE_RESTART_ENV);
-  {$ENDIF}
-end;
+{$ENDIF}
 
 type
-  TCrashThreadRegistration = class
-  public
-    Coverage: TCrashThreadCoverage;
-    NativeIdentity: TCrashThreadNativeIdentity;
-    Sequence: UInt64;
-    Closing: Boolean;
-    UnregisterWaiting: Boolean;
-    CaptureLeaseCount: Integer;
-    CaptureHandle: TCrashThreadCaptureHandle;
-  end;
-
-  TCrashThreadCandidateTier = (tctOwn, tctGlobal, tctForeign);
-
-  TCrashThreadCandidate = record
-    ThreadID: UInt64;
-    Name: String;
-    GroupID: UInt64;
-    Sequence: UInt64;
-    Tier: TCrashThreadCandidateTier;
-  end;
-
   TCrashReporterImpl = class
   private
     FConfig: TCrashConfig;
@@ -881,8 +416,7 @@ type
     FWasFreezeRestarted: Boolean; // loop-guard flag: this run WAS spawned by RestartOnFreeze (survives TakeRestartNotice)
     FMachMainThreadCovered: Boolean; // Init-time Mach registration verdict (main thread only; NOT a live watcher status)
     FMainThreadCoverage: TCrashThreadCoverage;
-    FThreadRegistrations: TObjectList<TCrashThreadRegistration>;
-    FRegistrationSequence: UInt64;
+    FRegistry: TCrashThreadRegistry;
     FExtendedCaptureOwned: Boolean;
     FBreadcrumbs: TCrashBreadcrumbStore;
     FOperationLifetime: ICrashOperationLifetime;
@@ -901,21 +435,12 @@ type
     procedure ConsoleLine(const S: String);
     function WriteToFile(const AText: String): Boolean;
     function EnsureCurrentReportPending(const AText: String): Boolean;
-    function WriteReportTextToUniqueFile(const AText: String;
-      var APath: String): Boolean;
     procedure ResetAlreadyReported;
     procedure CollectAttachments(const AReport: TCrashReport);
     procedure CleanupStaleAttachDirs;
     procedure HandleReport(const AReport: TCrashReport);
     procedure DoHandleReport(const AReport: TCrashReport);
-    function TryEnterRegistry(const ATimeoutMS: Integer): Boolean;
-    function EnterRegistryForCapture(const ABounded: Boolean): Boolean;
-    function FindRegistrationLocked(const AThreadID,
-      ASequence: UInt64): TCrashThreadRegistration;
-    procedure SweepClosedRegistrationsLocked;
     function ExtendedCaptureOperational: Boolean;
-    function RegisteredThreadName(const AThreadID: UInt64;
-      const AFallback: String): String;
     function CaptureExtendedThreads(var AReport: TCrashReport;
       const APrimaryThreadID: UInt64;
       const ABoundedRegistry: Boolean): Integer;
@@ -923,7 +448,6 @@ type
     procedure InstallFreezeDetector;
     procedure HandleFreezeCapture(const AReport: TCrashReport;
       const AFrozenForMS: Int64);
-    function WriteRecoveredRawReport(const ARaw: TCrashRawRecord): Boolean;
     procedure RecoverRawFallbackReports;
     procedure ScanPendingCrashReports;
   public
@@ -939,20 +463,14 @@ var
   {$IFDEF AUTOTESTS}
   GAutoTestExtendedCaptureEnabled: Integer;
   GAutoTestExtendedCaptureOwned: Boolean;
-  GAutoTestExtendedMaxThreadMS: UInt64;
   {$ENDIF}
-
-threadvar
-  GCoverageReporter: Pointer;
-  GCoverageReporterInstanceID: UInt64;
-  GCoverageRegistration: Pointer;
 
 constructor TCrashReporterImpl.Create;
 begin
   inherited Create;
   FLock := TCriticalSection.Create;
-  FThreadRegistrations := TObjectList<TCrashThreadRegistration>.Create(True);
   FInstanceID := UInt64(TInterlocked.Increment(GReporterInstanceSeq));
+  FRegistry := TCrashThreadRegistry.Create(FInstanceID);
   FMachMainThreadCovered := True; // no verdict yet - only Init's registration may flip it
   FAppStartTime := Now; // "close enough to process start"
   FAppStartTick := TThread.GetTickCount64;
@@ -978,7 +496,7 @@ begin
   FConfig.OnFreezeReport := nil;
   FreeAndNil(FBreadcrumbs);
   FOperationLifetime := nil;
-  FreeAndNil(FThreadRegistrations);
+  FreeAndNil(FRegistry);
   if FExtendedCaptureOwned then
   begin
     CrashThreadCaptureRelease;
@@ -988,66 +506,7 @@ begin
   inherited;
 end;
 
-function CrashCurrentThreadIdentity: UInt64;
-begin
-  {$IF Defined(MSWINDOWS)}
-  Result := UInt64(GetCurrentThreadId);
-  {$ELSE}
-  Result := UInt64(NativeUInt(pthread_self));
-  {$ENDIF}
-end;
-
-function CrashRegisterMachForCurrentThread: TCrashMachState;
-begin
-  {$IF Defined(MACOS) and Defined(CPUX64)}
-  if CrashInstallMacOSMachHandlerForCurrentThread then
-    Result := cmsInstalled
-  else
-    Result := cmsUnavailable;
-  {$ELSE}
-  Result := cmsNotRequired;
-  {$ENDIF}
-end;
-
-const
-  CRASH_EXTENDED_DEFAULT_THREADS = 32;
-  CRASH_EXTENDED_HARD_MAX_THREADS = 128;
-  CRASH_EXTENDED_THREAD_WAIT_MS = 100;
-  CRASH_EXTENDED_TOTAL_BUDGET_MS = 1000;
-  CRASH_EXTENDED_MIN_WAIT_MS = 2;
-  CRASH_EXTENDED_LOCK_BUDGET_MS = 10;
-  CRASH_EXTENDED_NAME_MAX_CHARS = 128;
-
-function CrashEffectiveExtendedThreadsMax(
-  const AConfigured: Integer): Integer;
-begin
-  if AConfigured <= 0 then
-    Exit(CRASH_EXTENDED_DEFAULT_THREADS);
-  if AConfigured > CRASH_EXTENDED_HARD_MAX_THREADS then
-    Exit(CRASH_EXTENDED_HARD_MAX_THREADS);
-  Result := AConfigured;
-end;
-
-function CrashSanitizeThreadName(const AName: String): String;
-begin
-  Result := StringReplace(AName, ';', '.', [rfReplaceAll]);
-  Result := StringReplace(Result, #13, ' ', [rfReplaceAll]);
-  Result := StringReplace(Result, #10, ' ', [rfReplaceAll]);
-  Result := StringReplace(Result, #9, ' ', [rfReplaceAll]);
-  Result := StringReplace(Result, '|', ' ', [rfReplaceAll]);
-  Result := StringReplace(Result, '=', ' ', [rfReplaceAll]);
-  if Length(Result) > CRASH_EXTENDED_NAME_MAX_CHARS then
-    SetLength(Result, CRASH_EXTENDED_NAME_MAX_CHARS);
-  if Trim(Result) = '' then
-    Result := 'Worker';
-end;
-
 {$IFDEF AUTOTESTS}
-function CrashAutoTestSanitizeThreadName(const AName: String): String;
-begin
-  Result := CrashSanitizeThreadName(AName);
-end;
-
 function CrashAutoTestSetExtendedCaptureOverride(
   const AEnabled: Boolean): Boolean;
 begin
@@ -1069,12 +528,6 @@ begin
     GAutoTestExtendedCaptureOwned := False;
   end;
   Result := True;
-end;
-
-function CrashAutoTestEffectiveExtendedThreadsMax(
-  const AConfigured: Integer): Integer;
-begin
-  Result := CrashEffectiveExtendedThreadsMax(AConfigured);
 end;
 
 function CrashAutoTestSetExtendedThreadsMax(const AValue: Integer;
@@ -1117,61 +570,14 @@ begin
     Exit;
 
   Report := Default(TCrashReport);
-  GAutoTestExtendedMaxThreadMS := 0;
+  Reporter.FRegistry.AutoTestMaxThreadMS := 0;
   Started := TThread.GetTickCount64;
   AOmitted := Reporter.CaptureExtendedThreads(Report, APrimaryThreadID, False);
   ATotalMS := TThread.GetTickCount64 - Started;
-  AMaxThreadMS := GAutoTestExtendedMaxThreadMS;
+  AMaxThreadMS := Reporter.FRegistry.AutoTestMaxThreadMS;
   AThreads := Report.ExtendedThreads;
 end;
 {$ENDIF}
-
-function TCrashReporterImpl.TryEnterRegistry(
-  const ATimeoutMS: Integer): Boolean;
-var
-  Deadline: UInt64;
-begin
-  Deadline := TThread.GetTickCount64 + UInt64(ATimeoutMS);
-  repeat
-    if FLock.TryEnter then
-      Exit(True);
-    if TThread.GetTickCount64 >= Deadline then
-      Exit(False);
-    TThread.Sleep(1);
-  until False;
-end;
-
-function TCrashReporterImpl.EnterRegistryForCapture(
-  const ABounded: Boolean): Boolean;
-begin
-  if ABounded then
-    Exit(TryEnterRegistry(CRASH_EXTENDED_LOCK_BUDGET_MS));
-  FLock.Enter;
-  Result := True;
-end;
-
-function TCrashReporterImpl.FindRegistrationLocked(const AThreadID,
-  ASequence: UInt64): TCrashThreadRegistration;
-var
-  Registration: TCrashThreadRegistration;
-begin
-  for Registration in FThreadRegistrations do
-    if (Registration.Coverage.ThreadID = AThreadID) and
-       (Registration.Sequence = ASequence) then
-      Exit(Registration);
-  Result := nil;
-end;
-
-procedure TCrashReporterImpl.SweepClosedRegistrationsLocked;
-var
-  I: Integer;
-begin
-  for I := FThreadRegistrations.Count - 1 downto 0 do
-    if FThreadRegistrations[I].Closing and
-       (not FThreadRegistrations[I].UnregisterWaiting) and
-       (FThreadRegistrations[I].CaptureLeaseCount = 0) then
-      FThreadRegistrations.Delete(I);
-end;
 
 function TCrashReporterImpl.ExtendedCaptureOperational: Boolean;
 begin
@@ -1183,30 +589,6 @@ begin
       GAutoTestExtendedCaptureOwned;
   {$ENDIF}
   Result := Result and CrashThreadCaptureAvailable;
-end;
-
-function TCrashReporterImpl.RegisteredThreadName(const AThreadID: UInt64;
-  const AFallback: String): String;
-var
-  I: Integer;
-begin
-  Result := AFallback;
-  if not TryEnterRegistry(CRASH_EXTENDED_LOCK_BUDGET_MS) then
-    Exit;
-  try
-    for I := FThreadRegistrations.Count - 1 downto 0 do
-      if (not FThreadRegistrations[I].Closing) and
-         (FThreadRegistrations[I].Coverage.ThreadID = AThreadID) then
-        Exit(FThreadRegistrations[I].Coverage.Name);
-  finally
-    FLock.Leave;
-  end;
-end;
-
-function FormatThreadCaptureDiagnostics(const AThreadID: UInt64;
-  const ATrace: TCrashThreadRawTrace): String;
-begin
-  Result := CrashThreadCaptureFormatDiagnostics(AThreadID, ATrace);
 end;
 
 procedure AppendSignalInfoLine(var ASection: String; const ALine: String);
@@ -1232,329 +614,9 @@ end;
 function TCrashReporterImpl.CaptureExtendedThreads(var AReport: TCrashReport;
   const APrimaryThreadID: UInt64;
   const ABoundedRegistry: Boolean): Integer;
-var
-  Candidates: array [0..CRASH_EXTENDED_HARD_MAX_THREADS - 1] of
-    TCrashThreadCandidate;
-  SeenForeignGroups: array [0..CRASH_EXTENDED_HARD_MAX_THREADS - 1] of
-    UInt64;
-  CandidateCount, EligibleCount, EffectiveLimit, OwnCount, GlobalCount,
-    OwnQuota, GlobalQuota, RemainingSlots, SeenForeignCount, I, WaitMS,
-    MaxDepth: Integer;
-  Candidate: TCrashThreadCandidate;
-  Registration, CurrentRegistration: TCrashThreadRegistration;
-  Handle: TCrashThreadCaptureHandle;
-  Trace: TCrashThreadRawTrace;
-  Outcome: TCrashThreadCaptureOutcome;
-  PrimaryGroupID: UInt64;
-  Deadline, OwnDeadline, CaptureDeadline, NowTick, Remaining: UInt64;
-  LeaseHeld, StillOwned, HasGlobalReserve: Boolean;
-  {$IFDEF AUTOTESTS}
-  CaptureStart, CaptureElapsed: UInt64;
-  {$ENDIF}
-
-  function IsEligible(const ARegistration: TCrashThreadRegistration): Boolean;
-  begin
-    Result := (not ARegistration.Closing) and
-      (ARegistration.Coverage.ThreadID <> APrimaryThreadID);
-  end;
-
-  procedure AddCandidate(const ARegistration: TCrashThreadRegistration;
-    const ATier: TCrashThreadCandidateTier);
-  begin
-    if CandidateCount >= EffectiveLimit then
-      Exit;
-    Candidates[CandidateCount].ThreadID :=
-      ARegistration.Coverage.ThreadID;
-    Candidates[CandidateCount].Name := ARegistration.Coverage.Name;
-    Candidates[CandidateCount].GroupID := ARegistration.Coverage.GroupID;
-    Candidates[CandidateCount].Sequence := ARegistration.Sequence;
-    Candidates[CandidateCount].Tier := ATier;
-    Inc(CandidateCount);
-  end;
-
-  function ForeignGroupSeen(const AGroupID: UInt64): Boolean;
-  var
-    K: Integer;
-  begin
-    for K := 0 to SeenForeignCount - 1 do
-      if SeenForeignGroups[K] = AGroupID then
-        Exit(True);
-    Result := False;
-  end;
-
-  function CandidateAlreadySelected(const ASequence: UInt64): Boolean;
-  var
-    K: Integer;
-  begin
-    for K := 0 to CandidateCount - 1 do
-      if Candidates[K].Sequence = ASequence then
-        Exit(True);
-    Result := False;
-  end;
 begin
-  Result := 0;
-  AReport.ExtendedThreads := nil;
-  AReport.ExtendedThreadsOmitted := 0;
-  AReport.PrimaryGroupID := 0;
-  if not ExtendedCaptureOperational then
-    Exit;
-
-  CandidateCount := 0;
-  EligibleCount := 0;
-  OwnCount := 0;
-  GlobalCount := 0;
-  SeenForeignCount := 0;
-  EffectiveLimit := CrashEffectiveExtendedThreadsMax(
-    FConfig.ExtendedThreadsMax);
-  if not EnterRegistryForCapture(ABoundedRegistry) then
-    Exit;
-  try
-    PrimaryGroupID := 0;
-    for Registration in FThreadRegistrations do
-      if (not Registration.Closing) and
-         (Registration.Coverage.ThreadID = APrimaryThreadID) then
-      begin
-        PrimaryGroupID := Registration.Coverage.GroupID;
-        Break;
-      end;
-    AReport.PrimaryGroupID := PrimaryGroupID;
-
-    for Registration in FThreadRegistrations do
-      if IsEligible(Registration) then
-      begin
-        Inc(EligibleCount);
-        if PrimaryGroupID <> 0 then
-        begin
-          if Registration.Coverage.GroupID = PrimaryGroupID then
-            Inc(OwnCount)
-          else if Registration.Coverage.GroupID = 0 then
-            Inc(GlobalCount);
-        end;
-      end;
-
-    // GroupID=0 is the compatibility path: first N registrations, unchanged.
-    if PrimaryGroupID = 0 then
-    begin
-      for Registration in FThreadRegistrations do
-        if IsEligible(Registration) then
-          AddCandidate(Registration, tctGlobal);
-    end
-    else
-    begin
-      // Reserve candidate slots for one Own and up to two Global entries,
-      // then fill Own, Global and finally the best-effort Foreign tail.
-      RemainingSlots := EffectiveLimit;
-      OwnQuota := 0;
-      if (OwnCount > 0) and (RemainingSlots > 0) then
-      begin
-        OwnQuota := 1;
-        Dec(RemainingSlots);
-      end;
-      GlobalQuota := GlobalCount;
-      if GlobalQuota > 2 then
-        GlobalQuota := 2;
-      if GlobalQuota > RemainingSlots then
-        GlobalQuota := RemainingSlots;
-      Dec(RemainingSlots, GlobalQuota);
-      I := OwnCount - OwnQuota;
-      if I > RemainingSlots then
-        I := RemainingSlots;
-      Inc(OwnQuota, I);
-      Dec(RemainingSlots, I);
-      I := GlobalCount - GlobalQuota;
-      if I > RemainingSlots then
-        I := RemainingSlots;
-      Inc(GlobalQuota, I);
-
-      for Registration in FThreadRegistrations do
-        if IsEligible(Registration) and
-           (Registration.Coverage.GroupID = PrimaryGroupID) and
-           (CandidateCount < OwnQuota) then
-          AddCandidate(Registration, tctOwn);
-
-      I := 0;
-      for Registration in FThreadRegistrations do
-        if IsEligible(Registration) and
-           (Registration.Coverage.GroupID = 0) and
-           (I < GlobalQuota) then
-        begin
-          AddCandidate(Registration, tctGlobal);
-          Inc(I);
-        end;
-
-      // First Foreign pass: oldest representative of every distinct group.
-      for Registration in FThreadRegistrations do
-      begin
-        if CandidateCount >= EffectiveLimit then
-          Break;
-        if IsEligible(Registration) and
-           (Registration.Coverage.GroupID <> 0) and
-           (Registration.Coverage.GroupID <> PrimaryGroupID) and
-           (not ForeignGroupSeen(Registration.Coverage.GroupID)) then
-        begin
-          SeenForeignGroups[SeenForeignCount] :=
-            Registration.Coverage.GroupID;
-          Inc(SeenForeignCount);
-          AddCandidate(Registration, tctForeign);
-        end;
-      end;
-
-      // Second Foreign pass: remaining entries in registration order.
-      for Registration in FThreadRegistrations do
-      begin
-        if CandidateCount >= EffectiveLimit then
-          Break;
-        if IsEligible(Registration) and
-           (Registration.Coverage.GroupID <> 0) and
-           (Registration.Coverage.GroupID <> PrimaryGroupID) and
-           (not CandidateAlreadySelected(Registration.Sequence)) then
-          AddCandidate(Registration, tctForeign);
-      end;
-    end;
-  finally
-    FLock.Leave;
-  end;
-  if EligibleCount > CandidateCount then
-    Result := EligibleCount - CandidateCount;
-  AReport.ExtendedThreadsOmitted := Result;
-  if CandidateCount = 0 then
-    Exit;
-
-  SetLength(AReport.ExtendedThreads, CandidateCount);
-  Deadline := TThread.GetTickCount64 + CRASH_EXTENDED_TOTAL_BUDGET_MS;
-  HasGlobalReserve := False;
-  if PrimaryGroupID <> 0 then
-    for I := 0 to CandidateCount - 1 do
-      if Candidates[I].Tier = tctGlobal then
-      begin
-        HasGlobalReserve := True;
-        Break;
-      end;
-  OwnDeadline := Deadline;
-  if HasGlobalReserve then
-    OwnDeadline := Deadline - CRASH_EXTENDED_THREAD_WAIT_MS;
-  for I := 0 to CandidateCount - 1 do
-  begin
-    Candidate := Candidates[I];
-    AReport.ExtendedThreads[I].ThreadID := Candidate.ThreadID;
-    AReport.ExtendedThreads[I].Name := Candidate.Name;
-    AReport.ExtendedThreads[I].GroupID := Candidate.GroupID;
-    AReport.ExtendedThreads[I].State := ctcsCaptureFailed;
-    AReport.ExtendedThreads[I].CallStack := nil;
-    AReport.ExtendedThreads[I].CaptureDiagnostics := '';
-    Handle := nil;
-    LeaseHeld := False;
-
-    CaptureDeadline := Deadline;
-    if HasGlobalReserve and (Candidate.Tier = tctOwn) then
-      CaptureDeadline := OwnDeadline;
-    NowTick := TThread.GetTickCount64;
-    if NowTick >= CaptureDeadline then
-    begin
-      AReport.ExtendedThreads[I].State := ctcsBudgetExceeded;
-      Continue;
-    end;
-
-    if not EnterRegistryForCapture(ABoundedRegistry) then
-      Continue;
-    try
-      Registration := FindRegistrationLocked(Candidate.ThreadID,
-        Candidate.Sequence);
-      if (Registration = nil) or Registration.Closing then
-        AReport.ExtendedThreads[I].State := ctcsThreadGone
-      else if Registration.CaptureHandle = nil then
-        AReport.ExtendedThreads[I].State := ctcsSignalUnavailable
-      else
-      begin
-        Inc(Registration.CaptureLeaseCount);
-        Handle := Registration.CaptureHandle;
-        LeaseHeld := True;
-      end;
-    finally
-      FLock.Leave;
-    end;
-    if not LeaseHeld then
-      Continue;
-
-    try
-      NowTick := TThread.GetTickCount64;
-      if NowTick >= CaptureDeadline then
-      begin
-        AReport.ExtendedThreads[I].State := ctcsBudgetExceeded;
-        Continue;
-      end;
-      Remaining := CaptureDeadline - NowTick;
-      if Remaining < CRASH_EXTENDED_MIN_WAIT_MS then
-      begin
-        AReport.ExtendedThreads[I].State := ctcsBudgetExceeded;
-        Continue;
-      end;
-      WaitMS := CRASH_EXTENDED_THREAD_WAIT_MS;
-      if Remaining < UInt64(WaitMS) then
-        WaitMS := Integer(Remaining);
-      {$IFDEF AUTOTESTS}
-      CaptureStart := TThread.GetTickCount64;
-      {$ENDIF}
-      Outcome := CrashThreadCaptureCapture(Handle, WaitMS, Trace);
-      {$IFDEF AUTOTESTS}
-      CaptureElapsed := TThread.GetTickCount64 - CaptureStart;
-      if CaptureElapsed > GAutoTestExtendedMaxThreadMS then
-        GAutoTestExtendedMaxThreadMS := CaptureElapsed;
-      {$ENDIF}
-    finally
-      // The lease protects only the raw request/result hand-off. Release it
-      // before symbolization so unregister never waits on resolver work.
-      FLock.Enter;
-      try
-        CurrentRegistration := FindRegistrationLocked(Candidate.ThreadID,
-          Candidate.Sequence);
-        StillOwned := (CurrentRegistration <> nil) and
-          (CurrentRegistration = Registration);
-        if Registration.CaptureLeaseCount > 0 then
-          Dec(Registration.CaptureLeaseCount);
-        if not StillOwned then
-        begin
-          AReport.ExtendedThreads[I].State := ctcsThreadGone;
-          AReport.ExtendedThreads[I].CallStack := nil;
-          Trace := Default(TCrashThreadRawTrace);
-        end;
-        SweepClosedRegistrationsLocked;
-      finally
-        FLock.Leave;
-      end;
-    end;
-    if not StillOwned then
-      Continue;
-
-    case Outcome of
-      tcoCaptured:
-        begin
-          AReport.ExtendedThreads[I].CaptureDiagnostics :=
-            FormatThreadCaptureDiagnostics(Candidate.ThreadID, Trace);
-          MaxDepth := TCrashCapture.MaxCallStackDepth;
-          if MaxDepth < 0 then
-            MaxDepth := 0;
-          if Length(Trace.Addresses) > MaxDepth then
-            SetLength(Trace.Addresses, MaxDepth);
-          try
-            AReport.ExtendedThreads[I].CallStack :=
-              TCrashCapture.SymbolizeAddressList(Trace.Addresses);
-            AReport.ExtendedThreads[I].State := ctcsCaptured;
-          except
-            AReport.ExtendedThreads[I].CallStack := nil;
-            AReport.ExtendedThreads[I].State := ctcsCaptureFailed;
-          end;
-        end;
-      tcoTimedOut:
-        AReport.ExtendedThreads[I].State := ctcsTimedOut;
-      tcoThreadGone:
-        AReport.ExtendedThreads[I].State := ctcsThreadGone;
-      tcoUnavailable:
-        AReport.ExtendedThreads[I].State := ctcsSignalUnavailable;
-    else
-      AReport.ExtendedThreads[I].State := ctcsCaptureFailed;
-    end;
-  end;
+  Result := FRegistry.CaptureExtendedThreads(AReport, APrimaryThreadID,
+    ABoundedRegistry, FConfig.ExtendedThreadsMax, ExtendedCaptureOperational);
 end;
 
 procedure TCrashReporterImpl.ExtendFreezeReport(var AReport: TCrashReport);
@@ -1567,7 +629,7 @@ begin
   if FConfig.FileNamePrefix <> '' then
     Result := FConfig.FileNamePrefix
   else
-    Result := GetExeBaseName + '_' + GetPlatformTag + '_';
+    Result := CrashExeBaseName + '_' + CrashPlatformTag + '_';
 end;
 
 function TCrashReporterImpl.EffectiveScanPrefix: String;
@@ -1586,46 +648,11 @@ begin
 end;
 
 function TCrashReporterImpl.EffectiveReportDir: String;
-var
-  ExeDir: String;
-  {$IF Defined(MACOS)}
-  ExePath, MacOSDir, ContentsDir, AppDir: String;
-  {$ENDIF}
 begin
-  // 1. Explicit host override always wins.
+  // An explicit host override always wins.
   if FConfig.ReportDir <> '' then
     Exit(IncludeTrailingPathDelimiter(FConfig.ReportDir));
-
-  {$IF Defined(ANDROID) or Defined(IOS)}
-  // 2. Sandboxed mobile: the "exe" lives inside the read-only app package
-  // (Android nativeLibraryDir / the iOS bundle), so ParamStr(0)'s directory is
-  // not writable. Use the app's private documents dir - always writable, needs
-  // no storage permission - which is exactly what a crash reporter wants
-  // (it must succeed even when the process is already failing).
-  ExeDir := TPath.GetDocumentsPath;
-  {$ELSEIF Defined(MACOS)}
-  // 2. macOS: if we're inside a .app bundle (.../<X>.app/Contents/MacOS/<exe>),
-  // write reports NEXT TO the bundle, never inside it - writing into a bundle
-  // breaks code signing, fails on read-only install locations, and is invisible
-  // to users (Show Package Contents only). ExpandFileName resolves a relative
-  // argv[0] (e.g. ./X launched from inside MacOS/) so the detection still works.
-  ExePath     := ExpandFileName(ParamStr(0));
-  MacOSDir    := ExcludeTrailingPathDelimiter(ExtractFilePath(ExePath));
-  ContentsDir := ExcludeTrailingPathDelimiter(ExtractFilePath(MacOSDir));
-  AppDir      := ExcludeTrailingPathDelimiter(ExtractFilePath(ContentsDir));
-  if SameText(ExtractFileName(MacOSDir), 'MacOS') and
-     SameText(ExtractFileName(ContentsDir), 'Contents') and
-     SameText(ExtractFileExt(AppDir), '.app') then
-    Exit(IncludeTrailingPathDelimiter(ExtractFilePath(AppDir)));
-  ExeDir := ExtractFilePath(ExePath);
-  {$ELSE}
-  // 3. Linux / Windows: the executable's own directory.
-  ExeDir := ExtractFilePath(ParamStr(0));
-  {$ENDIF}
-
-  if ExeDir = '' then
-    ExeDir := TPath.GetTempPath;
-  Result := IncludeTrailingPathDelimiter(ExeDir);
+  Result := CrashDefaultReportDir;
 end;
 
 function TCrashReporterImpl.BuildCrashFilePathForID(const ABugID: String): String;
@@ -1716,7 +743,7 @@ begin
       AtStr := '$' + IntToHex(Loc.CodeAddress, 16);
 
     if FConfig.AppName <> '' then AppLabel := FConfig.AppName
-    else                          AppLabel := GetExeBaseName;
+    else                          AppLabel := CrashExeBaseName;
 
     Writeln(ErrOutput);
     if ATerminating then
@@ -1733,15 +760,6 @@ begin
     // If the console is unavailable (e.g. GUI without an attached console),
     // ignore silently; the file output still works.
   end;
-end;
-
-function TCrashReporterImpl.WriteReportTextToUniqueFile(const AText: String;
-  var APath: String): Boolean;
-// Shared write core (exception path via WriteToFile, freeze path directly).
-// Never clobbers an existing report - appends a numeric suffix instead.
-// APath is emptied on failure so "saved to ..." messaging stays honest.
-begin
-  Result := CrashWriteReportTextToUniqueFile(AText, APath);
 end;
 
 function TCrashReporterImpl.WriteToFile(const AText: String): Boolean;
@@ -1762,7 +780,7 @@ begin
     FAttachFiles := nil;
     FCrashFilePath := BuildCrashFilePath;
   end;
-  Result := WriteReportTextToUniqueFile(AText, FCrashFilePath);
+  Result := CrashWriteReportTextToUniqueFile(AText, FCrashFilePath);
 end;
 
 function TCrashReporterImpl.EnsureCurrentReportPending(
@@ -1973,9 +991,9 @@ begin
   // NameThreadForDebugging), so worker threads get a generic label - the real
   // TID is shown on the "*Exception Thread: ID=..." line above.
   if TThread.CurrentThread.ThreadID = MainThreadID then
-    Ctx.ThreadName := RegisteredThreadName(CrashCurrentThreadIdentity, 'MAIN')
+    Ctx.ThreadName := FRegistry.ThreadName(CrashCurrentThreadIdentity, 'MAIN')
   else
-    Ctx.ThreadName := RegisteredThreadName(CrashCurrentThreadIdentity, 'Worker');
+    Ctx.ThreadName := FRegistry.ThreadName(CrashCurrentThreadIdentity, 'Worker');
   // Optional extra-context section provided by the host.
   if Assigned(FConfig.OnCollectContext) then
   try
@@ -2113,15 +1131,13 @@ end;
 procedure TCrashReporterImpl.Install(const AConfig: TCrashConfig);
 var
   ImageBase, ImageSize: UInt64;
-  AndroidModuleBase: UInt64;
-  AndroidImageID: TCrashAndroidBuildID;
   RawImageID: TCrashRawImageID;
 begin
   // A live runtime is strictly idempotent: a repeated Init never mutates only
   // half of the configuration. Reconfigure is Shutdown + a fresh Init.
   if not CrashAcceptInitialConfig(FInstalled, FConfig, AConfig) then
     Exit;
-  FOperationLifetime := TCrashOperationLifetime.Create;
+  FOperationLifetime := CrashNewOperationLifetime;
   FBreadcrumbs := TCrashBreadcrumbStore.Create(FConfig.BreadcrumbCapacity);
   if FConfig.ExtendedThreads then
     FExtendedCaptureOwned := CrashThreadCaptureAcquire;
@@ -2144,18 +1160,7 @@ begin
   { Recovery must see the symbol tables before it tries to symbolize a V2 raw
     address. On Android this also gives us the exact ELF build-id used to gate
     ASLR rebasing; elsewhere the call is a no-op. }
-  FillChar(RawImageID, SizeOf(RawImageID), 0);
-  if CrashAndroidGetBuildID(AndroidImageID) then
-    Move(AndroidImageID, RawImageID, SizeOf(RawImageID));
-  AndroidModuleBase := UInt64(CrashAndroidModuleBase);
-  if AndroidModuleBase <> 0 then
-  begin
-    ImageBase := AndroidModuleBase;
-    if not CrashModuleSizeForBase(ImageBase, ImageSize) then
-      ImageSize := 0;
-  end
-  else if not CrashCurrentMainImage(ImageBase, ImageSize) then
-    ImageSize := 0;
+  CrashCurrentImage(ImageBase, ImageSize, RawImageID);
 
   // Convert committed slots from previous processes before opening this
   // process's own preallocated files. Recovered .el files then flow through the
@@ -2166,7 +1171,7 @@ begin
   // installed by Init. No-op on unsupported targets or when persistence and
   // delivery are both disabled.
   CrashRawPrepare(EffectiveReportDir, EffectiveScanPrefix, FConfig.AppName,
-    FConfig.AppVersion, FConfig.CompilationTime, GetExeBaseName,
+    FConfig.AppVersion, FConfig.CompilationTime, CrashExeBaseName,
     ImageBase, ImageSize, RawImageID,
     FConfig.SaveToFile or FConfig.UploadEnabled);
 
@@ -2232,7 +1237,7 @@ begin
   end;
   // The report describes the frozen MAIN thread, not the watchdog.
   Ctx.ThreadID := Cardinal(MainThreadID);
-  Ctx.ThreadName := RegisteredThreadName(FMainThreadCoverage.ThreadID, 'MAIN');
+  Ctx.ThreadName := FRegistry.ThreadName(FMainThreadCoverage.ThreadID, 'MAIN');
   FreezeNote :=
     'Freeze Info:' + #13#10 +
     '-------------' + #13#10 +
@@ -2267,7 +1272,7 @@ begin
   if FConfig.SaveToFile or FConfig.UploadEnabled then
   begin
     Path := BuildCrashFilePathForID(Info.BugID);
-    WriteReportTextToUniqueFile(Text, Path);
+    CrashWriteReportTextToUniqueFile(Text, Path);
   end;
   Info.ReportFile := Path;
   DeliveryArmed := False;
@@ -2359,478 +1364,19 @@ begin
   end;
 end;
 
-function CrashUploadBody(const AUrl, AFieldName: String; const ABody: TBytes;
-  const AFileName: String): Boolean;
-// Self-contained multipart POST used by the facade Upload and by the startup
-// background worker. Deliberately touches NO reporter-singleton state: the
-// worker may still be running while the singleton is torn down at shutdown.
-// ABody is the file as on disk: UTF-16LE+BOM .el text or .elp package bytes.
-var
-  Client: THTTPClient;
-  Form: TMultipartFormData;
-  Bytes: TBytes;
-  Stream: TBytesStream;
-  Resp: IHTTPResponse;
-  UploadName, FieldName: String;
-begin
-  Result := False;
-  if AUrl = '' then
-    Exit;
-  // Test/dev escape: env CRASH_NO_UPLOAD=1 -> skip the POST and keep the file,
-  // so a local .el can be read without a network side effect.
-  if GetEnvironmentVariable('CRASH_NO_UPLOAD') = '1' then Exit;
-
-  Bytes := ABody;
-
-  // Server-side name = on-disk name, so logs/monitoring keep the context.
-  if AFileName <> '' then UploadName := AFileName
-  else                    UploadName := 'BugReport.el';
-
-  FieldName := AFieldName;
-  if FieldName = '' then FieldName := 'el_upload_file_0';
-
-  Stream := TBytesStream.Create(Bytes);
-  try
-    Client := THTTPClient.Create;
-    try
-      Client.ConnectionTimeout := 10000;
-      Client.ResponseTimeout := 30000;
-      Form := TMultipartFormData.Create(True);
-      try
-        Form.AddStream(FieldName, Stream, False, UploadName, 'application/octet-stream');
-        try
-          Resp := Client.Post(AUrl, Form);
-          Result := (Resp <> nil) and (Resp.StatusCode >= 200) and (Resp.StatusCode < 300);
-        except
-          // Network errors must not crash the process. The file is on disk, the
-          // report isn't lost.
-          Result := False;
-        end;
-      finally
-        Form.Free;
-      end;
-    finally
-      Client.Free;
-    end;
-  finally
-    Stream.Free;
-  end;
-end;
-
-function CrashUploadCore(const AUrl, AFieldName, AReportText,
-  AFileName: String): Boolean;
-begin
-  Result := CrashUploadBody(AUrl, AFieldName,
-    CrashReportUploadBody(AReportText, ''), AFileName);
-end;
-
-function CrashQueueUpload(const AUrl, AFieldName, AReportText,
-  AReportPath: String; const AOnComplete: TCrashUploadCompleteProc;
-  const ALifetime: ICrashOperationLifetime): Boolean;
-begin
-  Result := CrashQueueUploadWithTransport(AUrl, AFieldName, AReportText,
-    AReportPath, nil, AOnComplete, ALifetime);
-end;
-
-function CrashQueueUploadWithTransport(const AUrl, AFieldName, AReportText,
-  AReportPath: String; const ATransport: TCrashUploadWorkerProc;
-  const AOnComplete: TCrashUploadCompleteProc;
-  const ALifetime: ICrashOperationLifetime): Boolean;
-var
-  UploadUrl, UploadField, UploadText, UploadPath: String;
-  CompleteProc: TCrashUploadCompleteProc;
-  TransportProc: TCrashUploadWorkerProc;
-  Lifetime: ICrashOperationLifetime;
-begin
-  Result := False;
-  if (ALifetime <> nil) and (not ALifetime.Active) then
-    Exit;
-  // Capture only immutable values. The worker never dereferences GReporter and
-  // therefore remains safe if finalization starts while HTTP is still active.
-  UploadUrl := AUrl;
-  UploadField := AFieldName;
-  UploadText := AReportText;
-  UploadPath := AReportPath;
-  CompleteProc := AOnComplete;
-  TransportProc := ATransport;
-  Lifetime := ALifetime;
-  TThread.CreateAnonymousThread(
-    procedure
-    var
-      Success: Boolean;
-      Body: TBytes;
-    begin
-      Success := False;
-      try
-        Body := CrashReportUploadBody(UploadText, UploadPath);
-        if Assigned(TransportProc) then
-          Success := TransportProc(UploadUrl, UploadField, UploadText,
-            ExtractFileName(UploadPath), Body)
-        else
-          Success := CrashUploadBody(UploadUrl, UploadField, Body,
-            ExtractFileName(UploadPath));
-      except
-        // Unreadable package: the report and its marker stay for startup.
-      end;
-      if Success then
-        CrashDeleteReportAndPendingMarker(UploadPath);
-      if Assigned(CompleteProc) and
-         ((Lifetime = nil) or Lifetime.Active) then
-        TThread.ForceQueue(nil,
-          procedure
-          begin
-            if (Lifetime <> nil) and (not Lifetime.Active) then
-              Exit;
-            try
-              CompleteProc(Success);
-            except
-              // A completion callback cannot affect delivery state.
-            end;
-          end);
-    end).Start;
-  Result := True;
-end;
-
-{$IFDEF AUTOTESTS}
-function CrashAutoTestQueueUpload(const AReportText, AReportPath: String;
-  const ATransport: TCrashAutoTestUploadProc;
-  const AOnComplete: TCrashUploadCompleteProc): Boolean;
-var
-  WorkerTransport: TCrashUploadWorkerProc;
-begin
-  Result := False;
-  if not Assigned(ATransport) then
-    Exit;
-  WorkerTransport :=
-    function(const AUrl, AFieldName, AText, AFileName: String;
-      const ABody: TBytes): Boolean
-    begin
-      Result := ATransport(AUrl, AFieldName, AText, AFileName);
-    end;
-  try
-    Result := CrashQueueUploadWithTransport('autotest://upload', 'fixture',
-      AReportText, AReportPath, WorkerTransport, AOnComplete, nil);
-  except
-    // The test observes a failed queue request directly.
-  end;
-end;
-
-function CrashAutoTestQueueUploadBody(const AReportText, AReportPath: String;
-  const ATransport: TCrashAutoTestUploadBodyProc): Boolean;
-var
-  WorkerTransport: TCrashUploadWorkerProc;
-begin
-  Result := False;
-  if not Assigned(ATransport) then
-    Exit;
-  WorkerTransport :=
-    function(const AUrl, AFieldName, AText, AFileName: String;
-      const ABody: TBytes): Boolean
-    begin
-      Result := ATransport(AFileName, ABody);
-    end;
-  try
-    Result := CrashQueueUploadWithTransport('autotest://upload', 'fixture',
-      AReportText, AReportPath, WorkerTransport, nil, nil);
-  except
-  end;
-end;
-{$ENDIF}
-
-function CrashELContainsRawCaptureKey(const AFilePath,
-  ACaptureKey: String): Boolean;
-var
-  Text: String;
-begin
-  Result := False;
-  if (AFilePath = '') or (ACaptureKey = '') then
-    Exit;
-  try
-    Text := TFile.ReadAllText(AFilePath, TEncoding.Unicode);
-    Result := Pos('Raw Capture Key: ' + ACaptureKey, Text) > 0;
-  except
-  end;
-end;
-
-{$IFDEF AUTOTESTS}
-function CrashAutoTestELContainsRawCaptureKey(const AFilePath,
-  ACaptureKey: String): Boolean;
-begin
-  Result := CrashELContainsRawCaptureKey(AFilePath, ACaptureKey);
-end;
-
-function CrashAutoTestFormatParameters(const AArguments,
-  AAllowList: TArray<String>; const AIncludeAll: Boolean;
-  const ASanitizer: TCrashSanitizeParametersProc): String;
-begin
-  Result := CrashFormatParameters(AArguments, AAllowList, AIncludeAll,
-    ASanitizer);
-end;
-
-function CrashAutoTestRenderFileName(const ATemplate, AApp, AVersion,
-  ABugID: String): String;
-begin
-  Result := CrashRenderFileNameTemplate(ATemplate, AApp, AVersion, ABugID);
-end;
-
-function CrashAutoTestTemplateScanPrefix(const ATemplate, AApp: String): String;
-begin
-  Result := CrashTemplateScanPrefix(ATemplate, AApp);
-end;
-
-function CrashAutoTestAcceptInitialConfig(var AInstalled: Boolean;
-  var ACurrent: TCrashConfig; const AIncoming: TCrashConfig): Boolean;
-begin
-  Result := CrashAcceptInitialConfig(AInstalled, ACurrent, AIncoming);
-end;
-
-function CrashAutoTestOperationLifetimeGate: Boolean;
-var
-  TestResult: Boolean;
-begin
-  TestResult := False;
-  // Unit tests run on a registry worker. Observe ForceQueue from the actual
-  // main thread, where CheckSynchronize is legal.
-  TThread.Synchronize(nil,
-    procedure
-    var
-      Lifetime: ICrashOperationLifetime;
-      Gate, Entered, TransportDone: TEvent;
-      CallbackCalled, GateResult: Boolean;
-      Deadline: UInt64;
-    begin
-      Lifetime := TCrashOperationLifetime.Create;
-      Gate := TEvent.Create(nil, True, False, '');
-      Entered := TEvent.Create(nil, True, False, '');
-      TransportDone := TEvent.Create(nil, True, False, '');
-      try
-        CallbackCalled := False;
-        GateResult := Lifetime.Active and CrashQueueUploadWithTransport(
-          'autotest://lifetime', 'fixture', 'fixture', 'fixture.el',
-          function(const AUrl, AFieldName, AText, AFileName: String;
-            const ABody: TBytes): Boolean
-          begin
-            Entered.SetEvent;
-            Gate.WaitFor(2000);
-            TransportDone.SetEvent;
-            Result := False;
-          end,
-          procedure(const ASuccess: Boolean)
-          begin
-            CallbackCalled := True;
-          end,
-          Lifetime);
-        GateResult := GateResult and (Entered.WaitFor(2000) = wrSignaled);
-        Lifetime.Deactivate;
-        Gate.SetEvent;
-        GateResult := GateResult and (not Lifetime.Active) and
-          (TransportDone.WaitFor(2000) = wrSignaled);
-        // Give the worker time to cross the post-transport gate and pump the
-        // main queue. An incorrectly queued callback becomes observable here.
-        Deadline := TThread.GetTickCount64 + 250;
-        repeat
-          CheckSynchronize(0);
-          if CallbackCalled then
-            Break;
-          TThread.Sleep(5);
-        until TThread.GetTickCount64 >= Deadline;
-        TestResult := GateResult and (not CallbackCalled);
-      finally
-        Gate.SetEvent;
-        TransportDone.WaitFor(2000);
-        TransportDone.Free;
-        Entered.Free;
-        Gate.Free;
-      end;
-    end);
-  Result := TestResult;
-end;
-{$ENDIF}
-
-function TCrashReporterImpl.WriteRecoveredRawReport(
-  const ARaw: TCrashRawRecord): Boolean;
-var
-  Report: TCrashReport;
-  Ctx: TCrashELContext;
-  Text, Path: String;
-  IP, FaultAddr, ThreadID: UInt64;
-  CurrentImageBase, CurrentImageSize: UInt64;
-  AndroidModuleBase: UInt64;
-  RebasedIP, ModuleOffset, RoutineOffset, CapturedImageEnd: UInt64;
-  SignalNum, SignalCode: Integer;
-  Rebased: Boolean;
-  AndroidImageID: TCrashAndroidBuildID;
-  CurrentImageID: TCrashRawImageID;
-  Address: array[0..0] of UIntPtr;
-begin
-  Result := False;
-  Report := Default(TCrashReport);
-  if ARaw.PayloadKind = rpkPrimary then
-  begin
-    IP := CrashRawPrimaryIP(ARaw.Primary);
-    FaultAddr := ARaw.Primary.FaultAddr;
-    ThreadID := ARaw.Primary.ThreadID;
-    SignalNum := ARaw.Primary.SignalNum;
-    SignalCode := ARaw.Primary.SignalCode;
-    Report.ExceptionClassName := 'ERawHardwareFault';
-  end
-  else if ARaw.PayloadKind = rpkConcurrent then
-  begin
-    IP := ARaw.Concurrent.IP;
-    FaultAddr := ARaw.Concurrent.FaultAddr;
-    ThreadID := ARaw.Concurrent.ThreadID;
-    SignalNum := ARaw.Concurrent.SignalNum;
-    SignalCode := ARaw.Concurrent.SignalCode;
-    Report.ExceptionClassName := 'ERawConcurrentHardwareFault';
-  end
-  else
-    Exit;
-
-  Report.ExceptionMessage := Format(
-    'Committed raw fallback recovered signal %d (code=%d, fault=%s)',
-    [SignalNum, SignalCode, IntToHex(FaultAddr, SizeOf(Pointer) * 2)]);
-  Report.Source := csFatalProc;
-  AndroidModuleBase := UInt64(CrashAndroidModuleBase);
-  if AndroidModuleBase <> 0 then
-  begin
-    CurrentImageBase := AndroidModuleBase;
-    if not CrashModuleSizeForBase(CurrentImageBase, CurrentImageSize) then
-      CurrentImageSize := 0;
-  end
-  else if not CrashCurrentMainImage(CurrentImageBase, CurrentImageSize) then
-    CurrentImageSize := 0;
-  FillChar(CurrentImageID, SizeOf(CurrentImageID), 0);
-  if CrashAndroidGetBuildID(AndroidImageID) then
-    Move(AndroidImageID, CurrentImageID, SizeOf(CurrentImageID));
-  Rebased := CrashRawTryRebaseAddress(ARaw, IP, CurrentImageBase,
-    CurrentImageSize, CurrentImageID, FConfig.CompilationTime,
-    RebasedIP, ModuleOffset);
-  if Rebased then
-    Address[0] := UIntPtr(RebasedIP)
-  else
-    Address[0] := UIntPtr(IP);
-  if IP <> 0 then
-    Report.CallStack := TCrashCapture.SymbolizeAddressList(Address);
-  if Rebased and (Length(Report.CallStack) > 0) and
-     (UInt64(Report.CallStack[0].ModuleAddress) = CurrentImageBase) then
-  begin
-    { Resolution ran in this process, but the report must retain addresses from
-      the crashed process. Keep names/source/line and translate the resolved
-      module/routine addresses back to the captured ASLR range. }
-    Report.CallStack[0].CodeAddress := UIntPtr(IP);
-    Report.CallStack[0].ModuleAddress := UIntPtr(ARaw.ImageBase);
-    if UInt64(Report.CallStack[0].RoutineAddress) >= CurrentImageBase then
-    begin
-      RoutineOffset := UInt64(Report.CallStack[0].RoutineAddress) -
-        CurrentImageBase;
-      if (RoutineOffset < ARaw.ImageSize) and
-         (ARaw.ImageBase <= High(UInt64) - RoutineOffset) then
-        Report.CallStack[0].RoutineAddress :=
-          UIntPtr(ARaw.ImageBase + RoutineOffset)
-      else
-        Report.CallStack[0].RoutineAddress := 0;
-    end
-    else
-      Report.CallStack[0].RoutineAddress := 0;
-  end;
-  if Length(Report.CallStack) > 0 then
-    Report.ExceptionLocation := Report.CallStack[0]
-  else
-  begin
-    Report.ExceptionLocation.Clear;
-    Report.ExceptionLocation.CodeAddress := UIntPtr(IP);
-  end;
-
-  Ctx := CrashDefaultELContext(FAppStartTime, UIntPtr(IP), False);
-  if ARaw.InitUnixSeconds > 0 then
-    Ctx.StartTime := UnixToDateTime(ARaw.InitUnixSeconds, False);
-  try
-    Ctx.ExceptionTime := TFile.GetLastWriteTime(ARaw.FilePath);
-  except
-    Ctx.ExceptionTime := Now;
-  end;
-  Ctx.AppParameters := '';
-  if ARaw.AppName <> '' then
-    Ctx.AppName := ARaw.AppName
-  else if ARaw.ExeName <> '' then
-    Ctx.AppName := ARaw.ExeName
-  else if FConfig.AppName <> '' then
-    Ctx.AppName := FConfig.AppName;
-  Ctx.AppVersion := ARaw.AppVersion;
-  Ctx.CompileTime := ARaw.CompilationTime;
-  Ctx.ThreadID := Cardinal(ThreadID);
-  Ctx.ThreadName := 'RAW';
-  Ctx.DisabledSections := FConfig.DisabledSections;
-  CrashFormatRecoveredRaw(ARaw, Ctx.CpuSnapshot, Ctx.SignalInfoSection);
-  Ctx.SignalInfoSection := Ctx.SignalInfoSection + #13#10 +
-    '  Raw Format : v' + IntToStr(ARaw.FormatVersion);
-  if ARaw.FormatVersion >= CRASH_RAW_VERSION then
-  begin
-    if ARaw.ImageBase <= High(UInt64) - ARaw.ImageSize then
-      CapturedImageEnd := ARaw.ImageBase + ARaw.ImageSize
-    else
-      CapturedImageEnd := High(UInt64);
-    Ctx.SignalInfoSection := Ctx.SignalInfoSection + #13#10 +
-      '  Image Range: ' + IntToHex(ARaw.ImageBase, SizeOf(Pointer) * 2) +
-      '..' + IntToHex(CapturedImageEnd, SizeOf(Pointer) * 2);
-  end;
-  if Rebased then
-    Ctx.SignalInfoSection := Ctx.SignalInfoSection + #13#10 +
-      '  Rebased    : module offset ' +
-      IntToHex(ModuleOffset, SizeOf(Pointer) * 2) + ', current base ' +
-      IntToHex(CurrentImageBase, SizeOf(Pointer) * 2) + ', current size ' +
-      IntToHex(CurrentImageSize, SizeOf(Pointer) * 2);
-  CrashCollectELModules(Ctx);
-  Text := CrashBuildELReportText(Report, Ctx);
-
-  FExceptionID := CrashGenerateExceptionID(Report);
-  Path := BuildCrashFilePath;
-  Result := CrashWriteReportTextToUniqueFile(Text, Path);
-  FExceptionID := '';
-end;
-
 procedure TCrashReporterImpl.RecoverRawFallbackReports;
 var
-  Dir, Pattern, RawPath, ELPath: String;
-  RawFiles, ELFiles: TArray<String>;
-  Raw: TCrashRawRecord;
-  Duplicate: Boolean;
+  Context: TCrashRawRecoveryContext;
 begin
-  Dir := EffectiveReportDir;
-  if Dir = '' then
-    Exit;
-  RawFiles := CrashRawEnumerateFiles(Dir, EffectiveScanPrefix);
-  if Length(RawFiles) = 0 then
-    Exit;
-  Pattern := EffectiveScanPrefix + '*.el';
-  try
-    ELFiles := TDirectory.GetFiles(Dir, Pattern);
-  except
-    ELFiles := nil;
-  end;
-  for RawPath in RawFiles do
-  begin
-    if not CrashRawReadBlock(RawPath, Raw) then
-    begin
-      if CrashRawFileIsAbandoned(RawPath) or CrashRawFileIsStale(RawPath) then
-        CrashRawDeleteFile(RawPath);
-      Continue;
-    end;
-    if CrashRawRecordOwnedByLiveProcess(Raw) then
-      Continue;
-    Duplicate := False;
-    for ELPath in ELFiles do
-      if CrashELContainsRawCaptureKey(ELPath, Raw.CaptureKey) then
-      begin
-        Duplicate := True;
-        Break;
-      end;
-    if Duplicate or WriteRecoveredRawReport(Raw) then
-    begin
-      CrashRawDeleteFile(RawPath);
-      CrashRawDeleteUntouchedSibling(Raw);
-    end;
-  end;
+  Context := Default(TCrashRawRecoveryContext);
+  Context.ReportDir := EffectiveReportDir;
+  Context.ScanPrefix := EffectiveScanPrefix;
+  Context.AppName := FConfig.AppName;
+  Context.CompilationTime := FConfig.CompilationTime;
+  Context.DisabledSections := FConfig.DisabledSections;
+  Context.AppStartTime := FAppStartTime;
+  Context.PathForID := BuildCrashFilePathForID;
+  CrashRecoverRawFallbackReports(Context);
 end;
 
 procedure TCrashReporterImpl.ScanPendingCrashReports;
@@ -2903,31 +1449,8 @@ begin
 
   // Upload OFF the startup path. The worker owns immutable copies and never
   // dereferences the reporter singleton during or after finalization.
-  var UploadUrl := FConfig.UploadUrl;
-  var UploadField := FConfig.UploadFieldName;
-  TThread.CreateAnonymousThread(
-    procedure
-    var
-      I: Integer;
-      UpFile, UpText: String;
-    begin
-      for I := 0 to High(StartupUploadFiles) do
-      begin
-        UpFile := StartupUploadFiles[I];
-        try
-          if CrashIsPackagedReport(UpFile) then
-            UpText := ''
-          else
-            UpText := TFile.ReadAllText(UpFile, TEncoding.Unicode);
-          if CrashUploadBody(UploadUrl, UploadField,
-               CrashReportUploadBody(UpText, UpFile),
-               ExtractFileName(UpFile)) then
-            CrashDeleteReportAndPendingMarker(UpFile);
-        except
-          // Unreadable/upload failure: report and marker stay for a later boot.
-        end;
-      end;
-    end).Start;
+  CrashQueueStartupUploads(FConfig.UploadUrl, FConfig.UploadFieldName,
+    StartupUploadFiles);
 end;
 
 function TCrashReporterImpl.TakePendingCrashReports: TArray<String>;
@@ -3013,8 +1536,7 @@ begin
   Reporter := GReporter;
   if Reporter = nil then
     Exit;
-  if (GCoverageReporter = Pointer(Reporter)) and
-     (GCoverageReporterInstanceID = Reporter.FInstanceID) then
+  if Reporter.FRegistry.OwnsCurrentThread then
     UnregisterCurrentThread;
   GReporter := nil;
   Reporter.Free;
@@ -3058,140 +1580,29 @@ class function TCrashReporter.RegisterCurrentThread(const AName: String;
   const AGroupID: UInt64): TCrashThreadCoverage;
 var
   Reporter: TCrashReporterImpl;
-  Registration, Existing: TCrashThreadRegistration;
-  NativeIdentity: TCrashThreadNativeIdentity;
-  CaptureHandle: TCrashThreadCaptureHandle;
 begin
   Result := Default(TCrashThreadCoverage);
   Reporter := GReporter;
   if (Reporter = nil) or (not Reporter.FInstalled) then
     Exit;
-
-  Result.ThreadID := CrashCurrentThreadIdentity;
-  // Fast idempotent path. The TLS owner prevents an abandoned registration with
-  // a recycled native identity being mistaken for this caller.
-  if (GCoverageReporter = Pointer(Reporter)) and
-     (GCoverageReporterInstanceID = Reporter.FInstanceID) and
-     (GCoverageRegistration <> nil) then
-  begin
-    Reporter.FLock.Enter;
-    try
-      Existing := TCrashThreadRegistration(GCoverageRegistration);
-      if (Reporter.FThreadRegistrations.IndexOf(Existing) >= 0) and
-         (not Existing.Closing) then
-        Exit(Existing.Coverage);
-    finally
-      Reporter.FLock.Leave;
-    end;
-  end;
-
-  Result.Registered := True;
-  Result.Name := CrashSanitizeThreadName(AName);
-  Result.GroupID := AGroupID;
-  Result.AltStack := CrashRegisterAltStackForCurrentThread;
-  Result.MachHandler := CrashRegisterMachForCurrentThread;
-  NativeIdentity := CrashCurrentThreadNativeIdentity;
-  CaptureHandle := nil;
-  if Reporter.ExtendedCaptureOperational then
-    CrashThreadCaptureRegisterCurrentThread(CaptureHandle);
-  Result.ExtendedCaptureAvailable := CaptureHandle <> nil;
-
-  Registration := TCrashThreadRegistration.Create;
-  Registration.Coverage := Result;
-  Registration.NativeIdentity := NativeIdentity;
-  Registration.CaptureHandle := CaptureHandle;
-  Reporter.FLock.Enter;
-  try
-    // A dead owner can leave a calm-path record behind. The capture service has
-    // already resolved a pthread_t collision using the second kernel identity;
-    // invalidate the reporter record so a lease result cannot inherit its name.
-    for Existing in Reporter.FThreadRegistrations do
-      if (not Existing.Closing) and
-         ((Existing.Coverage.ThreadID = Result.ThreadID) or
-          ((NativeIdentity.PThread <> 0) and
-           (Existing.NativeIdentity.PThread = NativeIdentity.PThread))) then
-      begin
-        Existing.Closing := True;
-        Existing.CaptureHandle := nil;
-      end;
-    Reporter.SweepClosedRegistrationsLocked;
-    Inc(Reporter.FRegistrationSequence);
-    Registration.Sequence := Reporter.FRegistrationSequence;
-    Reporter.FThreadRegistrations.Add(Registration);
-  finally
-    Reporter.FLock.Leave;
-  end;
-  GCoverageReporter := Pointer(Reporter);
-  GCoverageReporterInstanceID := Reporter.FInstanceID;
-  GCoverageRegistration := Registration;
+  Result := Reporter.FRegistry.RegisterCurrentThread(AName, AGroupID,
+    Reporter.ExtendedCaptureOperational);
 end;
 
 class procedure TCrashReporter.UnregisterCurrentThread;
 var
   Reporter: TCrashReporterImpl;
-  Registration: TCrashThreadRegistration;
-  CaptureHandle: TCrashThreadCaptureHandle;
-  Leases: Integer;
-  Found: Boolean;
 begin
-  Reporter := TCrashReporterImpl(GCoverageReporter);
-  Registration := TCrashThreadRegistration(GCoverageRegistration);
-  CaptureHandle := nil;
-  Found := False;
-  if (Reporter <> nil) and (Reporter = GReporter) and
-     (GCoverageReporterInstanceID = Reporter.FInstanceID) and
-     (Registration <> nil) then
-  begin
-    Reporter.FLock.Enter;
-    try
-      if Reporter.FThreadRegistrations.IndexOf(Registration) >= 0 then
-      begin
-        Found := True;
-        Registration.Closing := True;
-        Registration.UnregisterWaiting := True;
-        CaptureHandle := Registration.CaptureHandle;
-      end;
-    finally
-      Reporter.FLock.Leave;
-    end;
-
-    if Found then
-    begin
-      // At most the currently running bounded capture holds a lease. Do not free
-      // its owned record/slot until the coordinator has published its verdict.
-      repeat
-        Reporter.FLock.Enter;
-        try
-          Leases := Registration.CaptureLeaseCount;
-        finally
-          Reporter.FLock.Leave;
-        end;
-        if Leases = 0 then
-          Break;
-        TThread.Sleep(1);
-      until False;
-
-      if CaptureHandle <> nil then
-        CrashThreadCaptureUnregisterCurrentThread(CaptureHandle);
-      Reporter.FLock.Enter;
-      try
-        Reporter.FThreadRegistrations.Remove(Registration);
-      finally
-        Reporter.FLock.Leave;
-      end;
-    end;
-  end;
-  GCoverageReporter := nil;
-  GCoverageReporterInstanceID := 0;
-  GCoverageRegistration := nil;
-  CrashUnregisterAltStackForCurrentThread;
+  Reporter := GReporter;
+  if Reporter <> nil then
+    TCrashThreadRegistry.UnregisterCurrentThread(Reporter.FRegistry)
+  else
+    TCrashThreadRegistry.UnregisterCurrentThread(nil);
 end;
 
 class function TCrashReporter.GetStatus: TCrashStatus;
 var
   Reporter: TCrashReporterImpl;
-  Registration: TCrashThreadRegistration;
-  I: Integer;
 begin
   Result := Default(TCrashStatus);
   Reporter := GReporter;
@@ -3206,28 +1617,11 @@ begin
   Reporter.FLock.Enter;
   try
     Result.MainThread := Reporter.FMainThreadCoverage;
-    Result.RegisteredThreadCount := 0;
-    for Registration in Reporter.FThreadRegistrations do
-      if not Registration.Closing then
-        Inc(Result.RegisteredThreadCount);
-    SetLength(Result.Threads, Result.RegisteredThreadCount);
-    I := 0;
-    for Registration in Reporter.FThreadRegistrations do
-      if not Registration.Closing then
-      begin
-        Result.Threads[I] := Registration.Coverage;
-        Inc(I);
-      end;
-    if (GCoverageReporter = Pointer(Reporter)) and
-       (GCoverageReporterInstanceID = Reporter.FInstanceID) and
-       (GCoverageRegistration <> nil) and
-       (Reporter.FThreadRegistrations.IndexOf(
-          TCrashThreadRegistration(GCoverageRegistration)) >= 0) then
-      Result.CurrentThread :=
-        TCrashThreadRegistration(GCoverageRegistration).Coverage;
   finally
     Reporter.FLock.Leave;
   end;
+  Reporter.FRegistry.Snapshot(Result.Threads, Result.CurrentThread);
+  Result.RegisteredThreadCount := Length(Result.Threads);
 end;
 
 class function TCrashReporter.LastCrashFileName: String;
@@ -3260,7 +1654,7 @@ begin
   if (GReporter = nil) or (not GReporter.FConfig.UploadEnabled) or
      (GReporter.FConfig.UploadUrl = '') then
     Exit;
-  Result := CrashUploadCore(GReporter.FConfig.UploadUrl,
+  Result := CrashUploadReportText(GReporter.FConfig.UploadUrl,
     GReporter.FConfig.UploadFieldName, AReportText, AFileName);
 end;
 
@@ -3321,343 +1715,12 @@ class function TCrashReporter.CanRestart: Boolean;
 begin
   if (GReporter <> nil) and (not GReporter.FConfig.AllowRestart) then
     Exit(False);
-  {$IF Defined(MSWINDOWS) or Defined(LINUX) or (Defined(MACOS) and not Defined(IOS))}
-  Result := True;
-  {$ELSE}
-  Result := False; // iOS/Android sandbox - not allowed
-  {$ENDIF}
+  Result := CrashRestartPlatformSupported;
 end;
-
-{$IF not Defined(MSWINDOWS)}
-// POSIX fork/execv
-function fork: pid_t; cdecl; external libc name _PU + 'fork';
-function execv(path: MarshaledAString; argv: PMarshaledAString): Integer; cdecl;
-  external libc name _PU + 'execv';
-
-{$IF Defined(LINUX)}
-// close_range(2) via the raw syscall: the libc wrapper only exists in
-// glibc 2.34+, and an unresolved import would stop the binary from LOADING on
-// older distros - syscall() resolves everywhere, an old kernel just returns
-// ENOSYS and the caller falls back to the fcntl loop.
-function syscall(ANumber: IntPtr): IntPtr; cdecl; varargs;
-  external libc name _PU + 'syscall';
-
-const
-  SYS_close_range      = 436; // x86-64
-  CLOSE_RANGE_CLOEXEC  = 4;   // mark instead of close
-{$ENDIF}
-
-type
-  // struct rlimit; rlim_t is 64-bit on every target built here. The RTL has
-  // no Posix.SysResource unit, hence the local declaration.
-  TCrashRLimit = record
-    rlim_cur: UInt64;
-    rlim_max: UInt64;
-  end;
-
-const
-  CRASH_RLIMIT_NOFILE = {$IF Defined(MACOS)} 8 {$ELSE} 7 {$ENDIF};
-
-function getrlimit(resource: Integer; var rlp: TCrashRLimit): Integer; cdecl;
-  external libc name _PU + 'getrlimit';
-
-function CrashSetCloseOnExec(const AFd: Integer): Boolean;
-// One sweep step. EINTR = retry; EBADF = a hole in the table, fine; any
-// other error on a live descriptor means the sweep cannot vouch for it.
-var
-  RC: Integer;
-begin
-  repeat
-    RC := fcntl(AFd, F_SETFD, FD_CLOEXEC);
-  until (RC = 0) or (errno <> EINTR);
-  Result := (RC = 0) or (errno = EBADF);
-end;
-
-function CrashMarkFDsCloseOnExecBySweep(const AFdLimit: Integer): Boolean;
-var
-  Fd: Integer;
-begin
-  Result := True;
-  for Fd := 3 to AFdLimit - 1 do
-    if not CrashSetCloseOnExec(Fd) then
-      Result := False; // keep sweeping - mark as much as possible - but report
-end;
-
-function CrashFdSweepLimitFromRLimit(const ARlimCur: UInt64): Integer;
-begin
-  if ARlimCur <= UInt64(High(Integer)) then
-    Result := Integer(ARlimCur)
-  else
-    Result := -1;
-end;
-
-{$IF Defined(LINUX)}
-const
-  SYS_getdents64     = 217;    // x86-64
-  CRASH_O_DIRECTORY  = $10000; // Linux x86-64 O_DIRECTORY
-  CRASH_O_CLOEXEC    = $80000; // Linux O_CLOEXEC
-
-function CrashMarkFDsCloseOnExecViaProcFS: Boolean;
-// Walk the ACTUALLY open descriptors via /proc/self/fd - raw syscalls only
-// (open/getdents64/close; libc readdir allocates and is not
-// async-signal-safe). No range bound: any fd number is reached.
-var
-  DirFd: Integer;
-  Buf: array [0..1023] of Byte;
-  NRead, Off: IntPtr;
-  Name: PAnsiChar;
-  Fd: Integer;
-  Ok: Boolean;
-
-  function ParseFdName(P: PAnsiChar; out AFd: Integer): Boolean;
-  var
-    V: Integer;
-  begin
-    Result := False;
-    if P^ = #0 then
-      Exit;
-    V := 0;
-    while P^ <> #0 do
-    begin
-      if (P^ < '0') or (P^ > '9') then
-        Exit; // '.', '..'
-      V := V * 10 + (Ord(P^) - Ord('0'));
-      Inc(P);
-    end;
-    AFd := V;
-    Result := True;
-  end;
-
-begin
-  Result := False;
-  repeat
-    DirFd := Posix.Fcntl.open('/proc/self/fd',
-      O_RDONLY or CRASH_O_DIRECTORY or CRASH_O_CLOEXEC);
-  until (DirFd >= 0) or (errno <> EINTR);
-  if DirFd < 0 then
-    Exit;
-  Ok := True;
-  repeat
-    NRead := syscall(SYS_getdents64, IntPtr(DirFd), IntPtr(@Buf[0]),
-      IntPtr(SizeOf(Buf)));
-    if NRead < 0 then
-    begin
-      if errno = EINTR then
-        Continue;
-      Ok := False;
-      Break;
-    end;
-    Off := 0;
-    while Off < NRead do
-    begin
-      // struct linux_dirent64: u64 d_ino; s64 d_off; u16 d_reclen;
-      // u8 d_type; char d_name[]
-      Name := PAnsiChar(@Buf[Off + 19]);
-      if ParseFdName(Name, Fd) and (Fd >= 3) and (Fd <> DirFd) then
-        if not CrashSetCloseOnExec(Fd) then
-          Ok := False;
-      Inc(Off, PWord(@Buf[Off + 16])^);
-    end;
-  until NRead = 0;
-  __close(DirFd);
-  Result := Ok;
-end;
-{$ENDIF}
-
-function CrashChildMarkFDsCloseOnExec(const AFdLimit: Integer): Boolean;
-// Runs IN THE CHILD between fork and execv: mark every fd >= 3 close-on-exec
-// so the exec'd replacement starts with only stdio (see the interface
-// comment). Everything here is async-signal-safe; the sweep limit is read by
-// the PARENT before fork and passed in. The confirmation pipe's write end is
-// caught too - it is already CLOEXEC, and a failed execv can still write
-// into it (CLOEXEC only acts on a successful exec). False = the fd table
-// cannot be vouched for; the caller must NOT exec.
-begin
-  {$IF Defined(LINUX)}
-  if syscall(SYS_close_range, IntPtr(3), IntPtr(High(Cardinal)),
-       IntPtr(CLOSE_RANGE_CLOEXEC)) = 0 then
-    Exit(True);
-  if CrashMarkFDsCloseOnExecViaProcFS then
-    Exit(True);
-  {$ENDIF}
-  if AFdLimit < 0 then
-    Exit(False); // no exact bound: never run a knowingly incomplete sweep
-  Result := CrashMarkFDsCloseOnExecBySweep(AFdLimit);
-end;
-
-function CrashSpawnDetachedVerified(const AExePath: String;
-  const AArgv: TArray<String>): Boolean;
-var
-  ChildPid: pid_t;
-  ArgBytes: array of TBytes;
-  Argv: array of MarshaledAString;
-  ExePath: TBytes;
-  I, FdLimit, WStatus: Integer;
-  RLim: TCrashRLimit;
-  Fds: TPipeDescriptors;
-  Confirm: Byte;
-  N: ssize_t;
-begin
-  Result := False;
-  // Marshal argv BEFORE fork: in the child of a multithreaded process only
-  // async-signal-safe calls are allowed until execv - a heap allocation there
-  // can deadlock on a lock another thread held at fork time.
-  ExePath := TEncoding.UTF8.GetBytes(AExePath);
-  SetLength(ExePath, Length(ExePath) + 1); // null-terminate
-  SetLength(ArgBytes, Length(AArgv));
-  SetLength(Argv, Length(AArgv) + 1); // +1 for the NULL terminator
-  for I := 0 to High(AArgv) do
-  begin
-    ArgBytes[I] := TEncoding.UTF8.GetBytes(AArgv[I]);
-    SetLength(ArgBytes[I], Length(ArgBytes[I]) + 1); // null-terminate
-    Argv[I] := MarshaledAString(@ArgBytes[I][0]);
-  end;
-  Argv[Length(AArgv)] := nil;
-
-  // Exact bound for the LAST-RESORT bounded sweep (Linux normally takes
-  // close_range or the /proc walk - neither needs one; macOS has no unbounded
-  // primitive). A finite representable rlim_cur is the honest limit: no fd at
-  // or above it can exist. A failed getrlimit, RLIM_INFINITY or a value beyond
-  // Integer cannot be swept completely by this loop, so keep the -1 sentinel:
-  // Linux may still succeed through an unbounded level; otherwise the child
-  // aborts before execv. Read in the parent because getrlimit is not on the
-  // async-signal-safe list.
-  FdLimit := -1;
-  if getrlimit(CRASH_RLIMIT_NOFILE, RLim) = 0 then
-    FdLimit := CrashFdSweepLimitFromRLimit(RLim.rlim_cur);
-
-  // Exec-confirmation channel (see the interface comment). Fail-closed: a
-  // spawn we cannot confirm is a spawn we do not attempt - the caller keeps
-  // the process alive instead of exiting on a guess.
-  if pipe(Fds) <> 0 then
-    Exit;
-  if fcntl(Fds.WriteDes, F_SETFD, FD_CLOEXEC) <> 0 then
-  begin
-    __close(Fds.ReadDes);
-    __close(Fds.WriteDes);
-    Exit;
-  end;
-
-  ChildPid := fork;
-  if ChildPid = 0 then
-  begin
-    // Child: detach from the parent's fd table before exec - only stdio and
-    // the (CLOEXEC) confirmation pipe may cross into the replacement. A table
-    // the sweep cannot vouch for aborts the spawn: marker + _exit(126).
-    if not CrashChildMarkFDsCloseOnExec(FdLimit) then
-    begin
-      Confirm := 2;
-      repeat
-        N := __write(Fds.WriteDes, @Confirm, 1);
-      until (N = 1) or ((N < 0) and (errno <> EINTR));
-      Posix.Unistd._exit(126);
-    end;
-    // If execv returns, it failed - report through the pipe (the write
-    // retried across EINTR: a lost marker byte would read as success), then
-    // _exit, not Halt: unit finalization is not fork-safe either. (write and
-    // _exit are async-signal-safe.)
-    execv(MarshaledAString(@ExePath[0]), @Argv[0]);
-    Confirm := 1;
-    repeat
-      N := __write(Fds.WriteDes, @Confirm, 1);
-    until (N = 1) or ((N < 0) and (errno <> EINTR));
-    Posix.Unistd._exit(127);
-  end;
-  if ChildPid = -1 then
-  begin
-    // fork failed - nothing was spawned.
-    __close(Fds.ReadDes);
-    __close(Fds.WriteDes);
-    Exit;
-  end;
-  __close(Fds.WriteDes);
-  repeat
-    N := __read(Fds.ReadDes, @Confirm, 1);
-  until (N >= 0) or (errno <> EINTR);
-  __close(Fds.ReadDes);
-  if N < 0 then
-  begin
-    // The channel broke: exec state UNKNOWN. Fail-closed - this process must
-    // keep living, so make the outcome deterministic by taking the child
-    // down (it is either a not-yet-exec'd twin or a milliseconds-old
-    // replacement that has not touched anything durable yet).
-    kill(ChildPid, SIGKILL);
-    waitpid(ChildPid, nil, 0);
-    Exit;
-  end;
-  if N > 0 then
-  begin
-    // Failure marker delivered (sweep=2 / execv=1); reap the child.
-    waitpid(ChildPid, nil, 0);
-    Exit;
-  end;
-  // EOF: normally a successful exec closed the CLOEXEC write end. Guard the
-  // lost-marker corner - a child that died without managing to deliver its
-  // byte also produces an EOF, but by then it is a zombie carrying one of
-  // OUR failure exit codes; a live (or differently-exited) child is a real
-  // replacement.
-  if (waitpid(ChildPid, @WStatus, WNOHANG) = ChildPid) and
-     WIFEXITED(WStatus) and
-     ((WEXITSTATUS(WStatus) = 126) or (WEXITSTATUS(WStatus) = 127)) then
-    Exit;
-  Result := True;
-end;
-{$ENDIF}
 
 class function TCrashReporter.Restart(const AHardExit: Boolean): Boolean;
-{$IF Defined(MSWINDOWS)}
-var
-  SI: TStartupInfo;
-  PI: TProcessInformation;
-  CmdLine: String;
-{$ELSEIF Defined(LINUX) or Defined(MACOS)}
-var
-  Args: TArray<String>;
-  I: Integer;
-{$ENDIF}
-
-  procedure QuitSelf;
-  // AHardExit skips unit finalization (see the declaration comment); the
-  // fallthrough Halt only ever runs in the soft mode.
-  begin
-    if AHardExit then
-    {$IF Defined(MSWINDOWS)}
-      TerminateProcess(GetCurrentProcess, 0);
-    {$ELSE}
-      Posix.Unistd._exit(0);
-    {$ENDIF}
-    Halt(0);
-  end;
-
 begin
-  Result := False;
-  if not CanRestart then
-  begin
-    // Restart is disallowed here (not a spawn failure): quit as requested.
-    QuitSelf;
-    Exit;
-  end;
-
-  {$IF Defined(MSWINDOWS)}
-  // GetCommandLine, not a ParamStr rebuild: the original quoting survives.
-  CmdLine := GetCommandLine;
-  FillChar(SI, SizeOf(SI), 0);
-  SI.cb := SizeOf(SI);
-  if not CreateProcess(nil, PChar(CmdLine), nil, nil, False, 0, nil, nil, SI, PI) then
-    Exit; // spawn failed - the caller keeps this process alive
-  CloseHandle(PI.hProcess);
-  CloseHandle(PI.hThread);
-  QuitSelf;
-  {$ELSEIF Defined(LINUX) or Defined(MACOS)}
-  SetLength(Args, ParamCount + 1);
-  for I := 0 to ParamCount do
-    Args[I] := ParamStr(I);
-  if not CrashSpawnDetachedVerified(ParamStr(0), Args) then
-    Exit; // spawn failed - the caller keeps this process alive
-  QuitSelf;
-  {$ELSE}
-  QuitSelf;
-  {$ENDIF}
+  Result := CrashRestartProcess(AHardExit, CanRestart);
 end;
 
 class function TCrashReporter.TakeRestartNotice: TCrashRestartNotice;

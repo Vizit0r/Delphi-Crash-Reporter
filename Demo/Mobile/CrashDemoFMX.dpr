@@ -22,6 +22,11 @@ uses
   Crash.CallStack in '..\..\Crash.CallStack.pas',
   Crash.Freeze in '..\..\Crash.Freeze.pas',
   Crash.Reporter in '..\..\Crash.Reporter.pas',
+  Crash.ReportNaming in '..\..\Crash.ReportNaming.pas',
+  Crash.Restart in '..\..\Crash.Restart.pas',
+  Crash.Upload in '..\..\Crash.Upload.pas',
+  Crash.RawRecovery in '..\..\Crash.RawRecovery.pas',
+  Crash.ThreadRegistry in '..\..\Crash.ThreadRegistry.pas',
   CrashDemo.Runtime in 'CrashDemo.Runtime.pas',
   CrashDemo.MainForm in 'CrashDemo.MainForm.pas' {CrashDemoMainForm};
 

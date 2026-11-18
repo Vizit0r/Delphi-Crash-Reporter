@@ -103,6 +103,7 @@ uses
   Crash.ThreadCapture,
   Crash.ThreadCapture.Trace,
   Crash.Reporter,
+  Crash.Restart,
   {$ENDIF}
   Crash.Tests.Progress;
 

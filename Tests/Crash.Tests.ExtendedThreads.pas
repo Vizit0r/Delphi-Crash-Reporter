@@ -36,6 +36,7 @@ uses
   Crash.Freeze,
   Crash.Modules,
   Crash.Reporter,
+  Crash.ThreadRegistry,
   Crash.Signals,
   Crash.ThreadCapture,
   Crash.ThreadCapture.CallSite,
@@ -1201,11 +1202,11 @@ var
 
 begin
   LimitOK :=
-    (CrashAutoTestEffectiveExtendedThreadsMax(-1) = 32) and
-    (CrashAutoTestEffectiveExtendedThreadsMax(0) = 32) and
-    (CrashAutoTestEffectiveExtendedThreadsMax(1) = 1) and
-    (CrashAutoTestEffectiveExtendedThreadsMax(128) = 128) and
-    (CrashAutoTestEffectiveExtendedThreadsMax(129) = 128);
+    (CrashEffectiveExtendedThreadsMax(-1) = 32) and
+    (CrashEffectiveExtendedThreadsMax(0) = 32) and
+    (CrashEffectiveExtendedThreadsMax(1) = 1) and
+    (CrashEffectiveExtendedThreadsMax(128) = 128) and
+    (CrashEffectiveExtendedThreadsMax(129) = 128);
   AProgress.Account(LimitOK,
     'E14: ExtendedThreadsMax uses default 32 and clamps to hard limit 128');
 
