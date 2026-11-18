@@ -99,7 +99,7 @@ uses
   System.SysUtils,
   System.Classes,
   Crash.ThreadCapture.Trace
-  {$IF Defined(MACOS) and Defined(CPUX64)}
+  {$IF Defined(MACOS) and not Defined(IOS) and (Defined(CPUX64) or Defined(CPUARM64))}
   , Crash.MacOS.MachExc
   {$ENDIF}
   {$IF Defined(MSWINDOWS)}
@@ -144,7 +144,7 @@ end;
 
 function CrashRegisterMachForCurrentThread: TCrashMachState;
 begin
-  {$IF Defined(MACOS) and Defined(CPUX64)}
+  {$IF Defined(MACOS) and not Defined(IOS) and (Defined(CPUX64) or Defined(CPUARM64))}
   if CrashInstallMacOSMachHandlerForCurrentThread then
     Result := cmsInstalled
   else

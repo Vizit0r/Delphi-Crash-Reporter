@@ -33,8 +33,8 @@ for this library.
 | Unhandled-exception trapping | ✅ | ✅ | ✅ | ⚠ compile-only | ❌ (EurekaLog) |
 | Call stack (Pascal names) | ✅ | ✅ (LC_SYMTAB) | ✅ (`.gosym`) | ⚠ compile-only | — |
 | Source line numbers (`.gol`) | ✅ | ✅ | ✅ | — | — |
-| CPU registers on hardware faults | ✅ | ✅ x64 Mach; ⚠ ARM64 gap | ✅ (ARM64) | ⚠ compile-only | ❌ (EurekaLog) |
-| Raw fallback when RTL conversion does not survive | ✅ | ✅ x64; ⚠ ARM64 gap | ✅ (ARM64) | ⚠ compile-only | ❌ |
+| CPU registers on hardware faults | ✅ | ✅ (x64/ARM64 Mach) | ✅ (ARM64) | ⚠ compile-only | ❌ (EurekaLog) |
+| Raw fallback when RTL conversion does not survive | ✅ | ✅ (x64/ARM64) | ✅ (ARM64) | ⚠ compile-only | ❌ |
 | Modules section | ✅ | ✅ | ✅ | — | — |
 | EL-compatible `.el` output | ✅ | ✅ | ✅ | ⚠ compile-only | — |
 | Save / upload / dialog / restart | ✅ | ✅ | ✅ (no restart) | ⚠ compile-only, no restart | — |
@@ -588,11 +588,11 @@ owner survived the fault or is still writing its own report. Fresh incomplete/co
 for diagnosis; stale ones expire after seven days. A successfully persisted
 ordinary hardware-fault `.el` supersedes and removes its matching raw slot.
 
-Active fatal-path scope is Linux x86-64, macOS x86-64 and Android ARM64
-(aarch64). On macOS x64 the Mach observer requests `MACH_EXCEPTION_CODES`, so
-the recovered fault address is not truncated to 32 bits. macOS ARM64 has the
-snapshot format but no production Mach observer yet; Delphi hardware faults
-bypass the POSIX handler there, so raw/register capture is not claimed.
+Active fatal-path scope is Linux x86-64, macOS x86-64 + ARM64 and Android ARM64
+(aarch64). On macOS the Mach observer requests `MACH_EXCEPTION_CODES`, so
+the recovered fault address is not truncated to 32 bits. On macOS ARM64 the
+observer reads the unified `ARM_THREAD_STATE` (the flavor the RTL uses too);
+runtime-verified on Apple M2.
 
 One recovery limitation is deliberate and visible: a recovered report's Modules
 section describes the current recovery process, not the process that crashed.
@@ -687,7 +687,7 @@ that belong to the same logical owner for report-selection purposes; zero is
 the global/compatibility group. Registration is per thread and idempotent. It
 installs a per-thread alternate
 signal stack (a stack the host already installed is borrowed and never disabled
-or freed), adds the thread-level Mach exception observer on macOS x86-64,
+or freed), adds the thread-level Mach exception observer on macOS (x86-64, ARM64),
 records the thread under the given name and, when `ExtendedThreads` is on,
 reserves a capture slot and records that thread's real stack bounds so its stack
 can ride along in other threads' reports. `UnregisterCurrentThread` must run on

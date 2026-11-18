@@ -137,11 +137,18 @@ procedure CrashFormatRecoveredRaw(const ARaw: TCrashRawRecord;
 
 type
   { CPU registers captured by the macOS Mach handler (Crash.MacOS.MachExc) and
-    handed to CrashRecordMacOSSnapshot. Mirrors x86_thread_state64. }
+    handed to CrashRecordMacOSSnapshot. Mirrors x86_thread_state64 /
+    arm_thread_state64. }
   TCrashMacOSRegs = record
+    {$IF Defined(CPUARM64)}
+    X:                  array[0..28] of UInt64;
+    Fp, Lr, Sp, Pc:     UInt64;
+    Cpsr:               UInt32;
+    {$ELSE}
     Rax, Rbx, Rcx, Rdx, Rdi, Rsi, Rbp, Rsp: UInt64;
     R8, R9, R10, R11, R12, R13, R14, R15:    UInt64;
     Rip, Rflags, Cs:                         UInt64;
+    {$ENDIF}
   end;
 
 { Record a snapshot captured by the macOS Mach exception handler into the same
@@ -1347,7 +1354,11 @@ begin
   // secondary fault must not overwrite the primary registers.
   if TInterlocked.CompareExchange(GSignalSnapshot.Claimed, 1, 0) = 0 then
   begin
+    {$IF Defined(CPUARM64)}
+    GSignalSnapshot.Kind       := Ord(skMacOSArm64);
+    {$ELSE}
     GSignalSnapshot.Kind       := Ord(skMacOSX64);
+    {$ENDIF}
     GSignalSnapshot.SignalNum  := ASignalNum;
     GSignalSnapshot.SignalCode := ASignalCode;
     GSignalSnapshot.FaultAddr  := AFaultAddr;
@@ -1366,6 +1377,12 @@ begin
     GSignalSnapshot.R14 := ARegs.R14;  GSignalSnapshot.R15 := ARegs.R15;
     GSignalSnapshot.Rip := ARegs.Rip;  GSignalSnapshot.Rflags := ARegs.Rflags;
     GSignalSnapshot.Cs  := ARegs.Cs;
+    {$ELSEIF Defined(CPUARM64)}
+    for var I := 0 to 28 do
+      GSignalSnapshot.X[I] := ARegs.X[I];
+    GSignalSnapshot.Fp := ARegs.Fp;  GSignalSnapshot.Lr := ARegs.Lr;
+    GSignalSnapshot.Sp := ARegs.Sp;  GSignalSnapshot.Pc := ARegs.Pc;
+    GSignalSnapshot.Cpsr := ARegs.Cpsr;
     {$ENDIF}
     // Stack dump (read SAFELY by the caller, e.g. via vm_read_overwrite). It lets
     // the EL Viewer recognise the full "Registers:" + "Stack:/Memory Dump"
@@ -1389,7 +1406,11 @@ begin
     GConcurrentSignal.SignalNum  := ASignalNum;
     GConcurrentSignal.SignalCode := ASignalCode;
     GConcurrentSignal.FaultAddr  := AFaultAddr;
+    {$IF Defined(CPUARM64)}
+    GConcurrentSignal.IP         := ARegs.Pc;
+    {$ELSE}
     GConcurrentSignal.IP         := ARegs.Rip;
+    {$ENDIF}
     GConcurrentSignal.ThreadID   := AFaultThreadID;
     TInterlocked.Exchange(GConcurrentSignal.Captured, 1);
     CrashRawBeginSlot(CRASH_RAW_SLOT_CONCURRENT);

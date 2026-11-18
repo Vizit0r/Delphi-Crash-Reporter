@@ -31,11 +31,13 @@
   (the main thread at startup + any host worker threads that opt in). Other
   threads keep the RTL's behaviour - same as today.
 
-  STATUS: x86-64 only. ARM64 path is TODO (the snapshot/format side in
-  Crash.Signals already supports skMacOSArm64). No-op stub on every other target.
-  Runtime-verified on macOS x86-64 (Intel): a hardware fault yields primary
-  registers in the .el (RIP = fault address) and the KERN_FAILURE reply falls
-  through to the RTL, which raises the Pascal exception as before.
+  STATUS: macOS x86-64 and ARM64 (Apple Silicon). No-op stub on every other
+  target, iOS included. On ARM64 MACHINE_THREAD_STATE is the unified
+  ARM_THREAD_STATE (header + arm_thread_state64), the same flavor the RTL uses.
+  Runtime-verified on macOS x86-64 (Intel) and ARM64 (Apple M2): a hardware
+  fault yields primary registers in the .el (RIP/PC = fault address) and the
+  KERN_FAILURE reply falls through to the RTL, which raises the Pascal
+  exception as before.
 
   Message layout uses mach_exc/exception_raise_state_identity with
   MACH_EXCEPTION_CODES (msgh_id 2407). The 64-bit exception codes preserve a
@@ -50,7 +52,7 @@ interface
   per thread to cover, FROM that thread, on a calm path (e.g. startup). The port
   + watcher thread are created on first call (process-wide); later calls just
   register another thread. Returns True when the thread is covered (or there is
-  nothing to cover - non-(macOS x86-64) targets); False when setup or the
+  nothing to cover - targets other than macOS x86-64 / ARM64); False when setup or the
   thread registration failed. A first-call failure is rolled back in full, and
   a terminal watcher failure tears the setup down and reopens the gate - a
   later call may retry either way. Calls serialize on an internal lock, and a
@@ -59,7 +61,7 @@ function CrashInstallMacOSMachHandlerForCurrentThread: Boolean;
 
 implementation
 
-{$IF Defined(MACOS) and Defined(CPUX64)}
+{$IF Defined(MACOS) and not Defined(IOS) and (Defined(CPUX64) or Defined(CPUARM64))}
 
 uses
   Posix.Base,          // libc
@@ -161,7 +163,7 @@ type
     code:         array[0..1] of Int64;       // mach_exception_data_type_t
     flavor:       Int32;
     old_stateCnt: mach_msg_type_number_t;
-    old_state:    array[0..223] of natural_t; // x86_thread_state_t lives here
+    old_state:    array[0..223] of natural_t; // x86_thread_state_t / arm_unified_thread_state_t
   end;
   PMachExcRequest = ^TMachExcRequest;
 
@@ -187,9 +189,35 @@ var
   GToken:  Int64 = 0;        // live-setup token: (generation shl 32) or port; 0 = none. Written only under GLock; watchers read it atomically to detect staleness.
   GGenSeq: Integer = 0;      // monotonic generation source for tokens
 
+{$IF Defined(CPUARM64)}
+function ArmThreadState(const Req: TMachExcRequest): Parm_thread_state64_t;
+// MACHINE_THREAD_STATE is ARM_THREAD_STATE here: a unified header + ts_64.
+// A plain ARM_THREAD_STATE64 body is accepted too. nil = anything else.
+var
+  Unified: Parm_unified_thread_state_t;
+begin
+  Result := nil;
+  if (Req.flavor = ARM_THREAD_STATE64) and
+     (Req.old_stateCnt >= ARM_THREAD_STATE64_COUNT) then
+    Result := Parm_thread_state64_t(@Req.old_state[0])
+  else if (Req.flavor = ARM_THREAD_STATE) and
+     (Req.old_stateCnt >= ARM_UNIFIED_THREAD_STATE_COUNT) then
+  begin
+    Unified := Parm_unified_thread_state_t(@Req.old_state[0]);
+    if Unified.ash.flavor = ARM_THREAD_STATE64 then
+      Result := @Unified.ts_64;
+  end;
+end;
+{$ENDIF}
+
 procedure CaptureRequest(const Req: TMachExcRequest);
 var
+  {$IF Defined(CPUARM64)}
+  TS:        Parm_thread_state64_t;
+  I:         Integer;
+  {$ELSE}
   TS:        Px86_thread_state_t;
+  {$ENDIF}
   Regs:      TCrashMacOSRegs;
   SigNum, Code0: Integer;
   FaultA:    UInt64;
@@ -197,6 +225,17 @@ var
   StackBuf:  array[0..STACK_READ_BYTES - 1] of Byte;
   OutCnt:    vm_size_t;
 begin
+  {$IF Defined(CPUARM64)}
+  TS := ArmThreadState(Req);
+  if TS = nil then
+    Exit;
+  for I := 0 to 28 do
+    Regs.X[I] := TS.__x[I];
+  Regs.Fp := TS.__fp;  Regs.Lr := TS.__lr;
+  Regs.Sp := TS.__sp;  Regs.Pc := TS.__pc;
+  Regs.Cpsr := TS.__cpsr;
+  StackBase := TS.__sp;
+  {$ELSE}
   // old_state holds an x86_thread_state_t (header + ts64) because we registered
   // with flavor MACHINE_THREAD_STATE (= x86_THREAD_STATE).
   TS := Px86_thread_state_t(@Req.old_state[0]);
@@ -207,6 +246,8 @@ begin
   Regs.R11 := TS.ts64.r11;  Regs.R12 := TS.ts64.r12;  Regs.R13 := TS.ts64.r13;
   Regs.R14 := TS.ts64.r14;  Regs.R15 := TS.ts64.r15;
   Regs.Rip := TS.ts64.rip;  Regs.Rflags := TS.ts64.rflags;  Regs.Cs := TS.ts64.cs;
+  StackBase := TS.ts64.rsp;
+  {$ENDIF}
 
   case Req.exception of
     EXC_BAD_ACCESS:      SigNum := SIG_SEGV;
@@ -226,7 +267,6 @@ begin
   // Dump the faulting thread's stack SAFELY: vm_read_overwrite returns an error
   // (not a fault) if RSP is unmapped. A raw Move here would crash our watcher
   // thread on a bad RSP. Needed so the EL Viewer renders the Registers section.
-  StackBase := TS.ts64.rsp;
   OutCnt    := 0;
   if vm_read_overwrite(mach_task_self, vm_address_t(StackBase), STACK_READ_BYTES,
        vm_address_t(@StackBuf[0]), OutCnt) <> KERN_SUCCESS then
@@ -467,7 +507,7 @@ begin
   end;
 end;
 
-{$ELSE}  // ---- not macOS x86-64: no-op stub ----
+{$ELSE}  // ---- not macOS x86-64 / ARM64: no-op stub ----
 
 function CrashInstallMacOSMachHandlerForCurrentThread: Boolean;
 begin
@@ -476,7 +516,7 @@ end;
 
 {$ENDIF}
 
-{$IF Defined(MACOS) and Defined(CPUX64)}
+{$IF Defined(MACOS) and not Defined(IOS) and (Defined(CPUX64) or Defined(CPUARM64))}
 initialization
   GLock := TCriticalSection.Create; // process-lifetime (see its declaration)
 {$ENDIF}
