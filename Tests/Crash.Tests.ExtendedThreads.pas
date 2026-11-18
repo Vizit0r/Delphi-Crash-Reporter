@@ -38,6 +38,8 @@ uses
   Crash.Reporter,
   Crash.Signals,
   Crash.ThreadCapture,
+  Crash.ThreadCapture.CallSite,
+  Crash.ThreadCapture.Trace,
   Crash.Tests.Progress
   {$IF Defined(CRASH_EXTENDED_RUNTIME_TEST)}
   , Posix.Base,
@@ -615,38 +617,129 @@ begin
   Result := StopReason = tcsrStackPointerOutside;
 end;
 
+function X86FFCall(const ABytes: TBytes): Boolean;
+begin
+  Result := (Length(ABytes) > 0) and (Length(ABytes) <= 8) and
+    CrashX86FFCallEndsAt(@ABytes[0], Length(ABytes));
+end;
+
 function Step_H3_X86CallDecoder: Boolean;
 begin
   Result :=
-    CrashThreadCaptureTestX86FFCall(TBytes.Create($FF, $D0)) and
-    CrashThreadCaptureTestX86FFCall(
-      TBytes.Create($48, $FF, $15, 0, 0, 0, 0)) and
-    CrashThreadCaptureTestX86FFCall(
-      TBytes.Create($41, $FF, $54, $24, $08)) and
-    (not CrashThreadCaptureTestX86FFCall(TBytes.Create($FF, $E0))) and
-    (not CrashThreadCaptureTestX86FFCall(TBytes.Create($FF)));
+    X86FFCall(TBytes.Create($FF, $D0)) and
+    X86FFCall(TBytes.Create($48, $FF, $15, 0, 0, 0, 0)) and
+    X86FFCall(TBytes.Create($41, $FF, $54, $24, $08)) and
+    (not X86FFCall(TBytes.Create($FF, $E0))) and
+    (not X86FFCall(TBytes.Create($FF)));
 end;
 
 function Step_H3a_ARM64CallDecoder: Boolean;
 begin
   Result :=
-    CrashThreadCaptureTestARM64Call($94000000) and // BL +0
-    CrashThreadCaptureTestARM64Call($97FFFFFF) and // BL -4
-    CrashThreadCaptureTestARM64Call($D63F0000) and // BLR X0
-    CrashThreadCaptureTestARM64Call($D63F03E0) and // BLR XZR
-    (not CrashThreadCaptureTestARM64Call($14000000)) and // B +0
-    (not CrashThreadCaptureTestARM64Call($D61F0000)); // BR X0
+    CrashARM64InstructionIsCall($94000000) and // BL +0
+    CrashARM64InstructionIsCall($97FFFFFF) and // BL -4
+    CrashARM64InstructionIsCall($D63F0000) and // BLR X0
+    CrashARM64InstructionIsCall($D63F03E0) and // BLR XZR
+    (not CrashARM64InstructionIsCall($14000000)) and // B +0
+    (not CrashARM64InstructionIsCall($D61F0000)); // BR X0
 end;
 
 function Step_H3b_MergeRules: Boolean;
+var
+  Candidates: TCrashTraceCandidates;
 begin
-  Result := CrashThreadCaptureTestMergeRules;
+  Candidates := nil;
+  Result := CrashAddTraceCandidate(Candidates, 32, $2000, False) and
+    (not CrashAddTraceCandidate(Candidates, 32, $3000, True)) and
+    CrashAddTraceCandidate(Candidates, 16, $1000, True) and
+    CrashAddTraceCandidate(Candidates, 24, $2000, True) and
+    CrashAddTraceCandidate(Candidates, 48, $4000, False);
+  if not Result then
+    Exit;
+  CrashCompactTraceCandidates(Candidates);
+  Result := (Length(Candidates) = 3) and
+    (Candidates[0].StackPos = 16) and Candidates[0].IsRaw and
+    (Candidates[1].StackPos = 24) and Candidates[1].IsRaw and
+    (Candidates[2].StackPos = 48) and (not Candidates[2].IsRaw);
+end;
+
+// Call-site validation on a synthetic code buffer, and a trace that keeps a
+// valid raw frame after an invalid frame record.
+function ValidationRules: Boolean;
+var
+  Map: TCrashCodeMap;
+  Payload: TCrashThreadCapturePayload;
+  Trace: TCrashThreadRawTrace;
+  CodeLow, CodeHigh, ReturnAddress: UIntPtr;
+  {$IF Defined(CPUX64)}
+  Code: array [0..63] of Byte;
+  TargetAddress: UIntPtr;
+  RelativeTarget: Int32;
+  {$ELSEIF Defined(CPUARM64)}
+  Code: array [0..15] of UInt32;
+  {$ENDIF}
+begin
+  Result := False;
+  FillChar(Code, SizeOf(Code), 0);
+  CodeLow := UIntPtr(@Code[0]);
+  CodeHigh := CodeLow + SizeOf(Code);
+  Map := TCrashCodeMap.ForRange(CodeLow, CodeHigh);
+
+  {$IF Defined(CPUX64)}
+  ReturnAddress := UIntPtr(@Code[16]);
+  TargetAddress := UIntPtr(@Code[32]);
+  Code[11] := $E8;
+  RelativeTarget := Int32(Int64(TargetAddress) - Int64(ReturnAddress));
+  Move(RelativeTarget, Code[12], SizeOf(RelativeTarget));
+  if not Map.CallSiteIsValid(ReturnAddress) then
+    Exit;
+  RelativeTarget := 1024;
+  Move(RelativeTarget, Code[12], SizeOf(RelativeTarget));
+  if Map.CallSiteIsValid(ReturnAddress) then
+    Exit;
+  RelativeTarget := Int32(Int64(TargetAddress) - Int64(ReturnAddress));
+  Move(RelativeTarget, Code[12], SizeOf(RelativeTarget));
+  // The call bytes start outside the executable range.
+  if TCrashCodeMap.ForRange(ReturnAddress - 4, CodeHigh).CallSiteIsValid(
+       ReturnAddress) then
+    Exit;
+  {$ELSEIF Defined(CPUARM64)}
+  ReturnAddress := UIntPtr(@Code[4]);
+  Code[3] := $94000000;
+  if not Map.CallSiteIsValid(ReturnAddress) then
+    Exit;
+  Code[3] := $14000000;
+  if Map.CallSiteIsValid(ReturnAddress) then
+    Exit;
+  Code[3] := $94000000;
+  if TCrashCodeMap.ForRange(ReturnAddress - 3, CodeHigh).CallSiteIsValid(
+       ReturnAddress) then
+    Exit;
+  {$ENDIF}
+
+  if Map.CallSiteIsValid(High(UIntPtr) - 3) then
+    Exit;
+
+  FillChar(Payload, SizeOf(Payload), 0);
+  Payload.InterruptedIP := $1234;
+  Payload.Count := 1;
+  Payload.Addrs[0] := High(UIntPtr) - 3;
+  Payload.AddrStackPos[0] := 16;
+  Payload.RawBaseSP := 24;
+  Payload.RawWordCount := 1;
+  Payload.RawWords[0] := ReturnAddress;
+  Payload.StopReason := tcsrEnd;
+  CrashBuildThreadTrace(Payload, True, Map, Trace);
+  Result := (Trace.StopReason = tcsrFrameInvalidCode) and
+    (Trace.FPFrameCount = 0) and (Trace.RawFrameCount = 1) and
+    (Length(Trace.Addresses) = 2) and
+    (Trace.Addresses[0] = UIntPtr($1234)) and
+    (Trace.Addresses[1] = ReturnAddress);
 end;
 
 function Step_H3c_ContextLayoutAndValidation: Boolean;
 begin
-  Result := CrashThreadCaptureTestContextAccessors and
-    CrashThreadCaptureTestValidationRules;
+  Result := CrashThreadCaptureTestContextAccessors and ValidationRules;
 end;
 
 function Step_H4_FaultFreeCodeReads: Boolean;

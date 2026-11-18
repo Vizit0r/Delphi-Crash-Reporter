@@ -101,6 +101,7 @@ uses
   Crash.Freeze,
   Crash.Signals,
   Crash.ThreadCapture,
+  Crash.ThreadCapture.Trace,
   Crash.Reporter,
   {$ENDIF}
   Crash.Tests.Progress;

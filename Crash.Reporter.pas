@@ -460,6 +460,7 @@ uses
   Crash.Pending,
   Crash.RawFallback,
   Crash.ThreadCapture,
+  Crash.ThreadCapture.Trace,
   {$IF Defined(MSWINDOWS)}
   Winapi.Windows,
   {$ENDIF}

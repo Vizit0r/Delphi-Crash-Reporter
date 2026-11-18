@@ -272,6 +272,9 @@ Core (framework-agnostic):
 - `Crash.CallStack` — RTL exception hooks + stack capture; `TCrashCapture`, `TCrashReport`, `TCrashReportSection`.
 - `Crash.Signals` — POSIX `sigaction` CPU-register snapshot for hardware faults.
 - `Crash.ThreadCapture` — process-wide POSIX service that samples a registered thread's stack in place: capture-signal ownership, registration-time stack bounds, a bounded FP/raw walker, preallocated per-thread slots, dual `pthread_t` + kernel-id identity, and late-signal handling. Used by `Crash.Freeze` and by the extended-thread collector.
+- `Crash.ThreadCapture.Trace` — turns the handler's raw payload into a trace: IP, ARM64 LR frame, frame-record and raw-scan return addresses merged by stack position; the trace types and the diagnostics line.
+- `Crash.ThreadCapture.CallSite` — `TCrashCodeMap`, an immutable snapshot of executable ranges, the PAC mask and the `.eh_frame_hdr` modules: return-address validation, pointer-auth stripping, when ARM64 LR is still the caller; plus the pure instruction decoders.
+- `Crash.Unwind.EhFrame` — function lookup through a 64-bit ELF module's `.eh_frame_hdr` (FDE → function start).
 - `Crash.Breadcrumbs` — bounded, thread-safe host diagnostic trail.
 - `Crash.RawFallback` — preallocated binary fallback slots and startup recovery.
 - `Crash.Modules` — loaded-module enumeration.

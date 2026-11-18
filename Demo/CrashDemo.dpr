@@ -25,6 +25,9 @@ uses
   Posix.SysMman,
   {$ENDIF}
   Crash.ThreadCapture,
+  Crash.Unwind.EhFrame,
+  Crash.ThreadCapture.CallSite,
+  Crash.ThreadCapture.Trace,
   Crash.Reporter,
   Crash.Freeze,
   Crash.CallStack;

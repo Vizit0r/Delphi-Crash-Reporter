@@ -47,6 +47,8 @@ uses
   System.Generics.Collections,
   Crash.Reporter,
   Crash.ThreadCapture,
+  Crash.ThreadCapture.CallSite,
+  Crash.ThreadCapture.Trace,
   Crash.Tests.Registry,
   Crash.Tests.Progress
   {$IF Defined(CRASH_CAPTURE_SHAPE_RUNTIME)}
@@ -233,7 +235,8 @@ procedure DumpCapture(const AProgress: TCrashTestProgress; const ATag: String;
   const AHandle: TCrashThreadCaptureHandle; const ATrace: TCrashThreadRawTrace;
   const AExecLow, AExecHigh: UIntPtr);
 var
-  Info: TCrashThreadCaptureTestSlotInfo;
+  Payload: TCrashThreadCapturePayload;
+  Map: TCrashCodeMap;
   I: Integer;
   Mark: String;
 begin
@@ -241,21 +244,22 @@ begin
     CrashThreadCaptureFormatDiagnostics(0, ATrace)]);
   AProgress.InfoFmt('%s: Execute=[$%x,$%x)', [ATag, UInt64(AExecLow),
     UInt64(AExecHigh)]);
-  if CrashThreadCaptureTestLastSlot(AHandle, Info) then
+  if CrashThreadCaptureTestLastPayload(AHandle, Payload) then
   begin
+    Map := CrashCurrentCodeMap;
     AProgress.InfoFmt('%s: ip=%s lr-decision: %s', [ATag,
-      DescribeAddress(Info.InterruptedIP),
-      CrashThreadCaptureTestLinkDecision(Info.InterruptedIP)]);
+      DescribeAddress(Payload.InterruptedIP),
+      Map.DescribeLinkDecision(Payload.InterruptedIP)]);
     AProgress.InfoFmt('%s: lr=%s check=%s', [ATag,
-      DescribeAddress(Info.InterruptedLR),
-      CrashThreadCaptureTestCheckAddress(Info.InterruptedLR)]);
+      DescribeAddress(Payload.InterruptedLR),
+      Map.CheckAddress(Payload.InterruptedLR)]);
     AProgress.InfoFmt('%s: sp=$%x fp=$%x raw-words=%d walker-stop=%s',
-      [ATag, UInt64(Info.InterruptedSP), UInt64(Info.InterruptedFP),
-       Info.RawWordCount, CrashThreadCaptureStopReasonText(Info.StopReason)]);
-    for I := 0 to High(Info.FPAddresses) do
+      [ATag, UInt64(Payload.InterruptedSP), UInt64(Payload.InterruptedFP),
+       Payload.RawWordCount,
+       CrashThreadCaptureStopReasonText(Payload.StopReason)]);
+    for I := 0 to Payload.Count - 1 do
       AProgress.InfoFmt('%s: record %d: %s check=%s', [ATag, I,
-        DescribeAddress(Info.FPAddresses[I]),
-        CrashThreadCaptureTestCheckAddress(Info.FPAddresses[I])]);
+        DescribeAddress(Payload.Addrs[I]), Map.CheckAddress(Payload.Addrs[I])]);
   end;
   for I := 0 to High(ATrace.Addresses) do
   begin
@@ -396,7 +400,9 @@ var
   SpinStart, IPStart, LRStart: UIntPtr;
   I, Captured, InSpin, LinkUsed, Stale: Integer;
   Dumped, KnowsFunctions: Boolean;
+  Map: TCrashCodeMap;
 begin
+  Map := CrashCurrentCodeMap;
   Worker := TShapeWorker.Create(smBusyFramed);
   try
     if not WaitReady(Worker) then
@@ -407,7 +413,7 @@ begin
     end;
     SpinMethod := Worker.SpinFramed;
     SpinStart := UIntPtr(TMethod(SpinMethod).Code);
-    KnowsFunctions := CrashThreadCaptureTestFunctionStart(SpinStart, IPStart) and
+    KnowsFunctions := Map.FunctionStart(SpinStart, IPStart) and
       (IPStart = SpinStart);
     TThread.Sleep(PARK_SETTLE_MS);
     Captured := 0;
@@ -425,13 +431,13 @@ begin
       if Trace.LinkFrameUsed then
         Inc(LinkUsed);
       if KnowsFunctions and
-         CrashThreadCaptureTestFunctionStart(Trace.InterruptedIP, IPStart) and
+         Map.FunctionStart(Trace.InterruptedIP, IPStart) and
          (IPStart = SpinStart) then
         Inc(InSpin);
       if Trace.LinkFrameUsed and (Length(Trace.Addresses) > 1) and
          ((not KnowsFunctions) or
-          (CrashThreadCaptureTestFunctionStart(Trace.InterruptedIP, IPStart) and
-           CrashThreadCaptureTestFunctionStart(Trace.Addresses[1], LRStart) and
+          (Map.FunctionStart(Trace.InterruptedIP, IPStart) and
+           Map.FunctionStart(Trace.Addresses[1], LRStart) and
            (IPStart = LRStart))) then
       begin
         Inc(Stale);
@@ -462,16 +468,128 @@ begin
   end;
 end;
 
+type
+  TShapeCodeWords = array [0..15] of UInt32;
+
+function SyntheticMap(var ACode: TShapeCodeWords): TCrashCodeMap;
+begin
+  Result := TCrashCodeMap.ForRange(UIntPtr(@ACode[0]),
+    UIntPtr(@ACode[0]) + SizeOf(ACode));
+end;
+
+// A saved LR carrying a signature above the user VA and in the top byte.
+function PointerAuthStrip: Boolean;
+var
+  Code: TShapeCodeWords;
+  Map: TCrashCodeMap;
+  Payload: TCrashThreadCapturePayload;
+  Trace: TCrashThreadRawTrace;
+  ReturnAddress, Signed: UIntPtr;
+begin
+  Result := False;
+  FillChar(Code, SizeOf(Code), 0);
+  Code[3] := $94000000; // BL
+  Map := SyntheticMap(Code);
+  ReturnAddress := UIntPtr(@Code[4]);
+  Signed := ReturnAddress or (UIntPtr($5A) shl 56) or (Map.AddressMask + 1);
+  if Signed = ReturnAddress then
+    Exit;
+  FillChar(Payload, SizeOf(Payload), 0);
+  Payload.InterruptedIP := $1234;
+  Payload.Count := 1;
+  Payload.Addrs[0] := Signed;
+  Payload.AddrStackPos[0] := 16;
+  Payload.StopReason := tcsrEnd;
+  CrashBuildThreadTrace(Payload, True, Map, Trace);
+  {$IF Defined(CPUARM64)}
+  Result := (Trace.StopReason = tcsrEnd) and (Trace.FPFrameCount = 1) and
+    (Length(Trace.Addresses) = 2) and (Trace.Addresses[1] = ReturnAddress) and
+    (Trace.Sources[1] = tfsFramePointer);
+  {$ELSE}
+  // No pointer authentication on x86-64: a tagged value stays invalid.
+  Result := (Trace.StopReason = tcsrFrameInvalidCode) and
+    (Trace.FPFrameCount = 0) and (Length(Trace.Addresses) = 1);
+  {$ENDIF}
+end;
+
+// Synthetic code has no FDE, so only the syscall-stub rule applies here.
+function LinkRegisterRules: Boolean;
+var
+  Code: TShapeCodeWords;
+  Map: TCrashCodeMap;
+  Trace: TCrashThreadRawTrace;
+  CallerReturn, AfterSvc: UIntPtr;
+  {$IF Defined(CPUARM64)}
+  OnSvc, Busy: UIntPtr;
+  {$ENDIF}
+
+  function Run(const AIP, ALR, AFPAddress: UIntPtr): Boolean;
+  var
+    Payload: TCrashThreadCapturePayload;
+  begin
+    FillChar(Payload, SizeOf(Payload), 0);
+    Payload.InterruptedIP := AIP;
+    Payload.InterruptedLR := ALR;
+    Payload.StopReason := tcsrEnd;
+    if AFPAddress <> 0 then
+    begin
+      Payload.Count := 1;
+      Payload.Addrs[0] := AFPAddress;
+      Payload.AddrStackPos[0] := 16;
+    end;
+    CrashBuildThreadTrace(Payload, True, Map, Trace);
+    Result := (Length(Trace.Addresses) = Length(Trace.Sources)) and
+      (Length(Trace.Addresses) > 0) and (Trace.Addresses[0] = AIP) and
+      (Trace.Sources[0] = tfsInterrupted);
+  end;
+
+begin
+  FillChar(Code, SizeOf(Code), 0);
+  Code[2] := $94000000;  // caller: BL stub
+  Code[8] := $D4000001;  // stub: SVC #0
+  Code[12] := $94000000; // busy code: BL (no SVC around)
+  Map := SyntheticMap(Code);
+  CallerReturn := UIntPtr(@Code[3]);
+  AfterSvc := UIntPtr(@Code[9]);
+  {$IF Defined(CPUARM64)}
+  OnSvc := UIntPtr(@Code[8]);
+  Busy := UIntPtr(@Code[14]);
+  Result := False;
+  // Stopped right after SVC: LR is the caller frame, signed or not.
+  if not (Run(AfterSvc, CallerReturn or (UIntPtr($3C) shl 56), 0) and
+     Trace.LinkFrameUsed and (Length(Trace.Addresses) = 2) and
+     (Trace.Addresses[1] = CallerReturn) and (Trace.Sources[1] = tfsLink)) then
+    Exit;
+  // Restarted syscall: the PC is back on the SVC itself.
+  if not (Run(OnSvc, CallerReturn, 0) and Trace.LinkFrameUsed) then
+    Exit;
+  // Outside a syscall stub (and without an FDE) LR may be stale: never used.
+  if not (Run(Busy, CallerReturn, 0) and (not Trace.LinkFrameUsed) and
+     (Length(Trace.Addresses) = 1)) then
+    Exit;
+  // LR that does not follow a call is rejected.
+  if not (Run(AfterSvc, AfterSvc + 4, 0) and (not Trace.LinkFrameUsed)) then
+    Exit;
+  // The first frame record repeating LR is not listed twice.
+  Result := Run(AfterSvc, CallerReturn, CallerReturn) and
+    Trace.LinkFrameUsed and (Length(Trace.Addresses) = 2) and
+    (Trace.FPFrameCount = 0);
+  {$ELSE}
+  Result := Run(AfterSvc, CallerReturn, 0) and
+    (not Trace.LinkFrameUsed) and (Length(Trace.Addresses) = 1);
+  {$ENDIF}
+end;
+
 procedure RunCaptureShapeTests(const AProgress: TCrashTestProgress);
 begin
   {$IF Defined(CPUARM64)}
-  AProgress.Account(CrashThreadCaptureTestPointerAuthStrip,
+  AProgress.Account(PointerAuthStrip,
     'S1: PAC-signed saved LR is stripped and still validated');
   {$ELSE}
-  AProgress.Account(CrashThreadCaptureTestPointerAuthStrip,
+  AProgress.Account(PointerAuthStrip,
     'S1: tagged return address stays invalid without pointer auth');
   {$ENDIF}
-  AProgress.Account(CrashThreadCaptureTestLinkRegisterRules,
+  AProgress.Account(LinkRegisterRules,
     'S2: LR is a frame only for a thread stopped in a syscall stub');
 
   if not CrashThreadCaptureAcquire then

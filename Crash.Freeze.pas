@@ -169,7 +169,8 @@ uses
   System.Math,
   Posix.Pthread,
   Posix.SysTypes,
-  Crash.ThreadCapture;
+  Crash.ThreadCapture,
+  Crash.ThreadCapture.Trace;
 
 const
   CAPTURE_WAIT_MS      = 2000; // how long the watchdog waits for the handler to publish
