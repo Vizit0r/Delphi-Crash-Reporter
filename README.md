@@ -769,6 +769,16 @@ were doing around the crash, not just the raise point.
   RBP alone and calls back into framed code (`pthread_once`) is lost. Such a
   glibc may also leave RBP zero in a parked thread: then there is no chain and
   the raw scan is the whole trace.
+- On ARM64 the window also closes below the first record once the function
+  owning the stack top has stored its frame record (`stp x29, x30` to `sp`
+  before the stopped IP, or before the LR caller's call site; on macOS a
+  compact-unwind FRAME range): a framed function keeps its return address only
+  in that record, so a raw word under it is a dead local. Android system
+  libraries, the Adreno driver and Delphi's own code have practically no
+  frameless non-leaf functions (0-0.4% of FDEs), and the Apple ARM64 ABI
+  requires a record in every non-leaf function. x86-64 keeps the raw words
+  there: telling a prologue/epilogue from the body needs the CFA rule at the
+  IP, i.e. a CFI interpreter.
 - **ARM64 pointer authentication.** Code built with PAC (bionic on newer Android,
   arm64e system code) signs the LR it saves, so the saved return address carries
   a signature above the user VA. The calm path strips everything above the

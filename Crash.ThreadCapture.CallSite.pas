@@ -43,6 +43,11 @@ type
     // ARM64: the frame LR contributes for a thread stopped at AIP, if any.
     function LinkFrame(const AIP, ALinkRegister: UIntPtr;
       out AAddress: UIntPtr): Boolean;
+    // ARM64: the function owning the stack top (the LR caller when the LR
+    // frame is used, else the one at AIP) has stored its frame record, so no
+    // live return address lies below the first record. False elsewhere.
+    function TopFrameIsRecorded(const AIP: UIntPtr; const AHasLink: Boolean;
+      const ALinkAddress: UIntPtr): Boolean;
     // Diagnostics: 'ok' or why a return-address candidate is rejected.
     function CheckAddress(const AAddress: UIntPtr): String;
     // Diagnostics: how the LR decision is made at AIP.
@@ -59,6 +64,8 @@ function CrashARM64InstructionIsCall(const AInstruction: UInt32): Boolean;
 function CrashARM64InstructionIsSvc(const AInstruction: UInt32): Boolean;
 // STP/STR that spills x30 (LR).
 function CrashARM64InstructionSavesLR(const AInstruction: UInt32): Boolean;
+// STP x29, x30 to the stack: a frame record.
+function CrashARM64InstructionStoresFrameRecord(const AInstruction: UInt32): Boolean;
 
 implementation
 
@@ -158,6 +165,15 @@ end;
 function CrashARM64InstructionIsSvc(const AInstruction: UInt32): Boolean;
 begin
   Result := (AInstruction and $FFE0001F) = $D4000001;
+end;
+
+function CrashARM64InstructionStoresFrameRecord(const AInstruction: UInt32): Boolean;
+var
+  Op: UInt32;
+begin
+  // STP x29, x30, [sp, #imm] or [sp, #imm]!
+  Op := AInstruction and $FFC07FFF;
+  Result := (Op = $A9007BFD) or (Op = $A9807BFD);
 end;
 
 function CrashARM64InstructionSavesLR(const AInstruction: UInt32): Boolean;
@@ -407,7 +423,54 @@ begin
   if not Known then
     Result := InterruptedInSyscallStub(AMap, AIP);
 end;
+
+// The function containing AAddress stored its frame record before ALimit. A
+// compact-unwind FRAME range says so for the whole function (an IP still in
+// the prologue keeps its return address in LR, not on the stack).
+function FrameRecordStoredBefore(const AMap: TCrashCodeMap;
+  const AAddress, ALimit: UIntPtr): Boolean;
+var
+  Start, P, RangeStart: UIntPtr;
+  Word, Encoding: UInt32;
+begin
+  Result := False;
+  if AMap.FunctionStart(AAddress, Start) then
+  begin
+    if (ALimit < Start) or ((ALimit - Start) div 4 > LR_SCAN_MAX_WORDS) then
+      Exit;
+    P := Start;
+    while P < ALimit do
+    begin
+      if not ReadCodeWord(AMap, P, Word) then
+        Exit;
+      if CrashARM64InstructionStoresFrameRecord(Word) then
+        Exit(True);
+      Inc(P, 4);
+    end;
+  end
+  else if CrashFindCompactFunctionStart(AMap.CompactImages, AAddress,
+            RangeStart, Encoding) then
+    Result := (Encoding and CRASH_UNWIND_ARM64_MODE_MASK) =
+      CRASH_UNWIND_ARM64_MODE_FRAME;
+end;
 {$ENDIF}
+
+function TCrashCodeMap.TopFrameIsRecorded(const AIP: UIntPtr;
+  const AHasLink: Boolean; const ALinkAddress: UIntPtr): Boolean;
+begin
+  Result := False;
+  {$IF Defined(CPUARM64)}
+  if AHasLink then
+  begin
+    // The LR caller is suspended at its call instruction.
+    if ALinkAddress >= SizeOf(UInt32) then
+      Result := FrameRecordStoredBefore(Self, ALinkAddress - SizeOf(UInt32),
+        ALinkAddress - SizeOf(UInt32));
+  end
+  else if AIP <> 0 then
+    Result := FrameRecordStoredBefore(Self, AIP, AIP);
+  {$ENDIF}
+end;
 
 // ARM64 keeps the return address in LR until a function spills it, so the
 // caller of a frameless leaf (syscall stubs, small Delphi leaves) is in no

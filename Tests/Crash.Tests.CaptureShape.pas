@@ -17,6 +17,8 @@
 //   S9  __unwind_info lookup on a hand-built section
 //   S10 macOS: dyld __unwind_info covers this binary's methods with their mode
 //   S11 raw stack scan is windowed by the frame-record chain
+//   S12 ARM64: no raw frame below the first record once the top owner stored
+//       its record (decoder everywhere, live captures on ARM64)
 
 interface
 
@@ -298,6 +300,19 @@ begin
       Exit(True);
 end;
 
+// No raw candidate before the first frame-record frame.
+function NoRawBelowFirstRecord(const ATrace: TCrashThreadRawTrace): Boolean;
+var
+  I: Integer;
+begin
+  Result := True;
+  for I := 0 to High(ATrace.Sources) do
+    case ATrace.Sources[I] of
+      tfsFramePointer: Exit;
+      tfsRaw: Exit(False);
+    end;
+end;
+
 function WaitReady(const AWorker: TShapeWorker): Boolean;
 var
   Deadline: UInt64;
@@ -352,6 +367,8 @@ begin
     {$IF Defined(CPUARM64)}
     AProgress.Account(Captured and Trace.LinkFrameUsed and
       (Length(Trace.Sources) > 1) and (Trace.Sources[1] = tfsLink), ALinkDesc);
+    AProgress.Account(Captured and NoRawBelowFirstRecord(Trace),
+      'S12: ' + ATag + ': no raw frame below the first frame record');
     {$ELSE}
     // x86-64 keeps the return address on the stack: nothing to check.
     AProgress.Info(ALinkDesc + ': n/a on x86-64');
@@ -392,6 +409,10 @@ begin
     AProgress.Account(Captured and Trace.LinkFrameUsed and
       TraceReaches(Trace, ExecLow, ExecHigh),
       'S7: busy frameless leaf: its caller comes from LR');
+    // Execute stored its record before calling the leaf: its dead locals
+    // below that record are not frames.
+    AProgress.Account(Captured and NoRawBelowFirstRecord(Trace),
+      'S12: S7: no raw frame below the first frame record');
     {$ELSE}
     AProgress.Account(Captured and TraceReaches(Trace, ExecLow, ExecHigh),
       'S7: busy frameless leaf: its caller is in the trace');
@@ -700,6 +721,18 @@ begin
     (Trace.RawDroppedCount = 0) and FrameIs(3, Sites[3], tfsRaw);
 end;
 
+function FrameRecordDecoder: Boolean;
+begin
+  Result :=
+    CrashARM64InstructionStoresFrameRecord($A9BF7BFD) and     // stp x29, x30, [sp, #-16]!
+    CrashARM64InstructionStoresFrameRecord($A9017BFD) and     // stp x29, x30, [sp, #16]
+    not CrashARM64InstructionStoresFrameRecord($A9BF7BF3) and // stp x19, x30, [sp, #-16]!
+    not CrashARM64InstructionStoresFrameRecord($A9BF77FD) and // stp x29, x29, [sp, #-16]!
+    not CrashARM64InstructionStoresFrameRecord($A9BF7A7D) and // stp x29, x30, [x19, #-16]!
+    not CrashARM64InstructionStoresFrameRecord($A8C17BFD) and // ldp x29, x30, [sp], #16
+    not CrashARM64InstructionStoresFrameRecord($F81F0FFE);    // str x30, [sp, #-16]!
+end;
+
 procedure PutU16(var ABuf: TBytes; const AOffset: Integer; const AValue: UInt16);
 begin
   Move(AValue, ABuf[AOffset], SizeOf(AValue));
@@ -860,6 +893,8 @@ begin
     'S2: LR is a frame only for a thread stopped in a syscall stub');
   AProgress.Account(RawScanWindow,
     'S11: raw scan stays below the first frame record unless the chain broke');
+  AProgress.Account(FrameRecordDecoder,
+    'S12: ARM64 frame-record store decoder (stp x29, x30 to sp)');
 
   if not CrashThreadCaptureAcquire then
   begin

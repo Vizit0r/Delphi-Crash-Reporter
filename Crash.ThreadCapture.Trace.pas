@@ -3,7 +3,8 @@
 { Turns the raw payload the capture signal handler leaves in a slot into a
   call-stack trace: the exact IP, the ARM64 link-register caller when it is
   provably live, then saved return addresses from frame records and from a
-  bounded raw stack scan below the first record (and above a broken chain),
+  bounded raw stack scan below the first record (unless the ARM64 stack-top
+  owner stored its own record) and above a broken chain,
   merged by stack position and validated against a TCrashCodeMap. Calm path
   only.
 
@@ -47,7 +48,7 @@ type
     BoundsAvailable: Boolean;
     FPFrameCount: Integer;
     RawFrameCount: Integer;
-    RawDroppedCount: Integer; // valid call sites inside the frame-record chain
+    RawDroppedCount: Integer; // valid call sites ruled out by the chain window
     LinkFrameUsed: Boolean;
     StopReason: TCrashThreadCaptureStopReason;
   end;
@@ -181,7 +182,7 @@ var
   Candidates: TCrashTraceCandidates;
   I, N, OutIndex, LeadIndex: Integer;
   Address, StackPos, FirstFPPos, LastFPPos, LinkAddress: UIntPtr;
-  HasLink, ChainComplete: Boolean;
+  HasLink, ChainComplete, TopRecorded: Boolean;
 begin
   ATrace := Default(TCrashThreadRawTrace);
   ATrace.InterruptedIP := UIntPtr(APayload.InterruptedIP);
@@ -209,9 +210,17 @@ begin
     end;
   end;
 
+  HasLink := AMap.LinkFrame(UIntPtr(APayload.InterruptedIP),
+    APayload.InterruptedLR, LinkAddress);
+
   // The chain owns the stack from its first record up: a raw word there is a
-  // dead local, except above a chain that broke before its end.
+  // dead local, except above a chain that broke before its end. Below the
+  // first record only a function that keeps its return address outside a
+  // record can leave a live one (ARM64: ruled out when the top owner stored
+  // its record).
   ChainComplete := ATrace.StopReason in [tcsrEnd, tcsrFrameLimit];
+  TopRecorded := (FirstFPPos <> 0) and AMap.TopFrameIsRecorded(
+    UIntPtr(APayload.InterruptedIP), HasLink, LinkAddress);
   N := Min(APayload.RawWordCount, CRASH_THREAD_CAPTURE_RAW_WORDS);
   for I := 0 to N - 1 do
   begin
@@ -219,8 +228,10 @@ begin
     if not AMap.CallSiteIsValid(Address) then
       Continue;
     StackPos := APayload.RawBaseSP + UIntPtr(I) * SizeOf(Pointer);
-    if (FirstFPPos <> 0) and (StackPos >= FirstFPPos) and
-       ((StackPos <= LastFPPos) or ChainComplete) then
+    if (FirstFPPos <> 0) and
+       (((StackPos < FirstFPPos) and TopRecorded) or
+        ((StackPos >= FirstFPPos) and
+         ((StackPos <= LastFPPos) or ChainComplete))) then
     begin
       if not CandidateAt(Candidates, StackPos) then
         Inc(ATrace.RawDroppedCount);
@@ -230,8 +241,6 @@ begin
   end;
 
   CrashCompactTraceCandidates(Candidates);
-  HasLink := AMap.LinkFrame(UIntPtr(APayload.InterruptedIP),
-    APayload.InterruptedLR, LinkAddress);
   SetLength(ATrace.Addresses, Length(Candidates) +
     Ord(ATrace.InterruptedIP <> 0) + Ord(HasLink));
   SetLength(ATrace.Sources, Length(ATrace.Addresses));
