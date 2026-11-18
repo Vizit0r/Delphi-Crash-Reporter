@@ -16,6 +16,7 @@
 //   S8  busy function that spills LR: a stale LR is never listed
 //   S9  __unwind_info lookup on a hand-built section
 //   S10 macOS: dyld __unwind_info covers this binary's methods with their mode
+//   S11 raw stack scan is windowed by the frame-record chain
 
 interface
 
@@ -286,6 +287,17 @@ begin
       Exit(True);
 end;
 
+function TraceReaches(const ATrace: TCrashThreadRawTrace;
+  const ALow, AHigh: UIntPtr): Boolean;
+var
+  I: Integer;
+begin
+  Result := False;
+  for I := 0 to High(ATrace.Addresses) do
+    if (ATrace.Addresses[I] >= ALow) and (ATrace.Addresses[I] < AHigh) then
+      Exit(True);
+end;
+
 function WaitReady(const AWorker: TShapeWorker): Boolean;
 var
   Deadline: UInt64;
@@ -325,6 +337,16 @@ begin
         ExecHigh)
     else
       AProgress.InfoFmt('%s: capture outcome=%d', [ATag, Ord(Outcome)]);
+    {$IF Defined(CPUX64)}
+    // A libc built without frame pointers may leave no usable FP at all; the
+    // raw scan alone must then reach Execute.
+    if Captured and (Trace.FPFrameCount = 0) and (Trace.StopReason in
+       [tcsrFramePointerZero, tcsrFramePointerOutside,
+        tcsrFramePointerMisaligned]) then
+      AProgress.Account(TraceReaches(Trace, ExecLow, ExecHigh),
+        AReachDesc + ' (no FP chain: raw scan)')
+    else
+    {$ENDIF}
     AProgress.Account(Captured and
       FramePointerReaches(Trace, ExecLow, ExecHigh), AReachDesc);
     {$IF Defined(CPUARM64)}
@@ -339,17 +361,6 @@ begin
     Worker.WaitFor;
     Worker.Free;
   end;
-end;
-
-function TraceReaches(const ATrace: TCrashThreadRawTrace;
-  const ALow, AHigh: UIntPtr): Boolean;
-var
-  I: Integer;
-begin
-  Result := False;
-  for I := 0 to High(ATrace.Addresses) do
-    if (ATrace.Addresses[I] >= ALow) and (ATrace.Addresses[I] < AHigh) then
-      Exit(True);
 end;
 
 procedure RunBusyLeafRound(const AProgress: TCrashTestProgress);
@@ -604,6 +615,91 @@ begin
   {$ENDIF}
 end;
 
+// Raw words share the stack with two frame records: only the one below the
+// first record survives, and the one above the last only when the chain broke.
+function RawScanWindow: Boolean;
+const
+  BASE = UIntPtr($1000);
+  W = SizeOf(Pointer);
+var
+  {$IF Defined(CPUX64)}
+  Code: array [0..255] of Byte;
+  RelativeTarget: Int32;
+  {$ELSE}
+  Code: array [0..31] of UInt32;
+  {$ENDIF}
+  Map: TCrashCodeMap;
+  Sites: array [0..4] of UIntPtr; // A below, F0/F1 records, B inner, C above
+  Payload: TCrashThreadCapturePayload;
+  Trace: TCrashThreadRawTrace;
+  K: Integer;
+
+  function Build(const ACount: Integer;
+    const AStop: TCrashThreadCaptureStopReason): Boolean;
+  begin
+    FillChar(Payload, SizeOf(Payload), 0);
+    Payload.InterruptedIP := $1234;
+    Payload.Count := ACount;
+    Payload.Addrs[0] := Sites[1];
+    Payload.AddrStackPos[0] := BASE + 3 * W;
+    Payload.Addrs[1] := Sites[2];
+    Payload.AddrStackPos[1] := BASE + 7 * W;
+    Payload.RawBaseSP := BASE;
+    Payload.RawWordCount := 10;
+    Payload.RawWords[1] := Sites[0];
+    Payload.RawWords[3] := Sites[1];
+    Payload.RawWords[5] := Sites[3];
+    Payload.RawWords[9] := Sites[4];
+    Payload.StopReason := AStop;
+    CrashBuildThreadTrace(Payload, True, Map, Trace);
+    Result := (Length(Trace.Addresses) = Length(Trace.Sources)) and
+      (Length(Trace.Addresses) > 0) and (Trace.Addresses[0] = $1234);
+  end;
+
+  function FrameIs(const AIndex: Integer; const AAddress: UIntPtr;
+    const ASource: TCrashThreadFrameSource): Boolean;
+  begin
+    Result := (AIndex < Length(Trace.Addresses)) and
+      (Trace.Addresses[AIndex] = AAddress) and (Trace.Sources[AIndex] = ASource);
+  end;
+
+begin
+  Result := False;
+  FillChar(Code, SizeOf(Code), 0);
+  Map := TCrashCodeMap.ForRange(UIntPtr(@Code[0]),
+    UIntPtr(@Code[0]) + SizeOf(Code));
+  for K := 0 to High(Sites) do
+  begin
+    {$IF Defined(CPUX64)}
+    Sites[K] := UIntPtr(@Code[16 * (K + 1)]);
+    Code[16 * (K + 1) - 5] := $E8;
+    RelativeTarget := Int32(Int64(UIntPtr(@Code[240])) - Int64(Sites[K]));
+    Move(RelativeTarget, Code[16 * (K + 1) - 4], SizeOf(RelativeTarget));
+    {$ELSE}
+    Code[4 * K + 3] := $94000000; // BL
+    Sites[K] := UIntPtr(@Code[4 * K + 4]);
+    {$ENDIF}
+    if not Map.CallSiteIsValid(Sites[K]) then
+      Exit;
+  end;
+
+  // Complete chain: the inner and the upper raw word are dead locals.
+  if not (Build(2, tcsrEnd) and (Length(Trace.Addresses) = 4) and
+     FrameIs(1, Sites[0], tfsRaw) and FrameIs(2, Sites[1], tfsFramePointer) and
+     FrameIs(3, Sites[2], tfsFramePointer) and (Trace.RawFrameCount = 1) and
+     (Trace.RawDroppedCount = 2)) then
+    Exit;
+  // Broken chain: the raw scan continues above its last record.
+  if not (Build(2, tcsrFramePointerOutside) and
+     (Length(Trace.Addresses) = 5) and FrameIs(1, Sites[0], tfsRaw) and
+     FrameIs(4, Sites[4], tfsRaw) and (Trace.RawDroppedCount = 1)) then
+    Exit;
+  // No records at all: every raw word is all there is.
+  Result := Build(0, tcsrFramePointerZero) and
+    (Length(Trace.Addresses) = 5) and (Trace.RawFrameCount = 4) and
+    (Trace.RawDroppedCount = 0) and FrameIs(3, Sites[3], tfsRaw);
+end;
+
 procedure PutU16(var ABuf: TBytes; const AOffset: Integer; const AValue: UInt16);
 begin
   Move(AValue, ABuf[AOffset], SizeOf(AValue));
@@ -762,6 +858,8 @@ begin
   {$ENDIF}
   AProgress.Account(LinkRegisterRules,
     'S2: LR is a frame only for a thread stopped in a syscall stub');
+  AProgress.Account(RawScanWindow,
+    'S11: raw scan stays below the first frame record unless the chain broke');
 
   if not CrashThreadCaptureAcquire then
   begin

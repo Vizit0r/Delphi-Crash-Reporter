@@ -756,7 +756,19 @@ were doing around the crash, not just the raise point.
   than faulting inside the reporter.
   FP-derived frames are the trusted source; the raw scan is a bounded heuristic
   used to recover callers across leaf/non-FP code and may still omit a real frame
-  or accept a call-shaped value from stack data.
+  or accept a call-shaped value from stack data. It is windowed by the chain:
+  raw words are kept only below the first frame record, and above the last one
+  only when the chain broke (any stop other than `end`/`frame-limit`); words in
+  between are dead locals of framed functions and are dropped (`raw-dropped=` in
+  the diagnostics counts them). A frameless non-leaf function between two framed
+  ones is therefore not recovered. This matters on distributions that build
+  without frame pointers (Debian 13's glibc keeps a frame record in ~2% of its
+  functions): the syscall wrappers at the stack top lie below the first record
+  and stay, most callback-taking functions use RBP as a scratch register and so
+  break the chain (the scan then continues above it), but a wrapper that leaves
+  RBP alone and calls back into framed code (`pthread_once`) is lost. Such a
+  glibc may also leave RBP zero in a parked thread: then there is no chain and
+  the raw scan is the whole trace.
 - **ARM64 pointer authentication.** Code built with PAC (bionic on newer Android,
   arm64e system code) signs the LR it saves, so the saved return address carries
   a signature above the user VA. The calm path strips everything above the
@@ -887,7 +899,7 @@ msbuild Tests/CrashTests.dproj /t:Build /p:Config=Release /p:Platform=Linux64
 | `CrashRawFallback` | the raw hardware-fault fallback: format, corruption, recovery |
 | `CrashHandledFault` | a handled hardware fault keeps capture armed and leaves no stale snapshot |
 | `CrashExtendedThreads` | registered-thread capture: limits, budgets, integration |
-| `CrashCaptureShape` | what a real capture contains for parked and busy threads (also on Android): frame records reach `Execute`, PAC stripping, LR of a syscall stub or frameless leaf, no stale LR; `__unwind_info` lookup (synthetic, and the real image on macOS) |
+| `CrashCaptureShape` | what a real capture contains for parked and busy threads (also on Android): frame records reach `Execute`, PAC stripping, LR of a syscall stub or frameless leaf, no stale LR; raw-scan window; `__unwind_info` lookup (synthetic, and the real image on macOS) |
 | `CrashFreeze` | the freeze detector: detection, suppression, re-arm, whole-process stall grace, `RestartOnFreeze` contract, BugID normalization |
 | `CrashChildProcess` | the runner starts itself as a child that dies of a real fault (unhandled raise, null write, a raise after a swallowed fault on the same or another thread, stack overflow) and checks the `.el` it leaves; the stack overflow (Linux only) is recovered from the raw block by the next start; a `ReportHandled` exception leaves a `.el` and the child keeps running, with an attachment provider a `.elp` package |
 

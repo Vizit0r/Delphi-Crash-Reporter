@@ -1041,7 +1041,7 @@ begin
           (Pos('bounds=ok', Threads[Index].CaptureDiagnostics) > 0) and
           (Pos('fp-frames=', Threads[Index].CaptureDiagnostics) > 0) and
           (Pos('raw-frames=', Threads[Index].CaptureDiagnostics) > 0) and
-          (Pos('raw-inner=', Threads[Index].CaptureDiagnostics) > 0) and
+          (Pos('raw-dropped=', Threads[Index].CaptureDiagnostics) > 0) and
           (Pos('stop=', Threads[Index].CaptureDiagnostics) > 0);
       end;
     end;
