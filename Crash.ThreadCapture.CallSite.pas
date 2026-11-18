@@ -414,7 +414,6 @@ var
   Start: UIntPtr;
   Known: Boolean;
 begin
-  Result := False;
   Known := False;
   if AMap.FunctionStart(AIP, Start) then
     Result := LinkRegisterLiveAt(AMap, Start, AIP, Known)

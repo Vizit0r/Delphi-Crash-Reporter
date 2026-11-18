@@ -71,7 +71,6 @@ end;
 
 function RaiseAndReportHandled: TObject;
 begin
-  Result := nil;
   try
     raise ECrashHandledReportTest.Create('handled report fixture');
   except

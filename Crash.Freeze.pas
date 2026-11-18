@@ -180,7 +180,7 @@ const
 
 var
   GWatchedCapture: TCrashThreadCaptureHandle = nil;
-  GWatchedThread: pthread_t = 0;
+  GWatchedThread: pthread_t;
   GTimeoutMS:     Int64 = 0;
   GLastPingMS:    Int64 = 0;   // TThread.GetTickCount64 (CLOCK_MONOTONIC: excludes system suspend)
   GSuppress:      Integer = 0;
