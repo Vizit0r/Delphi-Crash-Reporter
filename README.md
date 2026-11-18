@@ -734,7 +734,7 @@ were doing around the crash, not just the raise point.
 - Each thread receives the capture signal (a free realtime signal on
   Linux/Android, SIGUSR2 on macOS). The action uses `SA_ONSTACK` on every
   supported POSIX target. The handler records the kernel-supplied exact IP/SP/FP
-  and walks only inside the bounds saved at registration: at most 64 FP records
+  (and LR on ARM64) and walks only inside the bounds saved at registration: at most 64 FP records
   plus 128 pointer-sized raw words, all into a preallocated slot, with no
   allocation, strings, locks, symbolization or platform unwinder. The reporter
   waits at most **100 ms** per thread and **1000 ms** in total on a monotonic
@@ -744,10 +744,25 @@ were doing around the crash, not just the raise point.
   readable executable mapping and follow a supported call instruction. Code is
   read fault-free (`process_vm_readv` on Linux/Android,
   `vm_read_overwrite` on macOS), so a stale/unreadable mapping is rejected rather
-  than faulting inside the reporter. ARM64 signed/PAC-like addresses fail closed.
+  than faulting inside the reporter.
   FP-derived frames are the trusted source; the raw scan is a bounded heuristic
   used to recover callers across leaf/non-FP code and may still omit a real frame
   or accept a call-shaped value from stack data.
+- **ARM64 pointer authentication.** Code built with PAC (bionic on newer Android,
+  arm64e system code) signs the LR it saves, so the saved return address carries
+  a signature above the user VA. The calm path strips everything above the
+  highest executable mapping before validation; the executable-range and BL/BLR
+  checks still apply, so a stripped value is accepted only if it is a real call
+  site. Without this the FP chain stopped (`stop=fp-invalid-code`) at the first
+  frame record written by such code.
+- **ARM64 link register.** A frameless leaf (a syscall stub, a small Delphi leaf)
+  never writes a frame record, so its caller exists only in LR. LR becomes frame 1
+  (`lr=used` in the diagnostics) only where it is provably live: on Android the
+  function holding the IP is found through the module's `.eh_frame_hdr`, and LR
+  is used if that function has not spilled x30 before the IP; without an FDE (and
+  on macOS) only when the IP sits on or right after an `SVC`, i.e. the thread is
+  parked in a syscall stub. A function that already spilled LR may have called
+  something since, and its LR would be a stale frame inside itself.
 - A thread that could not be sampled still gets its block, with the reason in
   `Comment=` instead of frames: `Extended capture timed out`, `Thread exited
   during extended capture`, `Extended capture signal unavailable`, `Extended
@@ -860,6 +875,7 @@ msbuild Tests/CrashTests.dproj /t:Build /p:Config=Release /p:Platform=Linux64
 | `CrashRawFallback` | the raw hardware-fault fallback: format, corruption, recovery |
 | `CrashHandledFault` | a handled hardware fault keeps capture armed and leaves no stale snapshot |
 | `CrashExtendedThreads` | registered-thread capture: limits, budgets, integration |
+| `CrashCaptureShape` | what a real capture contains for parked and busy threads (also on Android): frame records reach `Execute`, PAC stripping, LR of a syscall stub or frameless leaf, no stale LR |
 | `CrashFreeze` | the freeze detector: detection, suppression, re-arm, whole-process stall grace, `RestartOnFreeze` contract, BugID normalization |
 | `CrashChildProcess` | the runner starts itself as a child that dies of a real fault (unhandled raise, null write, a raise after a swallowed fault on the same or another thread, stack overflow) and checks the `.el` it leaves; the stack overflow (Linux only) is recovered from the raw block by the next start; a `ReportHandled` exception leaves a `.el` and the child keeps running, with an attachment provider a `.elp` package |
 

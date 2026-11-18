@@ -41,6 +41,7 @@ uses
   Crash.Tests.HandledFault,
   Crash.Tests.HandledReport,
   Crash.Tests.ExtendedThreads,
+  Crash.Tests.CaptureShape,
   Crash.Tests.Freeze,
   Crash.Tests.ChildProcess;
 
