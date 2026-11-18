@@ -26,6 +26,7 @@ uses
   {$ENDIF}
   Crash.ThreadCapture,
   Crash.Unwind.EhFrame,
+  Crash.Unwind.CompactUnwind,
   Crash.ThreadCapture.CallSite,
   Crash.ThreadCapture.Trace,
   Crash.ReportNaming,

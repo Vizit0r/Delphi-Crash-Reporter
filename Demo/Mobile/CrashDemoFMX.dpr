@@ -16,6 +16,7 @@ uses
   Crash.Signals in '..\..\Crash.Signals.pas',
   Crash.ThreadCapture in '..\..\Crash.ThreadCapture.pas',
   Crash.Unwind.EhFrame in '..\..\Crash.Unwind.EhFrame.pas',
+  Crash.Unwind.CompactUnwind in '..\..\Crash.Unwind.CompactUnwind.pas',
   Crash.ThreadCapture.CallSite in '..\..\Crash.ThreadCapture.CallSite.pas',
   Crash.ThreadCapture.Trace in '..\..\Crash.ThreadCapture.Trace.pas',
   Crash.ELFormat in '..\..\Crash.ELFormat.pas',

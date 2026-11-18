@@ -14,6 +14,8 @@
 //   S6  sleeper: ARM64 adds the syscall caller from LR
 //   S7  busy frameless leaf: its caller (Execute) comes from LR on ARM64
 //   S8  busy function that spills LR: a stale LR is never listed
+//   S9  __unwind_info lookup on a hand-built section
+//   S10 macOS: dyld __unwind_info covers this binary's methods with their mode
 
 interface
 
@@ -49,6 +51,7 @@ uses
   Crash.ThreadCapture,
   Crash.ThreadCapture.CallSite,
   Crash.ThreadCapture.Trace,
+  Crash.Unwind.CompactUnwind,
   Crash.Tests.Registry,
   Crash.Tests.Progress
   {$IF Defined(CRASH_CAPTURE_SHAPE_RUNTIME)}
@@ -373,7 +376,7 @@ begin
     if Captured then
       DumpCapture(AProgress, 'S7', Worker.CaptureHandle, Trace, ExecLow,
         ExecHigh);
-    {$IF Defined(ANDROID) and Defined(CPUARM64)}
+    {$IF Defined(CPUARM64)}
     // The leaf keeps no frame record: only LR knows Execute called it.
     AProgress.Account(Captured and Trace.LinkFrameUsed and
       TraceReaches(Trace, ExecLow, ExecHigh),
@@ -397,9 +400,10 @@ var
   Trace: TCrashThreadRawTrace;
   Outcome: TCrashThreadCaptureOutcome;
   SpinMethod: TShapeMethod;
-  SpinStart, IPStart, LRStart: UIntPtr;
-  I, Captured, InSpin, LinkUsed, Stale: Integer;
-  Dumped, KnowsFunctions: Boolean;
+  SpinStart, IPStart, LRStart, RangeStart: UIntPtr;
+  I, Captured, InSpin, InFramed, LinkUsed, Stale: Integer;
+  Dumped, KnowsFunctions, HasMode, StaleSample: Boolean;
+  Encoding: UInt32;
   Map: TCrashCodeMap;
 begin
   Map := CrashCurrentCodeMap;
@@ -418,6 +422,7 @@ begin
     TThread.Sleep(PARK_SETTLE_MS);
     Captured := 0;
     InSpin := 0;
+    InFramed := 0;
     LinkUsed := 0;
     Stale := 0;
     Dumped := False;
@@ -434,11 +439,24 @@ begin
          Map.FunctionStart(Trace.InterruptedIP, IPStart) and
          (IPStart = SpinStart) then
         Inc(InSpin);
-      if Trace.LinkFrameUsed and (Length(Trace.Addresses) > 1) and
-         ((not KnowsFunctions) or
-          (Map.FunctionStart(Trace.InterruptedIP, IPStart) and
-           Map.FunctionStart(Trace.Addresses[1], LRStart) and
-           (IPStart = LRStart))) then
+      HasMode := CrashFindCompactFunctionStart(Map.CompactImages,
+        Trace.InterruptedIP, RangeStart, Encoding);
+      if HasMode and ((Encoding and CRASH_UNWIND_ARM64_MODE_MASK) =
+         CRASH_UNWIND_ARM64_MODE_FRAME) then
+        Inc(InFramed);
+      if not (Trace.LinkFrameUsed and (Length(Trace.Addresses) > 1)) then
+        StaleSample := False
+      else if KnowsFunctions then
+        StaleSample := Map.FunctionStart(Trace.InterruptedIP, IPStart) and
+          Map.FunctionStart(Trace.Addresses[1], LRStart) and
+          (IPStart = LRStart)
+      else if HasMode then
+        // Compact unwind: LR is only legitimate inside a frameless range.
+        StaleSample := (Encoding and CRASH_UNWIND_ARM64_MODE_MASK) <>
+          CRASH_UNWIND_ARM64_MODE_FRAMELESS
+      else
+        StaleSample := True;
+      if StaleSample then
       begin
         Inc(Stale);
         if not Dumped then
@@ -450,11 +468,17 @@ begin
       end;
       TThread.Sleep(3);
     end;
-    AProgress.InfoFmt('S8: samples=%d ip-in-SpinFramed=%d lr-used=%d stale=%d',
-      [Captured, InSpin, LinkUsed, Stale]);
+    AProgress.InfoFmt(
+      'S8: samples=%d ip-in-SpinFramed=%d ip-in-framed=%d lr-used=%d stale=%d',
+      [Captured, InSpin, InFramed, LinkUsed, Stale]);
     {$IF Defined(ANDROID) and Defined(CPUARM64)}
     // Samples inside SpinFramed itself make the check non-vacuous.
     AProgress.Account(KnowsFunctions and (InSpin > 0) and (Stale = 0),
+      'S8: busy function that spilled LR: no stale LR frame');
+    {$ELSEIF Defined(MACOS) and Defined(CPUARM64)}
+    // Compact unwind names no exact function; samples in a FRAME range make
+    // the check non-vacuous.
+    AProgress.Account((InFramed > 0) and (Stale = 0),
       'S8: busy function that spilled LR: no stale LR frame');
     {$ELSE}
     // Without a function index LR is trusted only in a syscall stub.
@@ -580,8 +604,155 @@ begin
   {$ENDIF}
 end;
 
+procedure PutU16(var ABuf: TBytes; const AOffset: Integer; const AValue: UInt16);
+begin
+  Move(AValue, ABuf[AOffset], SizeOf(AValue));
+end;
+
+procedure PutU32(var ABuf: TBytes; const AOffset: Integer; const AValue: UInt32);
+begin
+  Move(AValue, ABuf[AOffset], SizeOf(AValue));
+end;
+
+// A hand-built __unwind_info: one regular page (with a gap entry) and one
+// compressed page using a common and a page-local encoding.
+function CompactUnwindLookup: Boolean;
+const
+  BASE = UIntPtr($10000000);
+var
+  Buf: TBytes;
+  Images: TCrashCompactUnwindImages;
+  Start: UIntPtr;
+  Encoding: UInt32;
+
+  function Expect(const AOffset: UIntPtr; const AStart: UIntPtr;
+    const AEncoding: UInt32): Boolean;
+  begin
+    Result := CrashFindCompactFunctionStart(Images, BASE + AOffset, Start,
+      Encoding) and (Start = BASE + AStart) and (Encoding = AEncoding);
+  end;
+
+  function Missing(const AOffset: UIntPtr): Boolean;
+  begin
+    Result := not CrashFindCompactFunctionStart(Images, BASE + AOffset, Start,
+      Encoding);
+  end;
+
+begin
+  SetLength(Buf, 124);
+  FillChar(Buf[0], Length(Buf), 0);
+  // Header: version, common encodings @28 x1, personalities @32 x0, index @32 x3.
+  PutU32(Buf, 0, 1);
+  PutU32(Buf, 4, 28);
+  PutU32(Buf, 8, 1);
+  PutU32(Buf, 12, 32);
+  PutU32(Buf, 16, 0);
+  PutU32(Buf, 20, 32);
+  PutU32(Buf, 24, 3);
+  PutU32(Buf, 28, CRASH_UNWIND_ARM64_MODE_FRAME);
+  // First level: $1000 -> regular page @68, $2000 -> compressed page @100,
+  // sentinel $3000.
+  PutU32(Buf, 32, $1000);
+  PutU32(Buf, 36, 68);
+  PutU32(Buf, 44, $2000);
+  PutU32(Buf, 48, 100);
+  PutU32(Buf, 56, $3000);
+  // Regular page: entries @+8: $1000 frameless, $1100 frame, $1180 no info.
+  PutU32(Buf, 68, 2);
+  PutU16(Buf, 72, 8);
+  PutU16(Buf, 74, 3);
+  PutU32(Buf, 76, $1000);
+  PutU32(Buf, 80, CRASH_UNWIND_ARM64_MODE_FRAMELESS);
+  PutU32(Buf, 84, $1100);
+  PutU32(Buf, 88, CRASH_UNWIND_ARM64_MODE_FRAME);
+  PutU32(Buf, 92, $1180);
+  PutU32(Buf, 96, 0);
+  // Compressed page: entries @+12, page encodings @+20 (one).
+  PutU32(Buf, 100, 3);
+  PutU16(Buf, 104, 12);
+  PutU16(Buf, 106, 2);
+  PutU16(Buf, 108, 20);
+  PutU16(Buf, 110, 1);
+  PutU32(Buf, 112, $000000);           // +$000, common encoding 0
+  PutU32(Buf, 116, $400 or (1 shl 24)); // +$400, page-local encoding
+  PutU32(Buf, 120, CRASH_UNWIND_ARM64_MODE_FRAMELESS or $1000);
+
+  SetLength(Images, 1);
+  Images[0].LowAddress := BASE + $1000;
+  Images[0].HighAddress := BASE + $3000;
+  Images[0].ImageBase := BASE;
+  Images[0].UnwindInfo := UIntPtr(@Buf[0]);
+  Images[0].UnwindInfoSize := Length(Buf);
+
+  Result :=
+    Expect($1050, $1000, CRASH_UNWIND_ARM64_MODE_FRAMELESS) and
+    Expect($1100, $1100, CRASH_UNWIND_ARM64_MODE_FRAME) and
+    Missing($1190) and
+    Expect($2300, $2000, CRASH_UNWIND_ARM64_MODE_FRAME) and
+    Expect($2500, $2400, CRASH_UNWIND_ARM64_MODE_FRAMELESS or $1000) and
+    Missing($0FFF) and Missing($3000);
+  if not Result then
+    Exit;
+  // A section cut short must fail the lookup, never read past it.
+  Images[0].UnwindInfoSize := 90;
+  Result := Missing($1050) or (Start = BASE + $1000);
+  Images[0].UnwindInfoSize := 70;
+  Result := Result and Missing($1050);
+end;
+
+{$IF Defined(MACOS)}
+// The real __unwind_info of this binary, found through dyld: every known
+// method lies in an entry (a range that may also hold earlier functions with
+// the same encoding), and that entry carries the frame mode Delphi emits.
+function CompactUnwindRealImage(const AProgress: TCrashTestProgress): Boolean;
+var
+  Images: TCrashCompactUnwindImages;
+  Methods: array [0..2] of UIntPtr;
+  Start, InnerStart: UIntPtr;
+  Encoding, InnerEncoding, Mode: UInt32;
+  I: Integer;
+  ModeOK: Boolean;
+begin
+  Images := CrashEnumerateCompactUnwindImages;
+  AProgress.InfoFmt('S10: dyld images with __unwind_info: %d', [Length(Images)]);
+  Result := Length(Images) > 0;
+  Methods[0] := UIntPtr(@TShapeWorker.Execute);
+  Methods[1] := UIntPtr(@TShapeWorker.SpinBusy);
+  Methods[2] := UIntPtr(@TShapeWorker.SpinFramed);
+  for I := 0 to High(Methods) do
+  begin
+    if not (CrashFindCompactFunctionStart(Images, Methods[I], Start, Encoding) and
+       CrashFindCompactFunctionStart(Images, Methods[I] + 4, InnerStart,
+         InnerEncoding)) then
+    begin
+      AProgress.InfoFmt('S10: method %d at $%x: no entry', [I, UInt64(Methods[I])]);
+      Result := False;
+      Continue;
+    end;
+    Mode := Encoding and CRASH_UNWIND_ARM64_MODE_MASK;
+    {$IF Defined(CPUX64)}
+    ModeOK := Mode = $01000000; // UNWIND_X86_64_MODE_RBP_FRAME
+    {$ELSE}
+    ModeOK := (Mode = CRASH_UNWIND_ARM64_MODE_FRAME) or
+      (Mode = CRASH_UNWIND_ARM64_MODE_FRAMELESS);
+    {$ENDIF}
+    AProgress.InfoFmt('S10: method %d at $%x: entry=$%x (-$%x) encoding=$%.8x',
+      [I, UInt64(Methods[I]), UInt64(Start), UInt64(Methods[I] - Start), Encoding]);
+    if not ((Start <= Methods[I]) and (InnerStart = Start) and
+       (InnerEncoding = Encoding) and ModeOK) then
+      Result := False;
+  end;
+end;
+{$ENDIF}
+
 procedure RunCaptureShapeTests(const AProgress: TCrashTestProgress);
 begin
+  AProgress.Account(CompactUnwindLookup,
+    'S9: __unwind_info lookup: regular/compressed pages, gaps, bounds');
+  {$IF Defined(MACOS)}
+  AProgress.Account(CompactUnwindRealImage(AProgress),
+    'S10: dyld __unwind_info covers this binary''s methods with their frame mode');
+  {$ENDIF}
   {$IF Defined(CPUARM64)}
   AProgress.Account(PointerAuthStrip,
     'S1: PAC-signed saved LR is stripped and still validated');

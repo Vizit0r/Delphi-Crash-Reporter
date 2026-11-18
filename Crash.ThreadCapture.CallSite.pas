@@ -16,12 +16,14 @@ interface
 
 uses
   Crash.Modules,
+  Crash.Unwind.CompactUnwind,
   Crash.Unwind.EhFrame;
 
 type
   TCrashCodeMap = record
     Ranges: TCrashExecutableRanges;
-    Modules: TCrashUnwindModules;
+    Modules: TCrashUnwindModules;           // ELF .eh_frame_hdr
+    CompactImages: TCrashCompactUnwindImages; // Mach-O __unwind_info
     // Low bits that can hold a user code address (all ones above the highest
     // executable mapping are cleared by NormalizeCodeAddress on ARM64).
     AddressMask: UIntPtr;
@@ -35,6 +37,8 @@ type
     function NormalizeCodeAddress(const AAddress: UIntPtr): UIntPtr;
     // AReturnAddress is executable and directly follows a call instruction.
     function CallSiteIsValid(const AReturnAddress: UIntPtr): Boolean;
+    // Exact function start (ELF FDE). Compact unwind cannot give one: it
+    // merges neighbouring functions that share an encoding.
     function FunctionStart(const AAddress: UIntPtr; out AStart: UIntPtr): Boolean;
     // ARM64: the frame LR contributes for a thread stopped at AIP, if any.
     function LinkFrame(const AIP, ALinkRegister: UIntPtr;
@@ -361,8 +365,34 @@ begin
   Result := True;
 end;
 
+{ Compact unwind merges neighbouring functions with the same encoding, so its
+  range start is not the function start - but the mode holds for every
+  function of the range: FRAMELESS never spills LR, FRAME does (an IP still in
+  the prologue loses the caller, the safe side). }
+function LinkRegisterLiveByCompactMode(const AMap: TCrashCodeMap;
+  const AIP: UIntPtr; out AKnown: Boolean): Boolean;
+var
+  RangeStart: UIntPtr;
+  Encoding: UInt32;
+begin
+  Result := False;
+  AKnown := False;
+  if not CrashFindCompactFunctionStart(AMap.CompactImages, AIP, RangeStart,
+       Encoding) then
+    Exit;
+  case Encoding and CRASH_UNWIND_ARM64_MODE_MASK of
+    CRASH_UNWIND_ARM64_MODE_FRAMELESS:
+      begin
+        AKnown := True;
+        Result := True;
+      end;
+    CRASH_UNWIND_ARM64_MODE_FRAME:
+      AKnown := True;
+  end;
+end;
+
 // LR is the caller of the function at AIP while that function has not
-// spilled it. Without an FDE only a syscall stub is trusted.
+// spilled it. Without unwind data only a syscall stub is trusted.
 function LinkRegisterLive(const AMap: TCrashCodeMap; const AIP: UIntPtr): Boolean;
 var
   Start: UIntPtr;
@@ -371,7 +401,9 @@ begin
   Result := False;
   Known := False;
   if AMap.FunctionStart(AIP, Start) then
-    Result := LinkRegisterLiveAt(AMap, Start, AIP, Known);
+    Result := LinkRegisterLiveAt(AMap, Start, AIP, Known)
+  else
+    Result := LinkRegisterLiveByCompactMode(AMap, AIP, Known);
   if not Known then
     Result := InterruptedInSyscallStub(AMap, AIP);
 end;
@@ -415,6 +447,7 @@ function TCrashCodeMap.DescribeLinkDecision(const AIP: UIntPtr): String;
 var
   Start: UIntPtr;
   Known, Live: Boolean;
+  Encoding: UInt32;
 begin
   if FunctionStart(AIP, Start) then
   begin
@@ -423,8 +456,14 @@ begin
       [UInt64(Start), UInt64(AIP - Start), BoolToStr(Live, True),
        BoolToStr(Known, True)]);
   end
+  else if CrashFindCompactFunctionStart(CompactImages, AIP, Start, Encoding) then
+  begin
+    Live := LinkRegisterLiveByCompactMode(Self, AIP, Known);
+    Result := Format('compact-range=$%x encoding=$%.8x lr-live=%s known=%s ',
+      [UInt64(Start), Encoding, BoolToStr(Live, True), BoolToStr(Known, True)]);
+  end
   else
-    Result := 'no-fde ';
+    Result := 'no-unwind-info ';
   Result := Result + 'svc=' +
     BoolToStr(InterruptedInSyscallStub(Self, AIP), True);
 end;
@@ -439,6 +478,7 @@ var
   NowTick: UInt64;
   Ranges: TCrashExecutableRanges;
   Modules: TCrashUnwindModules;
+  CompactImages: TCrashCompactUnwindImages;
 begin
   GLock.Enter;
   try
@@ -452,6 +492,7 @@ begin
       except
         Ranges := nil;
       end;
+      CompactImages := nil;
       {$IF Defined(CPUARM64)}
       // Function bounds only feed the ARM64 LR decision.
       try
@@ -459,8 +500,14 @@ begin
       except
         Modules := nil;
       end;
+      try
+        CompactImages := CrashEnumerateCompactUnwindImages;
+      except
+        CompactImages := nil;
+      end;
       {$ENDIF}
       GMap := TCrashCodeMap.Create(Ranges, Modules);
+      GMap.CompactImages := CompactImages;
       GMapTick := NowTick;
       GMapValid := Length(Ranges) > 0;
     end;

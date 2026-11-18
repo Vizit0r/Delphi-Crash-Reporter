@@ -280,6 +280,7 @@ Core (framework-agnostic):
 - `Crash.ThreadCapture.Trace` — turns the handler's raw payload into a trace: IP, ARM64 LR frame, frame-record and raw-scan return addresses merged by stack position; the trace types and the diagnostics line.
 - `Crash.ThreadCapture.CallSite` — `TCrashCodeMap`, an immutable snapshot of executable ranges, the PAC mask and the `.eh_frame_hdr` modules: return-address validation, pointer-auth stripping, when ARM64 LR is still the caller; plus the pure instruction decoders.
 - `Crash.Unwind.EhFrame` — function lookup through a 64-bit ELF module's `.eh_frame_hdr` (FDE → function start).
+- `Crash.Unwind.CompactUnwind` — the same for Mach-O `__unwind_info` (Apple compact unwind: start and encoding); images come from dyld.
 - `Crash.Breadcrumbs` — bounded, thread-safe host diagnostic trail.
 - `Crash.RawFallback` — preallocated binary fallback slots and startup recovery.
 - `Crash.Modules` — loaded-module enumeration.
@@ -765,11 +766,14 @@ were doing around the crash, not just the raise point.
   frame record written by such code.
 - **ARM64 link register.** A frameless leaf (a syscall stub, a small Delphi leaf)
   never writes a frame record, so its caller exists only in LR. LR becomes frame 1
-  (`lr=used` in the diagnostics) only where it is provably live: on Android the
+  (`lr=used` in the diagnostics) only where it is provably live. On Android the
   function holding the IP is found through the module's `.eh_frame_hdr`, and LR
-  is used if that function has not spilled x30 before the IP; without an FDE (and
-  on macOS) only when the IP sits on or right after an `SVC`, i.e. the thread is
-  parked in a syscall stub. A function that already spilled LR may have called
+  is used if that function has not spilled x30 before the IP. On macOS the
+  `__unwind_info` mode decides: FRAMELESS keeps the return address in LR, FRAME
+  does not (compact unwind merges neighbouring functions that share an
+  encoding, so it names a range rather than the function start - the mode is
+  exact for the whole range). Without unwind data LR is used only when the IP
+  sits on or right after an `SVC`, i.e. the thread is parked in a syscall stub. A function that already spilled LR may have called
   something since, and its LR would be a stale frame inside itself.
 - A thread that could not be sampled still gets its block, with the reason in
   `Comment=` instead of frames: `Extended capture timed out`, `Thread exited
@@ -883,7 +887,7 @@ msbuild Tests/CrashTests.dproj /t:Build /p:Config=Release /p:Platform=Linux64
 | `CrashRawFallback` | the raw hardware-fault fallback: format, corruption, recovery |
 | `CrashHandledFault` | a handled hardware fault keeps capture armed and leaves no stale snapshot |
 | `CrashExtendedThreads` | registered-thread capture: limits, budgets, integration |
-| `CrashCaptureShape` | what a real capture contains for parked and busy threads (also on Android): frame records reach `Execute`, PAC stripping, LR of a syscall stub or frameless leaf, no stale LR |
+| `CrashCaptureShape` | what a real capture contains for parked and busy threads (also on Android): frame records reach `Execute`, PAC stripping, LR of a syscall stub or frameless leaf, no stale LR; `__unwind_info` lookup (synthetic, and the real image on macOS) |
 | `CrashFreeze` | the freeze detector: detection, suppression, re-arm, whole-process stall grace, `RestartOnFreeze` contract, BugID normalization |
 | `CrashChildProcess` | the runner starts itself as a child that dies of a real fault (unhandled raise, null write, a raise after a swallowed fault on the same or another thread, stack overflow) and checks the `.el` it leaves; the stack overflow (Linux only) is recovered from the raw block by the next start; a `ReportHandled` exception leaves a `.el` and the child keeps running, with an attachment provider a `.elp` package |
 
