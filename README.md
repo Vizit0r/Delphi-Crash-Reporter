@@ -1000,8 +1000,8 @@ msbuild Demo\Mobile\CrashDemoFMX.dproj /t:Build;Deploy \
   /p:Config=Debug /p:Platform=Android64
 ```
 
-The project deliberately carries the complete 88-jar FMX mobile dex list from
-the RAD Studio 37.0 template. If that list changes, delete generated
+The project deliberately carries the complete FMX mobile dex list (99 jars)
+from the RAD Studio 37.0 (13.2) template. If that list changes, delete generated
 `Android64\Debug\BuildClassesDex.stamp` and `CrashDemoFMX.classes` before the
 next `Build;Deploy`; the IDE target does not include `EnabledSysJars` in its
 cache stamp. The build also generates `.gosym` and `.gol` from the fresh
