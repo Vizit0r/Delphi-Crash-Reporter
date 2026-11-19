@@ -31,7 +31,7 @@ for this library.
 | Capability | Linux | macOS | Android | iOS | Windows |
 |---|---|---|---|---|---|
 | Unhandled-exception trapping | ✅ | ✅ | ✅ | ⚠ compile-only | ❌ (EurekaLog) |
-| Call stack (Pascal names) | ✅ | ✅ (LC_SYMTAB) | ✅ (`.gosym`) | ⚠ compile-only | — |
+| Call stack (Pascal names) | ✅ (`.dynsym` + `.gosym`) | ✅ (LC_SYMTAB) | ✅ (`.gosym`) | ⚠ compile-only | — |
 | Source line numbers (`.gol`) | ✅ | ✅ | ✅ | — | — |
 | CPU registers on hardware faults | ✅ | ✅ (x64/ARM64 Mach) | ✅ (ARM64) | ⚠ compile-only | ❌ (EurekaLog) |
 | Raw fallback when RTL conversion does not survive | ✅ | ✅ (x64/ARM64) | ✅ (ARM64) | ⚠ compile-only | ❌ |
@@ -286,7 +286,9 @@ Core (framework-agnostic):
 - `Crash.Modules` — loaded-module enumeration.
 - `Crash.Pending` — atomic report publication, delivery markers and startup partitioning.
 - `Crash.LineNumbers` — `.gol` line-number reader.
-- `Crash.Android.Symbols` — `.gosym` reader: address → Pascal name + source file on Android.
+- `Crash.SymbolFile` — `.gosym` format reader (platform-free) and ELF build-id reader.
+- `Crash.Android.Symbols` — `.gosym` lookup: address → Pascal name + source file on Android.
+- `Crash.Linux.Symbols` — `.gosym` lookup on Linux, for the routines `dladdr` cannot name.
 - `Crash.ELFormat` — EurekaLog `.el` text writer.
 - `Crash.MacOS.Api` / `Crash.MacOS.Symbols` — Mach-O structs + LC_SYMTAB symbolication.
 - `Crash.Demangle` — C++ (Itanium) → Pascal symbol translation.
@@ -320,8 +322,10 @@ All emit the same `.gol` byte format that `Crash.LineNumbers` reads at runtime.
 ### Build requirements
 
 - **Linux64**: `DCC_DebugInformation=2` (keep DWARF for the generator) and the
-  linker option `--export-dynamic` (so `dladdr` sees Pascal symbols). Without
-  the latter the call stack falls back to module-offset proxies.
+  linker option `--export-dynamic` (so `dladdr` sees the global Pascal symbols).
+  Without the latter the call stack falls back to module-offset proxies. Routines
+  the compiler emits as local symbols need the `.gosym` (see *Function names —
+  Linux*).
 - **macOS** (Release): Local symbols = True and Output debug information = True,
   otherwise the linker strips the symbol table and names resolve poorly.
 - **Android**: `DCC_DebugInformation=2` here too, so `LNG_ELF` can read the DWARF, plus
@@ -375,6 +379,22 @@ container built from the thin `.gol`s matches the assembled universal binary.
 reader's macOS fallback looks for it there, and `codesign` rejects non-Mach-O
 files in `Contents/MacOS/`.
 
+## Function names (`.gosym`) — Linux
+
+`dladdr` resolves only `.dynsym`, which `--export-dynamic` fills with the global symbols.
+Delphi 13.2 emits every routine declared only in an implementation section as a
+**local** symbol, so `dladdr` returns no name for it, and a release ELF stripped of
+`.symtab` has no other source. `LNG_ELF --gosym` writes `<exe>.gosym` from the
+**unstripped** executable: its local function symbols plus each one's source file
+from the DWARF line table (the format is the Android one below).
+`Crash.Linux.Symbols` loads it at startup, matches its build-id to the running
+executable and names the frames `dladdr` left empty.
+
+`Tools/gen-linux-crash-sidefiles.ps1 <exe>` runs `LNG_ELF --gosym` (building it on
+first use) and writes both `<exe>.gol` and `<exe>.gosym`. Run it as a post-build
+step before any strip, and ship both files next to the executable; see
+`Tests/CrashTests.dproj` for the MSBuild wiring.
+
 ## Function names (`.gosym`) — Android
 
 On Linux/macOS the call-stack *names* come from the binary's own symbol table at runtime
@@ -396,9 +416,9 @@ generated offline from the **unstripped** `.so`:
   the flat dotted name. It also fills the `Source` column with the real `.pas`. Functions
   with no DWARF (~18%, RTL stubs) carry no file and fall back to `module + offset`.
 
-The byte format is documented at the top of `Crash.Android.Symbols`, which reads the file
-once at startup, verifies its build-id against the running `.so`, and serves lookups from
-an in-memory binary search (cheap on the crash path).
+The byte format is documented at the top of `Crash.SymbolFile`. `Crash.Android.Symbols`
+reads the file once at startup, verifies its build-id against the running `.so`, and serves
+lookups from an in-memory binary search (cheap on the crash path).
 
 ### Build requirements
 

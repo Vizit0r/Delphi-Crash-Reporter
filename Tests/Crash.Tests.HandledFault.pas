@@ -78,23 +78,22 @@ type
   end;
 
 var
-  // Globals so the compiler cannot fold the write or the call away.
-  GNilTarget: PInteger = nil;
-  GFrameCalls: Integer = 0;
-
-procedure CountFrameCall;
-begin
-  Inc(GFrameCalls);
-end;
+  // Fault target the optimizer cannot fold to a constant nil.
+  GNilTarget: Pointer = nil;
 
 procedure WriteThroughNil;
-// The store sits in a routine that also makes a call, so it runs in its own
-// frame. A frameless leaf routine made the AV uncatchable on Android ARM64
-// (the process ended with runtime error 217), and a store inline in the
-// try block was not caught there on Linux either.
+// The store sits in a routine that also calls into another unit, so it runs in
+// its own frame and the caller keeps its exception landing pad. A frameless
+// leaf routine made the AV uncatchable on Android ARM64 (the process ended with
+// runtime error 217), and a store inline in the try block was not caught there
+// on Linux either.
+var
+  P: PInteger;
 begin
-  CountFrameCall;
-  GNilTarget^ := 1;
+  // Atomic read: an optimizer may not treat the global as a constant nil
+  P := AtomicCmpExchange(GNilTarget, nil, nil);
+  if Length(ParamStr(0)) >= 0 then
+    P^ := 1;
 end;
 
 function RawPrimaryCommitted: Boolean;

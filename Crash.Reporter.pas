@@ -346,6 +346,7 @@ uses
   Crash.ELFormat,
   Crash.MacOS.Symbols,
   Crash.Android.Symbols,
+  Crash.Linux.Symbols,
   Crash.Breadcrumbs,
   Crash.Pending,
   Crash.RawFallback,
@@ -1501,6 +1502,9 @@ begin
   // Android: load the .gosym side-file (an offline address->name map for the
   // stripped .so) so the call stack shows Pascal names. No-op elsewhere.
   CrashInitAndroidSymbols;
+  // Linux: load the .gosym side-file for the routines dladdr cannot name (local
+  // symbols of a stripped executable). No-op elsewhere.
+  CrashInitLinuxSymbols;
   // Eager-init the LineNumberInfo singleton on a quiet startup path. Otherwise
   // the first .gol read happens during the FIRST exception inside
   // GetCallStackEntry; if loading itself crashes, that's a double-fault inside

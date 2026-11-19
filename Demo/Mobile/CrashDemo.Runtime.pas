@@ -159,20 +159,28 @@ begin
   raise Exception.Create('test raise from CrashDemoFMX');
 end;
 
+var
+  // Fault targets the optimizer cannot see through.
+  GDemoNilTarget: Pointer = nil;
+  GDemoBurnFrame: Pointer = nil;
+
 procedure CrashDemoTriggerAccessViolation;
 var
   P: PInteger;
 begin
-  P := nil;
+  // Atomic read: an optimizer may not treat the global as a constant nil
+  P := AtomicCmpExchange(GDemoNilTarget, nil, nil);
   P^ := 42;
 end;
 
 function BurnStack(const ADepth: Integer): NativeInt;
+// The frame address escapes to a global, so the recursion keeps its frames.
 var
   Pad: array[0..511] of NativeInt;
 begin
   Pad[0] := ADepth;
   Pad[High(Pad)] := ADepth + 1;
+  GDemoBurnFrame := @Pad;
   Result := BurnStack(ADepth + 1) + Pad[0] + Pad[High(Pad)];
 end;
 

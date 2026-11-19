@@ -298,7 +298,8 @@ uses
   Crash.Demangle,
   Crash.Signals,
   Crash.MacOS.Symbols,   // LC_SYMTAB name adoption (no-op off macOS)
-  Crash.Android.Symbols; // .gosym name resolution (no-op off Android)
+  Crash.Android.Symbols, // .gosym name resolution (no-op off Android)
+  Crash.Linux.Symbols;   // .gosym name resolution (no-op off Linux)
 
 {$RANGECHECKS OFF}
 
@@ -1108,6 +1109,10 @@ var
   MacSymName: String;
   MacSymAddr: UInt64;
   {$ENDIF}
+  {$IF Defined(LINUX)}
+  LinuxSymName: RawByteString;
+  LinuxSymAddr: UIntPtr;
+  {$ENDIF}
 begin
   // dladdr success is enough: even without a nearest exported symbol (typical
   // for internal RTL frames before the first Pascal export) Module/Offset are
@@ -1149,6 +1154,27 @@ begin
     begin
       AEntry.RoutineName := MacSymName;
       AEntry.RoutineAddress := UIntPtr(MacSymAddr);
+      AEntry.NameTrusted := True;
+    end;
+    {$ENDIF}
+
+    {$IF Defined(LINUX)}
+    // dladdr sees only .dynsym; routines emitted as local symbols get no name
+    // above. Fill the name + function start from the .gosym side-file (see
+    // Crash.Linux.Symbols).
+    if (AEntry.RoutineName = '') and (AEntry.ModuleAddress <> 0) and
+       CrashLinuxLookupName(AEntry.CodeAddress, AEntry.ModuleAddress,
+         LinuxSymName, LinuxSymAddr, AEntry.SourceFile) then
+    begin
+      Demangled := cxa_demangle(MarshaledAString(PAnsiChar(LinuxSymName)), nil, 0, Status);
+      if (Demangled = nil) then
+        AEntry.RoutineName := String(LinuxSymName)
+      else
+      begin
+        AEntry.RoutineName := String(Demangled);
+        Posix.Stdlib.free(Demangled);
+      end;
+      AEntry.RoutineAddress := LinuxSymAddr;
       AEntry.NameTrusted := True;
     end;
     {$ENDIF}

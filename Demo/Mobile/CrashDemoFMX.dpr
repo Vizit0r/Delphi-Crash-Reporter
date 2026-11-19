@@ -5,6 +5,8 @@ uses
   FMX.Forms,
   Crash.MacOS.Api in '..\..\Crash.MacOS.Api.pas',
   Crash.Android.Symbols in '..\..\Crash.Android.Symbols.pas',
+  Crash.SymbolFile in '..\..\Crash.SymbolFile.pas',
+  Crash.Linux.Symbols in '..\..\Crash.Linux.Symbols.pas',
   Crash.Demangle in '..\..\Crash.Demangle.pas',
   Crash.LineNumbers in '..\..\Crash.LineNumbers.pas',
   Crash.MacOS.Symbols in '..\..\Crash.MacOS.Symbols.pas',

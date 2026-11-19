@@ -70,15 +70,10 @@ uses
   Androidapi.AssetManager,
   Androidapi.NativeActivity,
   Posix.Dlfcn,
-  Posix.Stdlib;
+  Posix.Stdlib,
+  Crash.SymbolFile;
 
 const
-  GOSY_SIGNATURE = $59534F47; // 'GOSY'
-  GOSY_VERSION   = $00020000; // v2: per-entry source-file index + file table
-  HEADER_SIZE    = 48;        // +FileTabOff(4)+FileTabSize(4) over v1
-  ENTRY_SIZE     = 20;        // UInt64 Addr + UInt32 Size + UInt32 NameOff + UInt32 FileOff
-  PT_NOTE        = 4;
-  NT_GNU_BUILD_ID = 3;
   // .gol (line numbers, GOLN) - shared format with LNG_ELF / Crash.LineNumbers
   GOLN_SIGNATURE = $4E4C4F47; // 'GOLN'
   GOLN_HDR_SIZE  = 44;        // sig+ver+size+count(16) + ID(16) + StartVA(8) + StartLine(4)
@@ -99,13 +94,7 @@ var
   GModuleBase: UIntPtr = 0;      // load base of the .so matched by both side-files
   GImageID: TCrashAndroidBuildID;
   GImageIDValid: Boolean = False;
-  GData: TBytes = nil;          // the whole .gosym, kept in memory
-  GCount: UInt32 = 0;
-  GEntriesOff: UInt32 = 0;      // = HEADER_SIZE
-  GStrTabOff: UInt32 = 0;
-  GStrTabSize: UInt32 = 0;
-  GFileTabOff: UInt32 = 0;
-  GFileTabSize: UInt32 = 0;
+  GSymbols: TCrashSymbolFile = nil; // the loaded .gosym
   // .gol decoded line table (address-sorted)
   GGolRelAddrs: TArray<UInt32> = nil; // VM address relative to GGolStartVA
   GGolLines: TArray<Integer> = nil;
@@ -113,84 +102,13 @@ var
 
 { ---- ELF build-id of a loaded .so file (self-contained, no dl_iterate_phdr) ---- }
 
-type
-  TElf64_Ehdr = packed record
-    e_ident: array[0..15] of Byte;
-    e_type, e_machine: UInt16;
-    e_version: UInt32;
-    e_entry, e_phoff, e_shoff: UInt64;
-    e_flags: UInt32;
-    e_ehsize, e_phentsize, e_phnum, e_shentsize, e_shnum, e_shstrndx: UInt16;
-  end;
-  TElf64_Phdr = packed record
-    p_type, p_flags: UInt32;
-    p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_align: UInt64;
-  end;
-
-function Align4(const V: UInt32): UInt32; inline;
-begin
-  Result := (V + 3) and not UInt32(3);
-end;
-
-function ExtractBuildIdFromNote(const ANote: TBytes; out AId: TBuildId): Boolean;
-var
-  P, NameSz, DescSz, NType, DescPos: UInt32;
-  I: Integer;
-begin
-  Result := False;
-  P := 0;
-  while (P + 12) <= UInt32(Length(ANote)) do
-  begin
-    NameSz := PUInt32(@ANote[P])^;
-    DescSz := PUInt32(@ANote[P + 4])^;
-    NType  := PUInt32(@ANote[P + 8])^;
-    DescPos := P + 12 + Align4(NameSz);
-    if (NType = NT_GNU_BUILD_ID) and (DescSz >= SizeOf(TBuildId)) and
-       ((DescPos + SizeOf(TBuildId)) <= UInt32(Length(ANote))) then
-    begin
-      for I := 0 to 15 do
-        AId[I] := ANote[DescPos + UInt32(I)];
-      Exit(True);
-    end;
-    Inc(P, 12 + Align4(NameSz) + Align4(DescSz));
-  end;
-end;
-
 function ReadElfBuildId(const APath: String; out AId: TBuildId): Boolean;
 var
-  Stream: TFileStream;
-  Ehdr: TElf64_Ehdr;
-  Phdr: TElf64_Phdr;
-  I: Integer;
-  Note: TBytes;
+  ID: TCrashSymbolBuildID;
+  LinkBase: UInt64;
 begin
-  Result := False;
-  if not TFile.Exists(APath) then
-    Exit;
-  try
-    Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
-    try
-      if Stream.Read(Ehdr, SizeOf(Ehdr)) <> SizeOf(Ehdr) then Exit;
-      if (Ehdr.e_ident[0] <> $7F) or (Ehdr.e_ident[1] <> Ord('E')) or
-         (Ehdr.e_ident[2] <> Ord('L')) or (Ehdr.e_ident[3] <> Ord('F')) then Exit;
-      for I := 0 to Ehdr.e_phnum - 1 do
-      begin
-        Stream.Position := Int64(Ehdr.e_phoff) + Int64(I) * Ehdr.e_phentsize;
-        if Stream.Read(Phdr, SizeOf(Phdr)) <> SizeOf(Phdr) then Break;
-        if Phdr.p_type <> PT_NOTE then Continue;
-        if (Phdr.p_filesz = 0) or (Phdr.p_filesz > 1024 * 1024) then Continue;
-        SetLength(Note, Phdr.p_filesz);
-        Stream.Position := Int64(Phdr.p_offset);
-        if Stream.Read(Note[0], Length(Note)) <> Length(Note) then Continue;
-        if ExtractBuildIdFromNote(Note, AId) then
-          Exit(True);
-      end;
-    finally
-      Stream.Free;
-    end;
-  except
-    Result := False;
-  end;
+  Result := CrashReadElfBuildID(APath, ID, LinkBase);
+  Move(ID, AId, SizeOf(AId));
 end;
 
 { ---- locate our own module (path + base) via dladdr on this unit's code ---- }
@@ -388,10 +306,8 @@ procedure CrashInitAndroidSymbols;
 var
   SoPath, SoName: String;
   ImgId: TBuildId;
-  HdrSig, HdrVer, HdrSize, HdrCount: UInt32;
-  HdrStrTabOff, HdrStrTabSize, HdrFileTabOff, HdrFileTabSize: UInt32;
-  I: Integer;
-  Match: Boolean;
+  SymID: TCrashSymbolBuildID;
+  Symbols: TCrashSymbolFile;
 begin
   if GLoaded then
     Exit;
@@ -412,50 +328,19 @@ begin
   LoadGol(ReadDeployedSideFile('internal/' + SoName + '.gol',
     TPath.Combine(TPath.GetDocumentsPath, SoName + '.gol')), ImgId);
 
-  GData := ReadDeployedSideFile('internal/' + SoName + '.gosym',
-    TPath.Combine(TPath.GetDocumentsPath, SoName + '.gosym'));
-  if Length(GData) < HEADER_SIZE then begin GData := nil; Exit; end;
-
-  HdrSig         := PUInt32(@GData[0])^;
-  HdrVer         := PUInt32(@GData[4])^;
-  HdrSize        := PUInt32(@GData[8])^;
-  HdrCount       := PUInt32(@GData[12])^;
-  // build-id at offset 16..31
-  HdrStrTabOff   := PUInt32(@GData[32])^;
-  HdrStrTabSize  := PUInt32(@GData[36])^;
-  HdrFileTabOff  := PUInt32(@GData[40])^;
-  HdrFileTabSize := PUInt32(@GData[44])^;
-
-  // Structural layout check: [header][entries][string table][file table], each
-  // region inside the file and none overlapping the next. A corrupt offset can
-  // then never read a "name" out of a neighbouring region.
-  if (HdrSig <> GOSY_SIGNATURE) or ((HdrVer shr 16) <> (GOSY_VERSION shr 16)) or
-     (HdrSize <> UInt32(Length(GData))) or
-     (HEADER_SIZE + UInt64(HdrCount) * ENTRY_SIZE > UInt64(HdrStrTabOff)) or
-     (UInt64(HdrStrTabOff) + HdrStrTabSize > UInt64(HdrFileTabOff)) or
-     (UInt64(HdrFileTabOff) + HdrFileTabSize > UInt64(Length(GData))) then
-  begin
-    GData := nil; Exit;
-  end;
-
-  // Verify the .gosym was built for THIS binary (build-id match). A mismatch ->
-  // refuse it (wrong names are worse than no names).
-  Match := True;
-  for I := 0 to 15 do
-    if GData[16 + I] <> ImgId[I] then begin Match := False; Break; end;
-  if not Match then begin GData := nil; Exit; end;
-
-  GCount := HdrCount;
-  GEntriesOff := HEADER_SIZE;
-  GStrTabOff := HdrStrTabOff;
-  GStrTabSize := HdrStrTabSize;
-  GFileTabOff := HdrFileTabOff;
-  GFileTabSize := HdrFileTabSize;
+  // Refused (structure or build-id mismatch) -> no names, never wrong ones.
+  Move(ImgId, SymID, SizeOf(SymID));
+  Symbols := TCrashSymbolFile.Create;
+  if Symbols.Load(ReadDeployedSideFile('internal/' + SoName + '.gosym',
+       TPath.Combine(TPath.GetDocumentsPath, SoName + '.gosym')), SymID) then
+    GSymbols := Symbols
+  else
+    Symbols.Free;
 end;
 
 function CrashAndroidSymbolsActive: Boolean;
 begin
-  Result := (GData <> nil) and (GCount > 0);
+  Result := (GSymbols <> nil) and GSymbols.Active;
 end;
 
 function CrashAndroidGetBuildID(out ABuildID: TCrashAndroidBuildID): Boolean;
@@ -473,45 +358,12 @@ begin
   Result := GModuleBase;
 end;
 
-function EntryAddr(const AIndex: UInt32): UInt64; inline;
-begin
-  // Move, not PUInt64^: with ENTRY_SIZE=20 every odd entry sits at 4-byte
-  // alignment only, and this code also compiles for 32-bit ARM.
-  Move(GData[GEntriesOff + AIndex * ENTRY_SIZE], Result, SizeOf(Result));
-end;
-
-function BoundedCStr(const AOffset, ALimit: UInt64;
-  out AStr: MarshaledAString): Boolean;
-// True when GData holds a NUL-terminated string starting at AOffset and fully
-// inside [AOffset, ALimit) - ALimit is the owning table's end, so a corrupt
-// offset can neither leave the buffer nor read a "name" out of another region.
-var
-  E, Lim: Integer;
-begin
-  Result := False;
-  AStr := nil;
-  if (AOffset >= ALimit) or (ALimit > UInt64(Length(GData))) then
-    Exit;
-  Lim := Integer(ALimit);
-  E := Integer(AOffset);
-  while (E < Lim) and (GData[E] <> 0) do
-    Inc(E);
-  if E >= Lim then
-    Exit; // no NUL inside the table - corrupt
-  AStr := MarshaledAString(@GData[Integer(AOffset)]);
-  Result := True;
-end;
-
 function CrashAndroidLookupName(const ACodeAddr, AModuleBase: UIntPtr;
   out AName: String; out ARoutineAddr: UIntPtr; out ASourceFile: String): Boolean;
 var
-  Target: UInt64;
-  Lo, Hi, Mid: Integer;
-  Found: Integer;
-  EntBase: UInt32;
-  Size, NameOff, FileOff, NextAddr: UInt32;
+  Mangled: RawByteString;
   EntAddr: UInt64;
-  Mangled, Demangled, FileStr: MarshaledAString;
+  Demangled: MarshaledAString;
   Status: Integer;
 begin
   Result := False;
@@ -525,55 +377,16 @@ begin
   if (GModuleBase = 0) or (AModuleBase <> GModuleBase) or
      (ACodeAddr < AModuleBase) then
     Exit;
-  Target := UInt64(ACodeAddr) - UInt64(AModuleBase); // module-relative VM address
-
-  // binary search: largest entry with Addr <= Target
-  Lo := 0; Hi := Integer(GCount) - 1; Found := -1;
-  while Lo <= Hi do
-  begin
-    Mid := (Lo + Hi) div 2;
-    if EntryAddr(UInt32(Mid)) <= Target then begin Found := Mid; Lo := Mid + 1; end
-    else Hi := Mid - 1;
-  end;
-  if Found < 0 then
+  // module-relative VM address (the .so links at 0)
+  if not GSymbols.Lookup(UInt64(ACodeAddr) - UInt64(AModuleBase), Mangled,
+       EntAddr, ASourceFile) then
     Exit;
-
-  EntBase := GEntriesOff + UInt32(Found) * ENTRY_SIZE;
-  Move(GData[EntBase], EntAddr, SizeOf(EntAddr));
-  Size    := PUInt32(@GData[EntBase + 8])^;
-  NameOff := PUInt32(@GData[EntBase + 12])^;
-  FileOff := PUInt32(@GData[EntBase + 16])^;
-
-  // range check: within [EntAddr, EntAddr+Size) when Size known, else up to the
-  // next entry's address.
-  if Size > 0 then
-  begin
-    if Target >= EntAddr + Size then Exit;
-  end
-  else
-  begin
-    if UInt32(Found) + 1 < GCount then
-    begin
-      NextAddr := UInt32(EntryAddr(UInt32(Found) + 1)); // next func start
-      if Target >= NextAddr then Exit;
-    end;
-  end;
 
   ARoutineAddr := AModuleBase + UIntPtr(EntAddr); // absolute function start
 
-  // source file (NUL-terminated in the file table); FileOff=0 -> unknown
-  if (FileOff > 0) and BoundedCStr(UInt64(GFileTabOff) + FileOff,
-       UInt64(GFileTabOff) + GFileTabSize, FileStr) then
-    ASourceFile := String(AnsiString(FileStr));
-
-  // read mangled name from the string table (NUL-terminated)
-  if not BoundedCStr(UInt64(GStrTabOff) + NameOff,
-       UInt64(GStrTabOff) + GStrTabSize, Mangled) then
-    Exit;
-
-  Demangled := cxa_demangle(Mangled, nil, 0, Status);
+  Demangled := cxa_demangle(MarshaledAString(PAnsiChar(Mangled)), nil, 0, Status);
   if Demangled = nil then
-    AName := String(AnsiString(Mangled))
+    AName := String(Mangled)
   else
   begin
     AName := String(Demangled);
@@ -618,6 +431,13 @@ begin
   Result := 0;
 end;
 
+{$ENDIF}
+
+{$IF Defined(ANDROID)}
+initialization
+
+finalization
+  FreeAndNil(GSymbols);
 {$ENDIF}
 
 end.

@@ -35,6 +35,7 @@ uses
   Crash.Tests.Progress,
   Crash.Tests.GolCodec,
   Crash.Tests.Dwarf,
+  Crash.Tests.SymbolFile,
   Crash.Tests.ELFormat,
   Crash.Tests.Pending,
   Crash.Tests.Capabilities,

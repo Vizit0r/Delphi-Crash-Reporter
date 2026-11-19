@@ -92,13 +92,19 @@ type
 
 {$REGION 'Child side'}
 
+var
+  // Fault targets the optimizer cannot see through (see CrashChildNullWrite).
+  GChildNilTarget: Pointer = nil;
+  GChildBurnFrame: Pointer = nil;
+
 procedure CrashChildNullWrite;
 // The faulting store sits in its own routine that also makes a call, so it has
 // a frame of its own (a frameless fault is not catchable on every target).
 var
   P: PInteger;
 begin
-  P := nil;
+  // Atomic read: an optimizer may not treat the global as a constant nil
+  P := AtomicCmpExchange(GChildNilTarget, nil, nil);
   if Length(ParamStr(0)) >= 0 then
     P^ := 42;
 end;
@@ -126,13 +132,14 @@ begin
 end;
 
 function CrashChildBurnStack(N: Integer): Integer;
-// Unbounded recursion with a 4 KB frame; the result feeds back so nothing is
-// optimized away.
+// Unbounded recursion with a 4 KB frame. The frame address escapes to a global,
+// so the recursion cannot become a loop that reuses one frame.
 var
   Pad: array[0..511] of NativeInt;
 begin
   Pad[0] := N;
   Pad[High(Pad)] := N + 1;
+  GChildBurnFrame := @Pad;
   Result := CrashChildBurnStack(N + 1) + Pad[0] + Pad[High(Pad)];
 end;
 

@@ -52,3 +52,7 @@ build.cmd lng_tool
 
 Produces `Crash\Tools\Bin\LNG.exe` (Win32 Release). The Linux generator is
 `build.cmd lng_elf_tool` -> `Crash\Tools\Bin\LNG_ELF.exe`.
+
+`LNG_ELF [--gosym] <elf>`: with `--gosym` it also writes `<elf>.gosym`, the
+local function symbols of the image's `.symtab` with their source files (see
+`GosymWriter.pas` and `Crash.SymbolFile.pas`). Run it on the unstripped image.

@@ -12,19 +12,24 @@ uses
   Elf in 'Source\Elf.pas',
   GeneratorElf in 'Source\GeneratorElf.pas',
   GolEncoder in 'Source\GolEncoder.pas',
-  Crash.LineNumbers in '..\..\Crash.LineNumbers.pas';
+  GosymWriter in 'Source\GosymWriter.pas',
+  Crash.LineNumbers in '..\..\Crash.LineNumbers.pas',
+  Crash.SymbolFile in '..\..\Crash.SymbolFile.pas';
 
 procedure Run;
 var
   Generator: TElfLineNumberGenerator;
+  WriteSymbols: Boolean;
 begin
-  if (ParamCount <> 1) then
+  WriteSymbols := (ParamCount = 2) and SameText(ParamStr(1), '--gosym');
+  if (ParamCount <> 1) and not WriteSymbols then
   begin
-    WriteLn('Usage: LNG_ELF <path to Linux64 ELF executable>');
+    WriteLn('Usage: LNG_ELF [--gosym] <path to ELF64 image>');
+    WriteLn('  --gosym  also write <path>.gosym (local function names) from .symtab');
     Halt(1);
   end;
 
-  Generator := TElfLineNumberGenerator.Create(ParamStr(1));
+  Generator := TElfLineNumberGenerator.Create(ParamStr(ParamCount), WriteSymbols);
   try
     Generator.Run;
   finally

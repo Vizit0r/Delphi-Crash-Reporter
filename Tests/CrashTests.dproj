@@ -106,4 +106,9 @@
     </ProjectExtensions>
     <Import Project="$(BDS)\Bin\CodeGear.Delphi.Targets" Condition="Exists('$(BDS)\Bin\CodeGear.Delphi.Targets')"/>
     <Import Project="$(APPDATA)\Embarcadero\$(BDSAPPDATABASEDIR)\$(PRODUCTVERSION)\UserTools.proj" Condition="Exists('$(APPDATA)\Embarcadero\$(BDSAPPDATABASEDIR)\$(PRODUCTVERSION)\UserTools.proj')"/>
+    <!-- Linux64: .gol + .gosym next to the runner, so its reports carry line
+         numbers and the names of local routines (CLI msbuild only). -->
+    <Target Name="CrashLinuxSidefiles" AfterTargets="Build" Condition="'$(Platform)'=='Linux64'">
+        <Exec Command='"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "$(MSBuildProjectDirectory)\..\Tools\gen-linux-crash-sidefiles.ps1" "$(OUTPUTPATH)"' />
+    </Target>
 </Project>

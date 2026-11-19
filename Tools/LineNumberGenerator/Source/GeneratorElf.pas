@@ -26,11 +26,14 @@ type
   private
     FExePath: String;
     FLineNumPath: String;
+    FWriteSymbols: Boolean;
   private
     procedure WriteLines(const AID: TGUID; var ALines: TArray<TLine>);
   {$ENDREGION 'Internal Declarations'}
   public
-    constructor Create(const APath: String);
+    { AWriteSymbols: also write <path>.gosym (local function names, see
+      GosymWriter) from the image's .symtab. }
+    constructor Create(const APath: String; const AWriteSymbols: Boolean = False);
     procedure Run;
   end;
 
@@ -42,15 +45,18 @@ uses
   System.Generics.Defaults,
   Crash.LineNumbers,
   Elf,
-  Dwarf;
+  Dwarf,
+  GosymWriter;
 
 { TElfLineNumberGenerator }
 
-constructor TElfLineNumberGenerator.Create(const APath: String);
+constructor TElfLineNumberGenerator.Create(const APath: String;
+  const AWriteSymbols: Boolean);
 begin
   inherited Create;
   FExePath := APath;
   FLineNumPath := APath + '.gol';
+  FWriteSymbols := AWriteSymbols;
 end;
 
 procedure TElfLineNumberGenerator.Run;
@@ -64,6 +70,9 @@ var
   Lines: TArray<TLine>;
   Line: TDwarfLine;
   PrevLine, LineCount: Integer;
+  Symtab, Strtab: TBytes;
+  FileByAddr: TDictionary<UInt64, String>;
+  FileIndex: Integer;
 begin
   if not FileExists(FExePath) then
     raise EFileNotFoundException.CreateFmt('Executable file "%s" not found', [FExePath]);
@@ -88,7 +97,11 @@ begin
       else if Sec.Name = '.debug_addr' then
         DwarfSections.Addr := Sec.Load
       else if Sec.Name = '.debug_line_str' then
-        DwarfSections.LineStr := Sec.Load;
+        DwarfSections.LineStr := Sec.Load
+      else if FWriteSymbols and (Sec.Name = '.symtab') then
+        Symtab := Sec.Load
+      else if FWriteSymbols and (Sec.Name = '.strtab') then
+        Strtab := Sec.Load;
     end;
   finally
     ElfFile.Free;
@@ -101,6 +114,7 @@ begin
       ' Ensure DCC_DebugInformation=2 for the Linux64 Release config and that' +
       ' the linker does not strip them.');
 
+  FileByAddr := TDictionary<UInt64, String>.Create;
   Dwarf := TDwarfInfo.Create;
   try
     Dwarf.Load(DwarfSections);
@@ -111,6 +125,15 @@ begin
       SetLength(Lines, LineCount + CU.Lines.Count);
       for Line in CU.Lines do
       begin
+        // Source file of the first row at an address (a function start, for
+        // the .gosym)
+        if FWriteSymbols and (not (TDwarfLineFlag.EndSequence in Line.Flags)) then
+        begin
+          FileIndex := Line.FileIndex;
+          if (FileIndex >= 0) and (FileIndex < CU.Files.Count) and
+             (CU.Files[FileIndex].Name <> '') then
+            FileByAddr.TryAdd(Line.Address, CU.Files[FileIndex].Name);
+        end;
         if (Line.Line <> PrevLine) then
         begin
           PrevLine := Line.Line;
@@ -131,7 +154,15 @@ begin
     Dwarf.Free;
   end;
 
-  WriteLines(ExeID, Lines);
+  try
+    WriteLines(ExeID, Lines);
+    if FWriteSymbols then
+      Writeln(Format('%s: %d local function symbols',
+        [ExtractFileName(FExePath) + '.gosym',
+         GosymWriteFile(FExePath + '.gosym', ExeID, Symtab, Strtab, FileByAddr)]));
+  finally
+    FileByAddr.Free;
+  end;
 end;
 
 procedure TElfLineNumberGenerator.WriteLines(const AID: TGUID;
