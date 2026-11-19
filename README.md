@@ -318,6 +318,8 @@ APK asset on Android — the mobile deploy is shared with `.gosym`, see *Functio
   the binary).
 
 All emit the same `.gol` byte format that `Crash.LineNumbers` reads at runtime.
+The generators read DWARF 2–5. Delphi 13.2 emits DWARF 5 on Linux64; macOS
+`.dSYM`s are still DWARF 2.
 
 ### Build requirements
 
