@@ -22,6 +22,7 @@
 //    G8  Reference-decoder self-check: truncated varint / op 255 rejected.
 //    G9  Deterministic bulk round-trip (dup clusters, line jumps both ways).
 //    G10 Production format constants match the literals pinned here.
+//    G11 A line-0 row loses a duplicate address to a real line.
 //
 //  Copyright (c) 2026 Vizit0r. BSD 2-Clause license (see LICENSE.txt).
 // ===========================================================================
@@ -444,6 +445,21 @@ begin
   end;
 end;
 
+function Step_G11_LineZeroLosesDuplicate(Progress: TCrashTestProgress): Boolean;
+begin
+  // DWARF line 0 ("no source line") at a duplicate address yields to the real
+  // line in either input order; a lone line-0 row is kept (ABS to 0, then ABS
+  // back to 40).
+  Result :=
+    RoundTrip(Progress, 'G11a', [ML(100, 10), ML(110, 0), ML(110, 30)],
+      [ML(100, 10), ML(110, 30)], [REF_OP_ADVANCE_REL, 9, 19]) and
+    RoundTrip(Progress, 'G11b', [ML(100, 10), ML(110, 30), ML(110, 0)],
+      [ML(100, 10), ML(110, 30)], [REF_OP_ADVANCE_REL, 9, 19]) and
+    RoundTrip(Progress, 'G11c', [ML(100, 10), ML(110, 0), ML(120, 40)],
+      [ML(100, 10), ML(110, 0), ML(120, 40)],
+      [REF_OP_ADVANCE_ABS, 9, 0, REF_OP_ADVANCE_REL, 9, 39]);
+end;
+
 function Step_G10_FormatConstantsPinned(Progress: TCrashTestProgress): Boolean;
 begin
   {$WARN COMPARISON_TRUE OFF}
@@ -476,6 +492,7 @@ begin
       Progress.Account(Step_G8_RefDecoderRejects(Progress), 'G8: reference decoder rejects malformed programs');
       Progress.Account(Step_G9_BulkRoundTrip(Progress), 'G9: bulk deterministic round-trip');
       Progress.Account(Step_G10_FormatConstantsPinned(Progress), 'G10: production format constants match pinned literals');
+      Progress.Account(Step_G11_LineZeroLosesDuplicate(Progress), 'G11: line 0 loses a duplicate address');
       Progress.WriteSummary(TEST_NAME);
       Result := Progress.AllPassed;
     finally

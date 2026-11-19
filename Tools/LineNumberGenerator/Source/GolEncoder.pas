@@ -26,12 +26,12 @@ type
 
 { Sort ALines by address and append the .gol state-machine program to ABuffer.
   Returns the number of emitted entries (the header Count field). Duplicate
-  addresses keep the smallest-line row (the sort breaks address ties by line,
+  addresses keep the smallest non-zero-line row (the sort breaks address ties by line,
   so the winner is deterministic and .gol builds are byte-reproducible);
   deltas always run against the last WRITTEN entry - the decoder's state
   machine never sees the skipped duplicates. Raises EInvalidOperation when
   ALines is nil or the sorted address span does not fit the 4 GB format
-  limit. }
+  limit. A line-0 row loses a duplicate address to any non-zero row. }
 function GolEncodeLines(var ALines: TArray<TGolLine>;
   const ABuffer: TStream): Integer;
 
@@ -81,8 +81,14 @@ begin
       // for far-apart addresses and breaks the sort order. Address ties break
       // by Line: TArray.Sort is unstable, and a deterministic duplicate winner
       // keeps .gol builds byte-reproducible.
+      // Line 0 (DWARF "no source line") sorts after any real line, so a real
+      // line wins a duplicate address.
       if ALeft.Address < ARight.Address then Result := -1
       else if ALeft.Address > ARight.Address then Result := 1
+      else if (ALeft.Line = 0) <> (ARight.Line = 0) then
+      begin
+        if ALeft.Line = 0 then Result := 1 else Result := -1;
+      end
       else if ALeft.Line < ARight.Line then Result := -1
       else if ALeft.Line > ARight.Line then Result := 1
       else Result := 0;

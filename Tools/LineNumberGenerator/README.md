@@ -14,6 +14,11 @@ file next to the executable. The runtime reader `Crash.LineNumbers.pas`
 (located two directories up) loads this `.gol` at startup and provides
 address-to-source-line lookups for the call-stack section of crash reports.
 
+`Dwarf.pas` reads DWARF 2-5 (32-bit DWARF, 64-bit addresses): the DWARF 5 unit
+header, indexed strings and addresses (`debug_str_offsets`, `debug_addr`) and
+line tables v2-v5 (`debug_line_str`). Line-0 rows ("no source line") are kept,
+but lose a duplicate address to a real line.
+
 ## CLI
 
 ```

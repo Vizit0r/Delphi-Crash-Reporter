@@ -34,6 +34,7 @@ uses
   Crash.Tests.Registry,
   Crash.Tests.Progress,
   Crash.Tests.GolCodec,
+  Crash.Tests.Dwarf,
   Crash.Tests.ELFormat,
   Crash.Tests.Pending,
   Crash.Tests.Capabilities,

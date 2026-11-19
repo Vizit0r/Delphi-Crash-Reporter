@@ -88,7 +88,14 @@ begin
         else if (Name = '__debug_line') then
           DwarfSections.Line := MachOSection.Load
         else if (Name = '__debug_str') then
-          DwarfSections.Str := MachOSection.Load;
+          DwarfSections.Str := MachOSection.Load
+        { Mach-O section names are limited to 16 characters }
+        else if (Name = '__debug_str_offs') then
+          DwarfSections.StrOffsets := MachOSection.Load
+        else if (Name = '__debug_addr') then
+          DwarfSections.Addr := MachOSection.Load
+        else if (Name = '__debug_line_str') then
+          DwarfSections.LineStr := MachOSection.Load;
       end;
     end;
   finally
@@ -115,6 +122,9 @@ begin
             Inc(LineCount);
           end;
         end;
+        // The next sequence starts at an unrelated address: keep its first row
+        if (TDwarfLineFlag.EndSequence in Line.Flags) then
+          PrevLine := -1;
       end;
     end;
     SetLength(Lines, LineCount);

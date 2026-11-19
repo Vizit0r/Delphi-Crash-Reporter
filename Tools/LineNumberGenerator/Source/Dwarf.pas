@@ -69,6 +69,7 @@ const
   DW_TAG_variant_part           = $33;
   DW_TAG_variable               = $34;
   DW_TAG_volatile_type          = $35;
+  DW_TAG_partial_unit           = $3c;
   DW_TAG_lo_user                = $4080;
   DW_TAG_hi_user                = $ffff;
 
@@ -136,6 +137,9 @@ const
   DW_AT_variable_parameter   = $4b; // flag
   DW_AT_virtuality           = $4c; // constant
   DW_AT_vtable_elem_location = $4d; // block, reference
+  DW_AT_str_offsets_base     = $72; // stroffsetsptr (DWARF 5)
+  DW_AT_addr_base            = $73; // addrptr (DWARF 5)
+  DW_AT_rnglists_base        = $74; // rnglistsptr (DWARF 5)
   DW_AT_lo_user              = $2000;
   DW_AT_hi_user              = $3fff;
 
@@ -165,6 +169,42 @@ const
   DW_FORM_exprloc      = $18; // exprloc
   DW_FORM_flag_present = $19; // flag
   DW_FORM_ref_sig8     = $20; // reference
+  { DWARF 5 }
+  DW_FORM_strx           = $1a; // string (ULEB index into .debug_str_offsets)
+  DW_FORM_addrx          = $1b; // address (ULEB index into .debug_addr)
+  DW_FORM_ref_sup4       = $1c; // reference
+  DW_FORM_strp_sup       = $1d; // string (supplementary file)
+  DW_FORM_data16         = $1e; // constant
+  DW_FORM_line_strp      = $1f; // string (offset into .debug_line_str)
+  DW_FORM_implicit_const = $21; // constant (value stored in the abbreviation)
+  DW_FORM_loclistx       = $22; // loclist
+  DW_FORM_rnglistx       = $23; // rnglist
+  DW_FORM_ref_sup8       = $24; // reference
+  DW_FORM_strx1          = $25;
+  DW_FORM_strx2          = $26;
+  DW_FORM_strx3          = $27;
+  DW_FORM_strx4          = $28;
+  DW_FORM_addrx1         = $29;
+  DW_FORM_addrx2         = $2a;
+  DW_FORM_addrx3         = $2b;
+  DW_FORM_addrx4         = $2c;
+
+const
+  { DWARF 5 unit header types }
+  DW_UT_compile       = $01;
+  DW_UT_type          = $02;
+  DW_UT_partial       = $03;
+  DW_UT_skeleton      = $04;
+  DW_UT_split_compile = $05;
+  DW_UT_split_type    = $06;
+
+const
+  { DWARF 5 line table entry content types }
+  DW_LNCT_path            = $1;
+  DW_LNCT_directory_index = $2;
+  DW_LNCT_timestamp       = $3;
+  DW_LNCT_size            = $4;
+  DW_LNCT_MD5             = $5;
 
 const
   DW_LANG_C89         = $0001;
@@ -203,6 +243,7 @@ type
     procedure SkipString;
     function ReadUInt8: UInt8; inline;
     function ReadUInt16: UInt16; inline;
+    function ReadUInt24: UInt32; inline;
     function ReadUInt32: UInt32; inline;
     function ReadUInt64: UInt64; inline;
     function ReadULeb128: UInt64; inline;
@@ -215,14 +256,39 @@ type
   end;
 
 type
+  TDwarfSections = record
+  public
+    Abbrev: TBytes;
+    Info: TBytes;
+    Line: TBytes;
+    Str: TBytes;
+    { DWARF 5 only; nil for DWARF 2-4 }
+    StrOffsets: TBytes;
+    Addr: TBytes;
+    LineStr: TBytes;
+  end;
+
+type
   TDwarfAttributeDesc = record
   public
     Name: Integer;
     Form: Integer;
+
+    { Value of a DW_FORM_implicit_const attribute (stored in the abbreviation,
+      not in .debug_info). }
+    ImplicitConst: Int64;
   public
     procedure SkipValue(const ACursor: TDwarfCursor);
+
+    { True for DW_FORM_strx/strx1-4; UIntValue then returns the index. }
+    function IsStringIndex: Boolean;
+
+    { Reads a string attribute. DW_FORM_strx* is resolved through
+      .debug_str_offsets starting at AStrOffsetsBase. }
     function StringValue(const ACursor: TDwarfCursor;
-      const AStringSection: TBytes): String;
+      const ASections: TDwarfSections; const AStrOffsetsBase: UInt64): String;
+
+    { Constants, section offsets and DW_FORM_strx*/addrx* indices. }
     function UIntValue(const ACursor: TDwarfCursor): UInt64;
   end;
 
@@ -258,21 +324,13 @@ type
   end;
 
 type
-  TDwarfSections = record
-  public
-    Abbrev: TBytes;
-    Info: TBytes;
-    Line: TBytes;
-    Str: TBytes;
-  end;
-
-type
   TDwarfFile = record
   public
     Name: String;
 
     { Index into TDwarfCompilationUnit.IncludeDirectories.
-      0 if in current directory. }
+      DWARF 2-4: 0 if in current directory.
+      DWARF 5: entry 0 is the compilation directory. }
     DirectoryIndex: Integer;
 
     Time: Int64;
@@ -305,21 +363,35 @@ type
     FName: String;
     FDirectory: String;
     FLanguage: Integer;
+    FVersion: Integer;
+    FStrOffsetsBase: UInt64;
+    FAddrBase: UInt64;
+    FLowPC: UInt64;
     FIncludeDirectories: TStringList;
     FFiles: TList<TDwarfFile>;
     FLines: TList<TDwarfLine>;
+  private
+    function ResolveStringIndex(const AIndex: UInt64): String;
+    function ResolveAddressIndex(const AIndex: UInt64): UInt64;
+    function ReadLineEntryFormats(const ACursor: TDwarfCursor): TArray<TDwarfAttributeDesc>;
   protected
     procedure Load(const ACursor: TDwarfCursor);
-    procedure LoadLineNumbers(const AOffset: Integer);
+    procedure LoadLineNumbers(const AOffset: UInt64);
   {$ENDREGION 'Internal Declarations'}
   public
     constructor Create(const AOwner: TDwarfInfo;
-      const AAbbreviations: TDwarfAbbreviationTable);
+      const AAbbreviations: TDwarfAbbreviationTable; const AVersion: Integer);
     destructor Destroy; override;
 
     property Producer: String read FProducer;
     property Name: String read FName;
     property Directory: String read FDirectory;
+
+    { DWARF version of the unit header (2-5) }
+    property Version: Integer read FVersion;
+
+    { DW_AT_low_pc (DW_FORM_addr or DW_FORM_addrx*), 0 if absent }
+    property LowPC: UInt64 read FLowPC;
 
     { DW_LANG_* }
     property Language: Integer read FLanguage;
@@ -365,9 +437,40 @@ const
   DW_LNS_set_isa            = 12;
 
 const
-  DW_LNE_end_sequence = 1;
-  DW_LNE_set_address  = 2;
-  DW_LNE_define_file  = 3;
+  DW_LNE_end_sequence      = 1;
+  DW_LNE_set_address       = 2;
+  DW_LNE_define_file       = 3;
+  DW_LNE_set_discriminator = 4;
+
+function ReadSectionString(const ASection: TBytes; const AOffset: UInt64;
+  const ASectionName: String): String;
+var
+  Cursor: TDwarfCursor;
+begin
+  if (AOffset >= UInt64(Length(ASection))) then
+    raise EDwarfError.CreateFmt('String offset %d is outside the %s section',
+      [AOffset, ASectionName]);
+  Cursor := ASection;
+  Cursor.Skip(AOffset);
+  Result := Cursor.ReadString;
+end;
+
+function ReadStringByIndex(const ASections: TDwarfSections;
+  const AStrOffsetsBase, AIndex: UInt64): String;
+var
+  Pos: UInt64;
+begin
+  if (ASections.StrOffsets = nil) then
+    raise EDwarfError.Create('DW_FORM_strx requires a debug_str_offsets section');
+
+  { 32-bit DWARF: each entry is a 4-byte offset into .debug_str }
+  Pos := AStrOffsetsBase + (AIndex * SizeOf(UInt32));
+  if ((Pos + SizeOf(UInt32)) > UInt64(Length(ASections.StrOffsets))) then
+    raise EDwarfError.CreateFmt('String index %d is outside the debug_str_offsets section', [AIndex]);
+
+  Result := ReadSectionString(ASections.Str, PUInt32(@ASections.StrOffsets[Pos])^,
+    'debug_str');
+end;
 
 { TDwarfCursor }
 
@@ -385,8 +488,8 @@ begin
   end
   else
   begin
-    Result.FCur := @ABytes[0];
-    Result.FEnd := @ABytes[Length(ABytes)];
+    Result.FCur := PByte(ABytes);
+    Result.FEnd := PByte(ABytes) + Length(ABytes); // one past the end, no $R+ index check
   end;
 end;
 
@@ -466,6 +569,12 @@ begin
   Inc(FCur, SizeOf(UInt16));
 end;
 
+function TDwarfCursor.ReadUInt24: UInt32;
+begin
+  Result := FCur[0] or (UInt32(FCur[1]) shl 8) or (UInt32(FCur[2]) shl 16);
+  Inc(FCur, 3);
+end;
+
 function TDwarfCursor.ReadUInt32: UInt32;
 begin
   Result := PUInt32(FCur)^;
@@ -535,31 +644,55 @@ var
   Indirect: TDwarfAttributeDesc;
 begin
   case Form of
-    DW_FORM_flag_present:
+    DW_FORM_flag_present,
+    DW_FORM_implicit_const:
       { No data };
 
     DW_FORM_flag,
     DW_FORM_data1,
-    DW_FORM_ref1:
+    DW_FORM_ref1,
+    DW_FORM_strx1,
+    DW_FORM_addrx1:
       ACursor.Skip(1);
 
     DW_FORM_data2,
-    DW_FORM_ref2:
+    DW_FORM_ref2,
+    DW_FORM_strx2,
+    DW_FORM_addrx2:
       ACursor.Skip(2);
+
+    DW_FORM_strx3,
+    DW_FORM_addrx3:
+      ACursor.Skip(3);
 
     DW_FORM_data4,
     DW_FORM_ref4,
-    DW_FORM_strp:
+    DW_FORM_ref_sup4,
+    DW_FORM_strx4,
+    DW_FORM_addrx4:
       ACursor.Skip(4);
 
+    DW_FORM_strp,
+    DW_FORM_line_strp,
+    DW_FORM_strp_sup,
     DW_FORM_ref_addr,
     DW_FORM_sec_offset:
       ACursor.Skip(4); // Only 32-bit DWARF sections are supported (this is checked in TDwarfInfo.LoadInfo)
 
     DW_FORM_data8,
     DW_FORM_ref8,
-    DW_FORM_ref_sig8:
+    DW_FORM_ref_sig8,
+    DW_FORM_ref_sup8:
       ACursor.Skip(8);
+
+    DW_FORM_data16:
+      ACursor.Skip(16);
+
+    DW_FORM_strx,
+    DW_FORM_addrx,
+    DW_FORM_loclistx,
+    DW_FORM_rnglistx:
+      ACursor.ReadULeb128;
 
     DW_FORM_addr:
       ACursor.Skip(8); // Only 64-bit addresses are supported (this is checked in TDwarfInfo.LoadInfo)
@@ -610,23 +743,43 @@ begin
   end;
 end;
 
+function TDwarfAttributeDesc.IsStringIndex: Boolean;
+begin
+  case Form of
+    DW_FORM_strx,
+    DW_FORM_strx1,
+    DW_FORM_strx2,
+    DW_FORM_strx3,
+    DW_FORM_strx4:
+      Result := True;
+  else
+    Result := False;
+  end;
+end;
+
 function TDwarfAttributeDesc.StringValue(const ACursor: TDwarfCursor;
-  const AStringSection: TBytes): String;
-var
-  Offset: Integer;
-  StrCursor: TDwarfCursor;
+  const ASections: TDwarfSections; const AStrOffsetsBase: UInt64): String;
 begin
   case Form of
     DW_FORM_string:
       Result := ACursor.ReadString;
 
     DW_FORM_strp:
+      Result := ReadSectionString(ASections.Str, ACursor.ReadUInt32, 'debug_str');
+
+    DW_FORM_line_strp:
       begin
-        Offset := ACursor.ReadUInt32;
-        StrCursor := AStringSection;
-        StrCursor.Skip(Offset);
-        Result := StrCursor.ReadString;
+        if (ASections.LineStr = nil) then
+          raise EDwarfError.Create('DW_FORM_line_strp requires a debug_line_str section');
+        Result := ReadSectionString(ASections.LineStr, ACursor.ReadUInt32, 'debug_line_str');
       end;
+
+    DW_FORM_strx,
+    DW_FORM_strx1,
+    DW_FORM_strx2,
+    DW_FORM_strx3,
+    DW_FORM_strx4:
+      Result := ReadStringByIndex(ASections, AStrOffsetsBase, UIntValue(ACursor));
   else
     SkipValue(ACursor);
     Result := '';
@@ -636,23 +789,41 @@ end;
 function TDwarfAttributeDesc.UIntValue(const ACursor: TDwarfCursor): UInt64;
 begin
   case Form of
-    DW_FORM_data1:
+    DW_FORM_data1,
+    DW_FORM_strx1,
+    DW_FORM_addrx1:
       Result := ACursor.ReadUInt8;
 
-    DW_FORM_data2:
+    DW_FORM_data2,
+    DW_FORM_strx2,
+    DW_FORM_addrx2:
       Result := ACursor.ReadUInt16;
 
-    DW_FORM_data4:
+    DW_FORM_strx3,
+    DW_FORM_addrx3:
+      Result := ACursor.ReadUInt24;
+
+    DW_FORM_data4,
+    DW_FORM_strx4,
+    DW_FORM_addrx4,
+    DW_FORM_sec_offset: // Only 32-bit DWARF sections are supported
       Result := ACursor.ReadUInt32;
 
     DW_FORM_data8:
       Result := ACursor.ReadUInt64;
 
-    DW_FORM_udata:
+    DW_FORM_udata,
+    DW_FORM_strx,
+    DW_FORM_addrx,
+    DW_FORM_loclistx,
+    DW_FORM_rnglistx:
       Result := ACursor.ReadULeb128;
 
     DW_FORM_sdata:
       Result := ACursor.ReadSLeb128;
+
+    DW_FORM_implicit_const:
+      Result := ImplicitConst;
   else
     SkipValue(ACursor);
     Result := 0;
@@ -675,6 +846,11 @@ begin
     Attr.Form := ACursor.ReadULeb128;
     if (Attr.Name = 0) and (Attr.Form = 0) then
       Break;
+
+    if (Attr.Form = DW_FORM_implicit_const) then
+      Attr.ImplicitConst := ACursor.ReadSLeb128
+    else
+      Attr.ImplicitConst := 0;
 
     if (AttrCount >= Length(FAttributes)) then
       SetLength(FAttributes, AttrCount + 8);
@@ -729,11 +905,12 @@ end;
 { TDwarfCompilationUnit }
 
 constructor TDwarfCompilationUnit.Create(const AOwner: TDwarfInfo;
-  const AAbbreviations: TDwarfAbbreviationTable);
+  const AAbbreviations: TDwarfAbbreviationTable; const AVersion: Integer);
 begin
   inherited Create;
   FOwner := AOwner;
   FAbbreviations := AAbbreviations;
+  FVersion := AVersion;
 
   FIncludeDirectories := TStringList.Create;
   FFiles := TList<TDwarfFile>.Create;
@@ -748,9 +925,47 @@ begin
   inherited;
 end;
 
-procedure TDwarfCompilationUnit.Load(const ACursor: TDwarfCursor);
+function TDwarfCompilationUnit.ResolveStringIndex(const AIndex: UInt64): String;
+begin
+  Result := ReadStringByIndex(FOwner.FSections, FStrOffsetsBase, AIndex);
+end;
+
+function TDwarfCompilationUnit.ResolveAddressIndex(const AIndex: UInt64): UInt64;
 var
-  AbbrevCode, StmtList: Integer;
+  Pos: UInt64;
+begin
+  if (FOwner.FSections.Addr = nil) then
+    raise EDwarfError.Create('DW_FORM_addrx requires a debug_addr section');
+
+  { 64-bit apps only: each entry is an 8-byte address }
+  Pos := FAddrBase + (AIndex * SizeOf(UInt64));
+  if ((Pos + SizeOf(UInt64)) > UInt64(Length(FOwner.FSections.Addr))) then
+    raise EDwarfError.CreateFmt('Address index %d is outside the debug_addr section', [AIndex]);
+
+  Result := PUInt64(@FOwner.FSections.Addr[Pos])^;
+end;
+
+function TDwarfCompilationUnit.ReadLineEntryFormats(
+  const ACursor: TDwarfCursor): TArray<TDwarfAttributeDesc>;
+var
+  I: Integer;
+begin
+  SetLength(Result, ACursor.ReadUInt8);
+  for I := 0 to Length(Result) - 1 do
+  begin
+    Result[I].Name := ACursor.ReadULeb128; // DW_LNCT_*
+    Result[I].Form := ACursor.ReadULeb128;
+    Result[I].ImplicitConst := 0;
+  end;
+end;
+
+procedure TDwarfCompilationUnit.Load(const ACursor: TDwarfCursor);
+const
+  NO_INDEX = High(UInt64);
+var
+  AbbrevCode: Integer;
+  StmtList: Int64;
+  ProducerIndex, NameIndex, DirectoryIndex, LowPCIndex: UInt64;
   Abbrev: TDwarfAbbreviation;
   Attr: TDwarfAttributeDesc;
 begin
@@ -761,41 +976,88 @@ begin
   if (Abbrev = nil) then
     raise EDwarfError.CreateFmt('Invalid DWARF abbreviation code (%d)', [AbbrevCode]);
 
-  if (Abbrev.Tag <> DW_TAG_compile_unit) then
+  if (Abbrev.Tag <> DW_TAG_compile_unit) and (Abbrev.Tag <> DW_TAG_partial_unit) then
     raise EDwarfError.Create('DWARF compilation unit must start with a DW_TAG_compile_unit tag');
 
   StmtList := -1;
+  ProducerIndex := NO_INDEX;
+  NameIndex := NO_INDEX;
+  DirectoryIndex := NO_INDEX;
+  LowPCIndex := NO_INDEX;
+
+  { Defaults skip the 8-byte header of the first DWARF 5 contribution.
+    DW_AT_str_offsets_base / DW_AT_addr_base may follow the attributes that
+    use them, so indexed values are resolved after the loop. }
+  FStrOffsetsBase := 8;
+  FAddrBase := 8;
+
   for Attr in Abbrev.Attributes do
   begin
     case Attr.Name of
       DW_AT_producer:
-        FProducer := Attr.StringValue(ACursor, FOwner.FSections.Str);
+        if (Attr.IsStringIndex) then
+          ProducerIndex := Attr.UIntValue(ACursor)
+        else
+          FProducer := Attr.StringValue(ACursor, FOwner.FSections, 0);
 
       DW_AT_language:
         FLanguage := Attr.UIntValue(ACursor);
 
       DW_AT_name:
-        FName := Attr.StringValue(ACursor, FOwner.FSections.Str);
+        if (Attr.IsStringIndex) then
+          NameIndex := Attr.UIntValue(ACursor)
+        else
+          FName := Attr.StringValue(ACursor, FOwner.FSections, 0);
 
       DW_AT_comp_dir:
-        FDirectory := Attr.StringValue(ACursor, FOwner.FSections.Str);
+        if (Attr.IsStringIndex) then
+          DirectoryIndex := Attr.UIntValue(ACursor)
+        else
+          FDirectory := Attr.StringValue(ACursor, FOwner.FSections, 0);
 
       DW_AT_stmt_list:
         StmtList := Attr.UIntValue(ACursor);
+
+      DW_AT_low_pc:
+        case Attr.Form of
+          DW_FORM_addr:
+            FLowPC := ACursor.ReadUInt64; // Only 64-bit apps are supported
+
+          DW_FORM_addrx,
+          DW_FORM_addrx1..DW_FORM_addrx4:
+            LowPCIndex := Attr.UIntValue(ACursor);
+        else
+          Attr.SkipValue(ACursor);
+        end;
+
+      DW_AT_str_offsets_base:
+        FStrOffsetsBase := Attr.UIntValue(ACursor);
+
+      DW_AT_addr_base:
+        FAddrBase := Attr.UIntValue(ACursor);
     else
       Attr.SkipValue(ACursor);
     end;
   end;
 
+  if (ProducerIndex <> NO_INDEX) then
+    FProducer := ResolveStringIndex(ProducerIndex);
+  if (NameIndex <> NO_INDEX) then
+    FName := ResolveStringIndex(NameIndex);
+  if (DirectoryIndex <> NO_INDEX) then
+    FDirectory := ResolveStringIndex(DirectoryIndex);
+  if (LowPCIndex <> NO_INDEX) then
+    FLowPC := ResolveAddressIndex(LowPCIndex);
+
   if (StmtList >= 0) then
     LoadLineNumbers(StmtList);
 end;
 
-procedure TDwarfCompilationUnit.LoadLineNumbers(const AOffset: Integer);
+procedure TDwarfCompilationUnit.LoadLineNumbers(const AOffset: UInt64);
 var
   Cursor: TDwarfCursor;
   Size: Cardinal;
-  Version, PrologueLength, MinimumInstructionLength, OpcodeBase: Integer;
+  Version, HeaderLength, MinimumInstructionLength, OpcodeBase: Integer;
   LineBase, LineRange, LineAdv, AddrAdv: Integer;
   DefaultIsStmt: Boolean;
   ProgramStart, ProgramEnd, Next: PByte;
@@ -804,9 +1066,15 @@ var
   Line: TDwarfLine;
   S: String;
   F: TDwarfFile;
+  Formats: TArray<TDwarfAttributeDesc>;
+  Fmt: TDwarfAttributeDesc;
+  I, Count: Integer;
 begin
   if (FOwner.FSections.Line = nil) then
     raise EDwarfError.Create('A __debug_line DWARF debug section is required');
+
+  if (AOffset >= UInt64(Length(FOwner.FSections.Line))) then
+    raise EDwarfError.CreateFmt('Line number program offset %d is outside the debug_line section', [AOffset]);
 
   Cursor := FOwner.FSections.Line;
   Cursor.Skip(AOffset);
@@ -819,12 +1087,22 @@ begin
   ProgramEnd := Cursor.Cur + Size;
 
   Version := Cursor.ReadUInt16;
-  if (Version <> 2) then
-    raise EDwarfError.Create('Only DWARF version 2 is supported for line numbers');
+  if (Version < 2) or (Version > 5) then
+    raise EDwarfError.CreateFmt('Unsupported line number program version (%d)', [Version]);
 
-  PrologueLength := Cursor.ReadUInt32;
-  ProgramStart := Cursor.Cur + PrologueLength;
+  if (Version >= 5) then
+  begin
+    if (Cursor.ReadUInt8 <> 8) then
+      raise EDwarfError.Create('Only 64-bit apps are supported');
+    if (Cursor.ReadUInt8 <> 0) then
+      raise EDwarfError.Create('Segment selectors in line number programs are not supported');
+  end;
+
+  HeaderLength := Cursor.ReadUInt32;
+  ProgramStart := Cursor.Cur + HeaderLength;
   MinimumInstructionLength := Cursor.ReadUInt8;
+  if (Version >= 4) then
+    Cursor.ReadUInt8; // maximum_operations_per_instruction (VLIW only)
   DefaultIsStmt := (Cursor.ReadUInt8 <> 0);
   LineBase := Cursor.ReadSInt8;
   LineRange := Cursor.ReadUInt8;
@@ -832,29 +1110,76 @@ begin
   Cursor.Read(StandardOpcodeLengths[1], OpcodeBase - 1);
 
   FIncludeDirectories.Clear;
-  FIncludeDirectories.Add(''); // First entry is current directory
-  while (True) do
-  begin
-    S := Cursor.ReadString;
-    if (S = '') then
-      Break;
-
-    FIncludeDirectories.Add(S);
-  end;
-
   FFiles.Clear;
-  FillChar(F, SizeOf(F), 0);
-  FFiles.Add(F); // Files start at index 1
-  while (True) do
+  if (Version >= 5) then
   begin
-    F.Name := Cursor.ReadString;
-    if (F.Name = '') then
-      Break;
+    { Self-describing entries; indices are 0-based }
+    Formats := ReadLineEntryFormats(Cursor);
+    Count := Cursor.ReadULeb128;
+    for I := 0 to Count - 1 do
+    begin
+      S := '';
+      for Fmt in Formats do
+      begin
+        if (Fmt.Name = DW_LNCT_path) then
+          S := Fmt.StringValue(Cursor, FOwner.FSections, FStrOffsetsBase)
+        else
+          Fmt.SkipValue(Cursor);
+      end;
+      FIncludeDirectories.Add(S);
+    end;
 
-    F.DirectoryIndex := Cursor.ReadULeb128;
-    F.Time := Cursor.ReadULeb128;
-    F.Size := Cursor.ReadULeb128;
-    FFiles.Add(F);
+    Formats := ReadLineEntryFormats(Cursor);
+    Count := Cursor.ReadULeb128;
+    for I := 0 to Count - 1 do
+    begin
+      F := Default(TDwarfFile);
+      for Fmt in Formats do
+      begin
+        case Fmt.Name of
+          DW_LNCT_path:
+            F.Name := Fmt.StringValue(Cursor, FOwner.FSections, FStrOffsetsBase);
+
+          DW_LNCT_directory_index:
+            F.DirectoryIndex := Fmt.UIntValue(Cursor);
+
+          DW_LNCT_timestamp:
+            F.Time := Fmt.UIntValue(Cursor);
+
+          DW_LNCT_size:
+            F.Size := Fmt.UIntValue(Cursor);
+        else
+          Fmt.SkipValue(Cursor); // DW_LNCT_MD5 and vendor content types
+        end;
+      end;
+      FFiles.Add(F);
+    end;
+  end
+  else
+  begin
+    FIncludeDirectories.Add(''); // First entry is current directory
+    while (True) do
+    begin
+      S := Cursor.ReadString;
+      if (S = '') then
+        Break;
+
+      FIncludeDirectories.Add(S);
+    end;
+
+    F := Default(TDwarfFile);
+    FFiles.Add(F); // Files start at index 1
+    while (True) do
+    begin
+      F.Name := Cursor.ReadString;
+      if (F.Name = '') then
+        Break;
+
+      F.DirectoryIndex := Cursor.ReadULeb128;
+      F.Time := Cursor.ReadULeb128;
+      F.Size := Cursor.ReadULeb128;
+      FFiles.Add(F);
+    end;
   end;
 
   { Execute statement program }
@@ -894,6 +1219,9 @@ begin
 
           DW_LNE_define_file:
             raise EDwarfError.Create('DW_LNE_define_file opcode not supported');
+
+          DW_LNE_set_discriminator:
+            { Skipped below via Next };
         else
           raise EDwarfError.CreateFmt('Invalid extended opcode (%d)', [Opcode]);
         end;
@@ -1008,7 +1336,7 @@ end;
 procedure TDwarfInfo.LoadInfo(const ACursor: TDwarfCursor);
 var
   Size: Cardinal;
-  Version, AbbrevOffset: Integer;
+  Version, UnitType, AddressSize, AbbrevOffset: Integer;
   Next: PByte;
   CU: TDwarfCompilationUnit;
   Abbrevs: TDwarfAbbreviationTable;
@@ -1027,10 +1355,31 @@ begin
     if (Version < 2) or (Version > 5) then
       raise EDwarfError.Create('Only DWARF versions 2-5 are supported');
 
-    AbbrevOffset := ACursor.ReadUInt32;
+    if (Version >= 5) then
+    begin
+      { DWARF 5: unit_type, address_size, debug_abbrev_offset }
+      UnitType := ACursor.ReadUInt8;
+      AddressSize := ACursor.ReadUInt8;
+      AbbrevOffset := ACursor.ReadUInt32;
+    end
+    else
+    begin
+      { DWARF 2-4: debug_abbrev_offset, address_size }
+      UnitType := DW_UT_compile;
+      AbbrevOffset := ACursor.ReadUInt32;
+      AddressSize := ACursor.ReadUInt8;
+    end;
 
-    if (ACursor.ReadUInt8 <> 8) then
+    if (AddressSize <> 8) then
       raise EDwarfError.Create('Only 64-bit apps are supported');
+
+    { Type, skeleton and split units carry no line number program of their
+      own (and have extra header fields). }
+    if (UnitType <> DW_UT_compile) and (UnitType <> DW_UT_partial) then
+    begin
+      ACursor.Seek(Next);
+      Continue;
+    end;
 
     if (not FAbbreviationTables.TryGetValue(AbbrevOffset, Abbrevs)) then
     begin
@@ -1039,7 +1388,7 @@ begin
       Abbrevs.Load(FSections.Abbrev, AbbrevOffset);
     end;
 
-    CU := TDwarfCompilationUnit.Create(Self, Abbrevs);
+    CU := TDwarfCompilationUnit.Create(Self, Abbrevs, Version);
     FCompilationUnits.Add(CU);
 
     CU.Load(ACursor);

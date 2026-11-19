@@ -82,7 +82,13 @@ begin
       else if Sec.Name = '.debug_line' then
         DwarfSections.Line := Sec.Load
       else if Sec.Name = '.debug_str' then
-        DwarfSections.Str := Sec.Load;
+        DwarfSections.Str := Sec.Load
+      else if Sec.Name = '.debug_str_offsets' then
+        DwarfSections.StrOffsets := Sec.Load
+      else if Sec.Name = '.debug_addr' then
+        DwarfSections.Addr := Sec.Load
+      else if Sec.Name = '.debug_line_str' then
+        DwarfSections.LineStr := Sec.Load;
     end;
   finally
     ElfFile.Free;
@@ -115,6 +121,9 @@ begin
             Inc(LineCount);
           end;
         end;
+        // The next sequence starts at an unrelated address: keep its first row
+        if (TDwarfLineFlag.EndSequence in Line.Flags) then
+          PrevLine := -1;
       end;
     end;
     SetLength(Lines, LineCount);
