@@ -1122,8 +1122,8 @@ begin
     end;
     var Diag := 'Crash LineNumberInfo (diag):' + #13#10 +
                 '------------------------------' + #13#10 +
-                '  .gol expected at: ' + Lni.DiagFilename + #13#10 +
-                '  .gol exists?    : ' + BoolToStr(Lni.DiagFileExists, True) + #13#10 +
+                '  .gol source     : ' + Lni.DiagFilename + #13#10 +
+                '  .gol found?     : ' + BoolToStr(Lni.DiagFileExists, True) + #13#10 +
                 '  Status          : ' + StatusStr + #13#10 +
                 Format('  BaseAddress     : 0x%.16x', [Lni.BaseAddress]) + #13#10 +
                 Format('  Line entries    : %d', [Lni.LineCount]) + #13#10 +
@@ -1137,8 +1137,9 @@ begin
         '                    proxies). This is typically an IDE-built Linux' + #13#10 +
         '                    binary: the IDE drives dcclinux64 directly and' + #13#10 +
         '                    skips the MSBuild post-build that generates the' + #13#10 +
-        '                    .gol. Rebuild via "build.cmd fmx_linux" to emit a' + #13#10 +
-        '                    matching .gol next to the executable.' + #13#10;
+        '                    .gol. Rebuild from the command line so LNG_ELF' + #13#10 +
+        '                    writes a matching .gol (embedded as .crash.gol or' + #13#10 +
+        '                    next to the executable).' + #13#10;
     if Result.SignalInfoSection = '' then
       Result.SignalInfoSection := Diag
     else

@@ -78,6 +78,18 @@ type
 function CrashReadElfBuildID(const APath: String; out AID: TCrashSymbolBuildID;
   out ALinkBase: UInt64): Boolean;
 
+const
+  { Sections that carry the side-files inside the image itself (added after
+    linking, e.g. objcopy --add-section). Read from the file, not mapped. }
+  CRASH_ELF_GOL_SECTION   = '.crash.gol';
+  CRASH_ELF_GOSYM_SECTION = '.crash.gosym';
+
+{ Reads the contents of the section named AName from the ELF64 file APath.
+  False (AData = nil) when the file is not a readable ELF64, has no such
+  section or the section is empty, NOBITS or larger than 256 MB. }
+function CrashReadElfSection(const APath: String; const AName: AnsiString;
+  out AData: TBytes): Boolean;
+
 implementation
 
 uses
@@ -98,7 +110,16 @@ type
     p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_align: UInt64;
   end;
 
+  TElf64Shdr = packed record
+    sh_name, sh_type: UInt32;
+    sh_flags, sh_addr, sh_offset, sh_size: UInt64;
+    sh_link, sh_info: UInt32;
+    sh_addralign, sh_entsize: UInt64;
+  end;
+
 const
+  SHT_NOBITS = 8;
+  MAX_SECTION_SIZE = 256 * 1024 * 1024;
   PT_LOAD = 1;
   PT_NOTE = 4;
   NT_GNU_BUILD_ID = 3;
@@ -178,6 +199,83 @@ begin
     Result := False;
   end;
   ALinkBase := ALinkBase and not UInt64($FFF);
+end;
+
+function CrashReadElfSection(const APath: String; const AName: AnsiString;
+  out AData: TBytes): Boolean;
+var
+  Stream: TFileStream;
+  Ehdr: TElf64Ehdr;
+  Shdrs: array of TElf64Shdr;
+  StrTab: TBytes;
+  I, K: Integer;
+  NameOff: UInt64;
+  Match: Boolean;
+begin
+  Result := False;
+  AData := nil;
+  if AName = '' then
+    Exit;
+  try
+    Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
+    try
+      if Stream.Read(Ehdr, SizeOf(Ehdr)) <> SizeOf(Ehdr) then Exit;
+      if (Ehdr.e_ident[0] <> $7F) or (Ehdr.e_ident[1] <> Ord('E')) or
+         (Ehdr.e_ident[2] <> Ord('L')) or (Ehdr.e_ident[3] <> Ord('F')) or
+         (Ehdr.e_ident[4] <> 2) then // ELFCLASS64
+        Exit;
+      if (Ehdr.e_shoff = 0) or (Ehdr.e_shnum = 0) or
+         (Ehdr.e_shentsize <> SizeOf(TElf64Shdr)) or
+         (Ehdr.e_shstrndx >= Ehdr.e_shnum) or
+         (Ehdr.e_shoff + UInt64(Ehdr.e_shnum) * SizeOf(TElf64Shdr) > UInt64(Stream.Size)) then
+        Exit;
+
+      SetLength(Shdrs, Ehdr.e_shnum);
+      Stream.Position := Int64(Ehdr.e_shoff);
+      Stream.ReadBuffer(Shdrs[0], Length(Shdrs) * SizeOf(TElf64Shdr));
+
+      with Shdrs[Ehdr.e_shstrndx] do
+      begin
+        if (sh_size = 0) or (sh_size > MAX_SECTION_SIZE) or
+           (sh_offset + sh_size > UInt64(Stream.Size)) then
+          Exit;
+        SetLength(StrTab, sh_size);
+        Stream.Position := Int64(sh_offset);
+        Stream.ReadBuffer(StrTab[0], Length(StrTab));
+      end;
+
+      for I := 0 to High(Shdrs) do
+      begin
+        // Bounded compare of the NUL-terminated name against AName
+        NameOff := Shdrs[I].sh_name;
+        if NameOff + UInt64(Length(AName)) >= UInt64(Length(StrTab)) then
+          Continue;
+        Match := StrTab[NameOff + UInt64(Length(AName))] = 0;
+        K := 1;
+        while Match and (K <= Length(AName)) do
+        begin
+          Match := StrTab[NameOff + UInt64(K) - 1] = Byte(AName[K]);
+          Inc(K);
+        end;
+        if not Match then
+          Continue;
+
+        if (Shdrs[I].sh_type = SHT_NOBITS) or (Shdrs[I].sh_size = 0) or
+           (Shdrs[I].sh_size > MAX_SECTION_SIZE) or
+           (Shdrs[I].sh_offset + Shdrs[I].sh_size > UInt64(Stream.Size)) then
+          Exit;
+        SetLength(AData, Shdrs[I].sh_size);
+        Stream.Position := Int64(Shdrs[I].sh_offset);
+        Stream.ReadBuffer(AData[0], Length(AData));
+        Exit(True);
+      end;
+    finally
+      Stream.Free;
+    end;
+  except
+    AData := nil;
+    Result := False;
+  end;
 end;
 
 { TCrashSymbolFile }

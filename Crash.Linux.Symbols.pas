@@ -11,6 +11,8 @@
   .symtab has no other source. LNG_ELF --gosym writes <exe>.gosym from the
   unstripped executable (its local function symbols plus their source files);
   this unit loads it at startup and resolves the frames dladdr left unnamed.
+  The data is taken from the image's own .crash.gosym section when present
+  (added after linking), else from the <exe>.gosym file next to it.
 
   Covers the module that contains this unit (the executable). The side-file is
   matched by the ELF build-id, so a stale one is refused, never misread.
@@ -59,6 +61,7 @@ var
   ModulePath: String;
   ID: TCrashSymbolBuildID;
   LinkBase: UInt64;
+  Data: TBytes;
   Symbols: TCrashSymbolFile;
 begin
   if GLoaded then
@@ -72,10 +75,15 @@ begin
       Exit;
     if not CrashReadElfBuildID(ModulePath, ID, LinkBase) then
       Exit;
-    if not TFile.Exists(ModulePath + '.gosym') then
-      Exit;
+    // Embedded in the image first, then the side-file next to it
+    if not CrashReadElfSection(ModulePath, CRASH_ELF_GOSYM_SECTION, Data) then
+    begin
+      if not TFile.Exists(ModulePath + '.gosym') then
+        Exit;
+      Data := TFile.ReadAllBytes(ModulePath + '.gosym');
+    end;
     Symbols := TCrashSymbolFile.Create;
-    if Symbols.Load(TFile.ReadAllBytes(ModulePath + '.gosym'), ID) then
+    if Symbols.Load(Data, ID) then
     begin
       GModuleBase := UIntPtr(Info.dli_fbase);
       GLinkBase := LinkBase;

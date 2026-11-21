@@ -237,8 +237,8 @@ type
     function DiagHeaderIdHex: String;
     { True if the running ELF still carries a .debug_line section. When the
       .gol failed to load (Status <> Available) this distinguishes an unstripped
-      IDE-built binary -- whose line numbers are recoverable by rebuilding via
-      build.cmd -- from a properly stripped release build. }
+      IDE-built binary -- whose line numbers are recoverable by a command-line
+      rebuild -- from a properly stripped release build. }
     function DiagHasDwarf: Boolean;
     {$ENDIF}
   end;
@@ -259,6 +259,10 @@ uses
   Crash.MacOS.Api,
   Macapi.Foundation,
   Macapi.Helpers,
+  System.IOUtils,
+  {$ENDIF}
+  {$IF Defined(LINUX)}
+  Crash.SymbolFile,
   System.IOUtils,
   {$ENDIF}
   System.Classes,
@@ -825,8 +829,8 @@ end;
 // (from /proc/self/maps instead of _dyld_get_image_vmaddr_slide) differ.
 function TLineNumberInfo.Load: TLineNumberStatus;
 var
-  Filename: String;
-  Stream: TFileStream;
+  Filename, ImagePath: String;
+  Data: TBytes;
   Header: TLineNumberHeader;
   Line: TLine;
   Lines: TArray<TLine>;
@@ -853,13 +857,30 @@ begin
   FDiagFileExists := False;
   try
     if FModuleMode then
-      Filename := FModuleFilename
+    begin
+      Filename := FModuleFilename;
+      ImagePath := Copy(Filename, 1, Length(Filename) - Length('.gol'));
+    end
     else
+    begin
       Filename := ParamStr(0) + '.gol';
-    FDiagFilename := Filename;
-    FDiagFileExists := FileExists(Filename);
-    if not FDiagFileExists then
-      Exit(TLineNumberStatus.FileNotFound);
+      ImagePath := ParamStr(0);
+    end;
+
+    // Embedded in the image first, then the side-file next to it
+    if CrashReadElfSection(ImagePath, CRASH_ELF_GOL_SECTION, Data) then
+    begin
+      FDiagFilename := ImagePath + ' [' + String(CRASH_ELF_GOL_SECTION) + ']';
+      FDiagFileExists := True;
+    end
+    else
+    begin
+      FDiagFilename := Filename;
+      FDiagFileExists := FileExists(Filename);
+      if not FDiagFileExists then
+        Exit(TLineNumberStatus.FileNotFound);
+      Data := TFile.ReadAllBytes(Filename);
+    end;
 
     if FModuleMode then
     begin
@@ -878,30 +899,24 @@ begin
       BaseSlide := ImageInfo.BaseAddr;
     end;
 
-    Stream := TFileStream.Create(Filename, fmOpenRead or fmShareDenyWrite);
-    try
-      if (Stream.Read(Header, SizeOf(Header)) <> SizeOf(Header)) then
-        Exit(TLineNumberStatus.InvalidSize);
-      FDiagHeaderId := Header.ID;
+    if (Length(Data) < SizeOf(Header)) then
+      Exit(TLineNumberStatus.InvalidSize);
+    Move(Data[0], Header, SizeOf(Header));
+    FDiagHeaderId := Header.ID;
 
-      if (Header.Signature <> LINE_NUMBER_SIGNATURE) then
-        Exit(TLineNumberStatus.InvalidSignature);
+    if (Header.Signature <> LINE_NUMBER_SIGNATURE) then
+      Exit(TLineNumberStatus.InvalidSignature);
 
-      if ((Header.Version shr 16) > (LINE_NUMBER_VERSION shr 16)) then
-        Exit(TLineNumberStatus.UnsupportedVersion);
+    if ((Header.Version shr 16) > (LINE_NUMBER_VERSION shr 16)) then
+      Exit(TLineNumberStatus.UnsupportedVersion);
 
-      if (Header.Size <> Stream.Size) then
-        Exit(TLineNumberStatus.InvalidSize);
+    if (Header.Size <> UInt32(Length(Data))) then
+      Exit(TLineNumberStatus.InvalidSize);
 
-      if (Header.ID <> MatchID) then
-        Exit(TLineNumberStatus.ExecutableIDMismatch);
+    if (Header.ID <> MatchID) then
+      Exit(TLineNumberStatus.ExecutableIDMismatch);
 
-      SetLength(StateMachineProgram, Header.Size - SizeOf(Header));
-      if (Stream.Read(StateMachineProgram[0], Length(StateMachineProgram)) <> Length(StateMachineProgram)) then
-        Exit(TLineNumberStatus.InvalidSize);
-    finally
-      Stream.Free;
-    end;
+    StateMachineProgram := Copy(Data, SizeOf(Header), MaxInt);
 
     // Sanity: every entry takes at least one opcode byte - a Count beyond the
     // file size is corruption; reject it before the big allocation.
@@ -915,8 +930,8 @@ begin
     Line.RelAddress := 0;
     Line.Line := Header.StartLine;
     Lines[0] := Line;
-    PC := @StateMachineProgram[0];
-    PCEnd := @StateMachineProgram[Length(StateMachineProgram)];
+    PC := PByte(StateMachineProgram);
+    PCEnd := PC + Length(StateMachineProgram); // one past the end, no $R+ index check
     for I := 1 to Header.Count do
     begin
       if (PC >= PCEnd) then

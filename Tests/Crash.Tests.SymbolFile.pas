@@ -12,6 +12,9 @@
 //    S4  Truncated / corrupt files are refused.
 //    S5  Linux: CrashReadElfBuildID on the running executable gives a build-id
 //        and a page-aligned link base that the main module address is above.
+//    S6  CrashReadElfSection on a synthetic ELF64: the exact section is read,
+//        a name that is only a prefix does not match, NOBITS / missing / non-ELF
+//        / truncated files give nothing.
 //
 //  Copyright (c) 2026 Vizit0r. BSD 2-Clause license (see LICENSE.txt).
 // ===========================================================================
@@ -328,6 +331,142 @@ begin
 end;
 {$ENDIF}
 
+{ S6 }
+
+type
+  TTestShdr = packed record
+    sh_name, sh_type: UInt32;
+    sh_flags, sh_addr, sh_offset, sh_size: UInt64;
+    sh_link, sh_info: UInt32;
+    sh_addralign, sh_entsize: UInt64;
+  end;
+
+const
+  SHT_PROGBITS_ = 1;
+  SHT_STRTAB_   = 3;
+  SHT_NOBITS_   = 8;
+  EHDR_SIZE     = 64;
+
+function WriteTestElf(const APath: String; const ATruncate: Boolean): Boolean;
+// [Ehdr][".crash.go" data][".crash.gol" data][shstrtab][Shdr x5]
+const
+  STRTAB: AnsiString = #0'.shstrtab'#0'.crash.gol'#0'.crash.go'#0'.crash.gosym'#0;
+  NAME_SHSTRTAB = 1;
+  NAME_GOL      = 11;
+  NAME_GO       = 22;
+  NAME_GOSYM    = 32;
+var
+  S: TMemoryStream;
+  Ident: array [0..15] of Byte;
+  W16: UInt16;
+  W32: UInt32;
+  W64: UInt64;
+  Shdrs: array [0..4] of TTestShdr;
+  GoOff, GolOff, StrOff, ShOff: UInt64;
+  I: Integer;
+const
+  GO_DATA: AnsiString = 'AB';
+  GOL_DATA: AnsiString = 'line-table';
+begin
+  S := TMemoryStream.Create;
+  try
+    S.Size := EHDR_SIZE;
+    S.Position := EHDR_SIZE;
+    GoOff := S.Position;
+    S.WriteBuffer(GO_DATA[1], Length(GO_DATA));
+    GolOff := S.Position;
+    S.WriteBuffer(GOL_DATA[1], Length(GOL_DATA));
+    StrOff := S.Position;
+    S.WriteBuffer(STRTAB[1], Length(STRTAB));
+    ShOff := (S.Position + 7) and not UInt64(7);
+    S.Size := ShOff;
+    S.Position := ShOff;
+
+    FillChar(Shdrs, SizeOf(Shdrs), 0);
+    Shdrs[1].sh_name := NAME_GO;       Shdrs[1].sh_type := SHT_PROGBITS_;
+    Shdrs[1].sh_offset := GoOff;       Shdrs[1].sh_size := Length(GO_DATA);
+    Shdrs[2].sh_name := NAME_GOL;      Shdrs[2].sh_type := SHT_PROGBITS_;
+    Shdrs[2].sh_offset := GolOff;      Shdrs[2].sh_size := Length(GOL_DATA);
+    Shdrs[3].sh_name := NAME_GOSYM;    Shdrs[3].sh_type := SHT_NOBITS_;
+    Shdrs[3].sh_offset := GolOff;      Shdrs[3].sh_size := 64;
+    Shdrs[4].sh_name := NAME_SHSTRTAB; Shdrs[4].sh_type := SHT_STRTAB_;
+    Shdrs[4].sh_offset := StrOff;      Shdrs[4].sh_size := Length(STRTAB);
+    for I := 0 to High(Shdrs) do
+      S.WriteBuffer(Shdrs[I], SizeOf(TTestShdr));
+
+    // ELF64 header
+    FillChar(Ident, SizeOf(Ident), 0);
+    Ident[0] := $7F; Ident[1] := Ord('E'); Ident[2] := Ord('L'); Ident[3] := Ord('F');
+    Ident[4] := 2; Ident[5] := 1; Ident[6] := 1;
+    S.Position := 0;
+    S.WriteBuffer(Ident, SizeOf(Ident));
+    W16 := 2;  S.WriteBuffer(W16, 2);        // e_type
+    W16 := 62; S.WriteBuffer(W16, 2);        // e_machine
+    W32 := 1;  S.WriteBuffer(W32, 4);        // e_version
+    W64 := 0;  S.WriteBuffer(W64, 8);        // e_entry
+    S.WriteBuffer(W64, 8);                   // e_phoff
+    S.WriteBuffer(ShOff, 8);                 // e_shoff
+    W32 := 0;  S.WriteBuffer(W32, 4);        // e_flags
+    W16 := EHDR_SIZE; S.WriteBuffer(W16, 2); // e_ehsize
+    W16 := 0;  S.WriteBuffer(W16, 2);        // e_phentsize
+    S.WriteBuffer(W16, 2);                   // e_phnum
+    W16 := SizeOf(TTestShdr); S.WriteBuffer(W16, 2);
+    W16 := Length(Shdrs); S.WriteBuffer(W16, 2);
+    W16 := 4;  S.WriteBuffer(W16, 2);        // e_shstrndx
+
+    if ATruncate then
+      S.Size := S.Size - 8; // the section header table runs past EOF
+    S.SaveToFile(APath);
+    Result := True;
+  finally
+    S.Free;
+  end;
+end;
+
+function Step_S6_ElfSection(Progress: TCrashTestProgress): Boolean;
+var
+  Path: String;
+  Data: TBytes;
+
+  function Check(const ATag: string; const AName: AnsiString;
+    const AWant: AnsiString): Boolean;
+  var
+    Got: Boolean;
+    Str: AnsiString;
+  begin
+    Got := CrashReadElfSection(Path, AName, Data);
+    SetString(Str, PAnsiChar(PByte(Data)), Length(Data));
+    if AWant = '' then
+      Result := (not Got) and (Data = nil)
+    else
+      Result := Got and (Str = AWant);
+    if not Result then
+      Progress.InfoFmt('%s: found=%s data="%s"', [ATag, BoolToStr(Got, True), String(Str)]);
+  end;
+
+begin
+  Path := TPath.Combine(TPath.GetTempPath,
+    Format('crash_elfsection_%d.elf', [TThread.CurrentThread.ThreadID]));
+  try
+    WriteTestElf(Path, False);
+    Result :=
+      Check('S6 exact', '.crash.gol', 'line-table') and
+      Check('S6 prefix', '.crash.go', 'AB') and
+      Check('S6 NOBITS', '.crash.gosym', '') and
+      Check('S6 missing', '.crash.none', '') and
+      Check('S6 empty name', '', '');
+    WriteTestElf(Path, True);
+    Result := Result and Check('S6 truncated', '.crash.gol', '');
+    TFile.WriteAllText(Path, 'not an ELF file at all, just text');
+    Result := Result and Check('S6 not ELF', '.crash.gol', '');
+    TFile.Delete(Path);
+    Result := Result and Check('S6 no file', '.crash.gol', '');
+  finally
+    if TFile.Exists(Path) then
+      TFile.Delete(Path);
+  end;
+end;
+
 class function TSymbolFile_AllInOne.AutoTest(out OutLines: TArray<string>): Boolean;
 var
   L: TList<string>;
@@ -344,6 +483,7 @@ begin
       {$IF Defined(LINUX)}
       Progress.Account(Step_S5_RunningElf(Progress), 'S5: build-id and link base of the running executable');
       {$ENDIF}
+      Progress.Account(Step_S6_ElfSection(Progress), 'S6: ELF section reader (exact name, NOBITS, missing, corrupt)');
       Progress.WriteSummary(TEST_NAME);
       Result := Progress.AllPassed;
     finally
@@ -358,7 +498,7 @@ end;
 initialization
   CrashRegisterTest(
     'SymbolFile',
-    'The .gosym side-file writer and reader',
+    'The .gosym side-file writer and reader, ELF section reader',
     ['crash', 'gosym', 'symbols'],
     TSymbolFile_AllInOne.AutoTest
   );

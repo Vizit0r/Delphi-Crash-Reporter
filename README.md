@@ -306,8 +306,9 @@ Tests (`Tests/`, test builds only — see [Tests](#tests)):
 ## Source line numbers (`.gol`)
 
 Line numbers come from a `.gol` file generated at build time from the binary's
-debug info and deployed alongside the app (next to the executable on Linux/macOS; as an
-APK asset on Android — the mobile deploy is shared with `.gosym`, see *Function names*).
+debug info and deployed alongside the app (next to the executable on Linux/macOS, or
+embedded in the Linux ELF — see *Embedding the side-files in the ELF*; as an APK asset
+on Android — the mobile deploy is shared with `.gosym`, see *Function names*).
 
 - **Linux**: `Tools/LineNumberGenerator/LNG_ELF` reads DWARF from the ELF.
 - **macOS**: `Tools/LineNumberGenerator/LNG` reads DWARF from the `.dSYM`.
@@ -394,8 +395,28 @@ executable and names the frames `dladdr` left empty.
 
 `Tools/gen-linux-crash-sidefiles.ps1 <exe>` runs `LNG_ELF --gosym` (building it on
 first use) and writes both `<exe>.gol` and `<exe>.gosym`. Run it as a post-build
-step before any strip, and ship both files next to the executable; see
-`Tests/CrashTests.dproj` for the MSBuild wiring.
+step before any strip; see `Tests/CrashTests.dproj` for the MSBuild wiring.
+
+### Embedding the side-files in the ELF (recommended)
+
+Two files that must travel next to the executable can get lost (not copied out of
+an archive, deleted), and the report then silently has no lines and fewer names.
+Both can instead live inside the executable as non-loaded sections, added in the
+same pass that strips it:
+
+```sh
+objcopy --remove-section .crash.gol --remove-section .crash.gosym \
+        --add-section .crash.gol=MyApp.gol --add-section .crash.gosym=MyApp.gosym \
+        --strip-all MyApp
+```
+
+Any `objcopy` works (binutils on Linux/WSL, or `llvm-objcopy` from the Android NDK
+on Windows). The sections survive `--strip-all` and leave the build-id unchanged;
+the `--remove-section` pair makes the command repeatable on an already processed
+binary. At startup `Crash.LineNumbers` and `Crash.Linux.Symbols` read
+`.crash.gol` / `.crash.gosym` from the executable file (`CrashReadElfSection` in
+`Crash.SymbolFile`) and fall back to `<exe>.gol` / `<exe>.gosym` next to it. The
+same applies to a shared library and its own side-files.
 
 ## Function names (`.gosym`) — Android
 
